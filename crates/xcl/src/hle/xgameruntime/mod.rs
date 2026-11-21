@@ -10,7 +10,7 @@ pub mod taskqueue;
 pub mod xasync;
 
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::util::{write_cstr_out, E_INVALIDARG, E_NOT_FOUND, E_NOT_SUFFICIENT_BUFFER, E_NOT_SUPPORTED, HRESULT, S_OK};
@@ -151,8 +151,21 @@ pub unsafe extern "system" fn XGameRuntimeUninitialize() {
     INIT_COUNT.fetch_sub(1, Ordering::AcqRel);
 }
 
-pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(_feature: u32) -> bool {
-    true
+pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
+    matches!(
+        feature,
+        2  // XAsync
+            | 3  // XAsyncProvider
+            | 5  // XGame
+            | 7  // XGameSave
+            | 11 // XPackage
+            | 12 // XPersistentLocalStorage
+            | 15 // XSystem
+            | 16 // XTaskQueue
+            | 17 // XThread
+            | 18 // XUser
+            | 19 // XError
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -331,24 +344,66 @@ pub struct XPersistentLocalStorageSpaceInfo {
     pub total_bytes: u64,
 }
 
+/// Bytes the title occupies under `root`: the sizes of regular files, recursively.
+/// Entries whose metadata can't be read are skipped; the total saturates instead of
+/// overflowing. Links and other reparse points are never followed and never counted —
+/// a link could point outside `root`, and only in-tree bytes belong to the quota.
+/// (`DirEntry::file_type` on Windows reports every name-surrogate reparse point —
+/// symlinks, junctions and mount points — as `is_symlink`, without an extra syscall
+/// and without dereferencing it.)
+fn pls_used_bytes(root: &Path) -> u64 {
+    let mut used = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            } else if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                used = used.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+        }
+    }
+    used
+}
+
+/// `total_bytes` is the title's quota; both free figures are the smaller of the host's
+/// and the quota still unused (`quota − used`, saturating at zero free once the title
+/// sits over quota). `used_bytes` stays truthful even when it exceeds the quota.
+fn pls_space_info(quota: u64, used: u64, avail: u64, free: u64) -> XPersistentLocalStorageSpaceInfo {
+    let remaining = quota.saturating_sub(used);
+    XPersistentLocalStorageSpaceInfo {
+        available_free_bytes: avail.min(remaining),
+        total_free_bytes: free.min(remaining),
+        used_bytes: used,
+        total_bytes: quota,
+    }
+}
+
 pub unsafe extern "system" fn XPersistentLocalStorageGetSpaceInfo(info: *mut XPersistentLocalStorageSpaceInfo) -> HRESULT {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     if info.is_null() {
         return E_INVALIDARG;
     }
+    let pls = pls_path();
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
-    GetDiskFreeSpaceExW(crate::util::wide(&pls_path()).as_ptr(), &mut avail, &mut total, &mut free);
+    let ok = GetDiskFreeSpaceExW(crate::util::wide(&pls).as_ptr(), &mut avail, &mut total, &mut free);
     // the title's quota (MicrosoftGame.Config <PersistentLocalStorage><SizeMB>, else 4 GiB)
-    let budget = match crate::state::config().pls_mb {
+    let quota = match crate::state::config().pls_mb {
         0 => 4096,
         mb => mb,
-    } << 20;
-    *info = XPersistentLocalStorageSpaceInfo {
-        available_free_bytes: avail.min(budget),
-        total_free_bytes: free.min(budget),
-        used_bytes: 0,
-        total_bytes: budget,
-    };
+    }
+    .saturating_mul(1024 * 1024);
+    let used = pls_used_bytes(Path::new(&pls));
+    if ok == 0 {
+        // host figures unavailable – let the remaining quota bound free space alone
+        avail = quota;
+        free = quota;
+    }
+    *info = pls_space_info(quota, used, avail, free);
     S_OK
 }
 
@@ -550,6 +605,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn feature_availability_reports_only_implemented_families() {
+        let expected = [2, 3, 5, 7, 11, 12, 15, 16, 17, 18, 19];
+        for feature in 0..=21 {
+            assert_eq!(
+                unsafe { XGameRuntimeIsFeatureAvailable(feature) },
+                expected.contains(&feature),
+                "unexpected availability for public feature {feature}"
+            );
+        }
+        assert!(!unsafe { XGameRuntimeIsFeatureAvailable(u32::MAX) });
+    }
+
+    #[test]
     fn user_add_and_queries() {
     let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -595,6 +663,97 @@ mod tests {
             let s = std::ffi::CStr::from_ptr(buf.as_ptr() as *const _).to_string_lossy().into_owned();
             assert!(s.ends_with("saves\\scid-1"), "{s}");
             assert!(std::path::Path::new(&s).is_dir());
+        }
+    }
+
+    fn pls_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("olympus_pls_test_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn pls_used_counts_nested_files() {
+        let root = pls_test_dir("nested");
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(root.join("top.bin"), [0u8; 100]).unwrap();
+        std::fs::write(root.join("a").join("mid.bin"), [0u8; 50]).unwrap();
+        std::fs::write(deep.join("deep.bin"), [0u8; 250]).unwrap();
+        assert_eq!(pls_used_bytes(&root), 400);
+        assert_eq!(pls_used_bytes(&root.join("missing")), 0); // unreadable → 0, not an error
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pls_space_math_quota_and_saturation() {
+        const MIB: u64 = 1024 * 1024;
+        // the quota is reduced by measured use when the host disk is not the limit
+        let s = pls_space_info(4 * MIB, 300_000, u64::MAX, u64::MAX);
+        assert_eq!((s.used_bytes, s.total_bytes), (300_000, 4 * MIB));
+        assert_eq!(s.available_free_bytes, 4 * MIB - 300_000);
+        assert_eq!(s.total_free_bytes, 4 * MIB - 300_000);
+        // the host disk is the tighter limit
+        let s = pls_space_info(4 * MIB, 0, 1234, 5678);
+        assert_eq!((s.available_free_bytes, s.total_free_bytes), (1234, 5678));
+        // over quota: free saturates at 0 while used stays truthful
+        let s = pls_space_info(4 * MIB, 4 * MIB + 7, u64::MAX, u64::MAX);
+        assert_eq!((s.available_free_bytes, s.total_free_bytes), (0, 0));
+        assert_eq!(s.used_bytes, 4 * MIB + 7);
+        // a huge configured quota never overflows or underflows
+        let s = pls_space_info(u64::MAX, u64::MAX - 1, u64::MAX, u64::MAX);
+        assert_eq!((s.available_free_bytes, s.total_free_bytes), (1, 1));
+        let s = pls_space_info(10, 20, 0, u64::MAX);
+        assert_eq!((s.available_free_bytes, s.total_free_bytes), (0, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pls_used_does_not_follow_dir_links() {
+        let base = pls_test_dir("links");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("pls");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("escape.bin"), [0u8; 777]).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.bin"), [0u8; 111]).unwrap();
+        // a junction needs no elevation (unlike a symlink); skip when it can't be made
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(root.join("linked"))
+            .arg(&outside)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&base);
+            eprintln!("mklink /J unavailable – link case skipped");
+            return;
+        }
+        assert_eq!(pls_used_bytes(&root), 111); // the junction and its target are not counted
+        // nor is a file symlink's target, when it can be created (needs the privilege)
+        if std::os::windows::fs::symlink_file(&outside.join("escape.bin"), &root.join("flink.bin")).is_ok() {
+            assert_eq!(pls_used_bytes(&root), 111);
+        }
+        let _ = std::fs::remove_dir_all(&base); // remove_dir_all removes the link, not the target
+    }
+
+    #[test]
+    fn pls_space_info_export() {
+        unsafe {
+            assert_eq!(XPersistentLocalStorageGetSpaceInfo(std::ptr::null_mut()), E_INVALIDARG);
+            let mut info: XPersistentLocalStorageSpaceInfo = std::mem::zeroed();
+            assert_eq!(XPersistentLocalStorageGetSpaceInfo(&mut info), S_OK);
+            let before = info.used_bytes;
+            let probe = data_subdir("pls").join(format!("probe_{}.bin", std::process::id()));
+            std::fs::write(&probe, [0u8; 321]).unwrap();
+            assert_eq!(XPersistentLocalStorageGetSpaceInfo(&mut info), S_OK);
+            assert_eq!(info.used_bytes, before + 321);
+            assert_eq!(info.used_bytes, pls_used_bytes(&data_subdir("pls")));
+            assert_eq!(info.total_bytes, 4096u64 << 20); // default quota: 4 GiB
+            assert!(info.available_free_bytes <= info.total_free_bytes);
+            assert!(info.total_free_bytes + info.used_bytes <= info.total_bytes);
+            let _ = std::fs::remove_file(&probe);
         }
     }
 }
