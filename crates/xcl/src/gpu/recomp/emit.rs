@@ -174,6 +174,27 @@ fn buffer_op(name: &str) -> Option<(BufKind, u64)> {
     None
 }
 
+/// D16 typed-buffer operations pack two converted components into each VGPR.  The HI_X
+/// forms update/read only the high half of VDATA.
+fn buffer_format_d16(name: &str) -> Option<(BufKind, u64, bool)> {
+    let (kind, r) = if let Some(r) = name.strip_prefix("buffer_load_format_d16_").or_else(|| name.strip_prefix("tbuffer_load_format_d16_")) {
+        (BufKind::FormatLoad, r)
+    } else if let Some(r) = name.strip_prefix("buffer_store_format_d16_").or_else(|| name.strip_prefix("tbuffer_store_format_d16_")) {
+        (BufKind::FormatStore, r)
+    } else {
+        return None;
+    };
+    let (components, high) = match r {
+        "x" => (1, false),
+        "xy" => (2, false),
+        "xyz" => (3, false),
+        "xyzw" => (4, false),
+        "hi_x" => (1, true),
+        _ => return None,
+    };
+    Some((kind, components, high))
+}
+
 /// GFX10 unified buffer formats (index = FORMAT value; LLVM `UfmtSymbolicGFX10`).
 pub const BUF_FORMATS: [&str; 78] = [
     "INVALID", "8_UNORM", "8_SNORM", "8_USCALED", "8_SSCALED", "8_UINT", "8_SINT", "16_UNORM", "16_SNORM", "16_USCALED",
@@ -610,6 +631,9 @@ impl Em {
     // ---------------------------------------------------------------- scalar ALU
 
     fn salu(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if matches!(name, "s_movrels_b32" | "s_movrels_b64" | "s_movreld_b32" | "s_movreld_b64" | "s_movrelsd_2_b32") {
+            return self.smovrel(d, name);
+        }
         let (outs, ins) = Self::ops(d);
         let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
@@ -642,6 +666,17 @@ impl Em {
             return Ok(());
         }
         if d.enc.name == "ENC_SOPC" {
+            if matches!(name, "s_bitcmp0_b64" | "s_bitcmp1_b64") {
+                let (a0, a1) = self.read64(d, ins[0]).ok_or("op")?;
+                let b = self.read(d, ins[1], false).ok_or("op")?;
+                let bit = format!("((select(({b} & 32u) == 0u, {a0}, {a1}) >> ({b} & 31u)) & 1u)");
+                if name == "s_bitcmp0_b64" {
+                    self.line(&format!("scc = (uint)({bit} == 0u);"));
+                } else {
+                    self.line(&format!("scc = {bit};"));
+                }
+                return Ok(());
+            }
             let a64 = name.ends_with("_u64");
             if a64 {
                 let (a, b) = (self.read64(d, ins[0]).ok_or("op")?, self.read64(d, ins[1]).ok_or("op")?);
@@ -723,6 +758,21 @@ impl Em {
             self.write64(&dst, &hex(pc as u32), "0u");
             return Ok(());
         }
+        if matches!(name, "s_bitset0_b64" | "s_bitset1_b64") {
+            let i = self.read(d, ins[0], false).ok_or("op")?;
+            let (lo, hi) = match &dst {
+                Dst::S(n) => (self.sreg(*n), self.sreg(*n + 1)),
+                _ => ("0u".into(), "0u".into()),
+            };
+            let mask = format!("(1u << ({i} & 31u))");
+            let (nl, nh) = if name == "s_bitset1_b64" {
+                (format!("{lo} | select(({i} & 32u) == 0u, {mask}, 0u)"), format!("{hi} | select(({i} & 32u) != 0u, {mask}, 0u)"))
+            } else {
+                (format!("{lo} & ~select(({i} & 32u) == 0u, {mask}, 0u)"), format!("{hi} & ~select(({i} & 32u) != 0u, {mask}, 0u)"))
+            };
+            self.write64(&dst, &nl, &nh);
+            return Ok(());
+        }
         if wide {
             return self.salu64(d, name, &dst, &ins);
         }
@@ -752,6 +802,7 @@ impl Em {
             "s_ff0_i32_b32" => (format!("firstbitlow(~{a})"), None),
             "s_ff1_i32_b32" => (format!("firstbitlow({a})"), None),
             "s_flbit_i32_b32" => (format!("(({a}) == 0u ? 0xFFFFFFFFu : 31u - firstbithigh({a}))"), None),
+            "s_flbit_i32" => (format!("ffbh_i({a})"), None),
             "s_abs_i32" => (format!("(uint)abs((int){a})"), Some(format!("{t} != 0u"))),
             "s_sext_i32_i8" => (format!("(uint)(((int)({a} << 24)) >> 24)"), None),
             "s_sext_i32_i16" => (format!("(uint)(((int)({a} << 16)) >> 16)"), None),
@@ -813,6 +864,56 @@ impl Em {
         Ok(())
     }
 
+    /// Scalar relative moves: uniform M0 selects an SGPR from the encoded base. HLSL has
+    /// no dynamically indexed scalar locals, so use the same bounded switch representation
+    /// as v_movrel. Reads are captured before writes to preserve overlapping moves.
+    fn smovrel(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        let dst = Self::field(d, "SDST");
+        let src = Self::field(d, "SSRC0");
+        if dst > 123 || src > 123 {
+            return Err("scalar movrel register");
+        }
+        let m0 = self.sreg(124);
+        let (rd, wr, wide) = match name {
+            "s_movrels_b32" => (Some(m0.clone()), None, false),
+            "s_movrels_b64" => (Some(m0.clone()), None, true),
+            "s_movreld_b32" => (None, Some(m0.clone()), false),
+            "s_movreld_b64" => (None, Some(m0.clone()), true),
+            "s_movrelsd_2_b32" => (Some(format!("({m0} & 0x3FFu)")), Some(format!("(({m0} >> 16) & 0x3FFu)")), false),
+            _ => return Err("scalar movrel"),
+        };
+        let words = if wide { 2 } else { 1 };
+        let mut vals = Vec::new();
+        for word in 0..words {
+            let t = self.t();
+            if let Some(idx) = &rd {
+                let mut cases = String::new();
+                for k in 0..=123u64.saturating_sub(src + word) {
+                    cases.push_str(&format!(" case {k}u: {t} = {}; break;", self.sreg(src + word + k)));
+                }
+                self.line(&format!("uint {t} = 0u; switch ({idx}) {{{cases} default: break; }}"));
+            } else {
+                let v = self.sreg(src + word);
+                self.line(&format!("uint {t} = {v};"));
+            }
+            vals.push(t);
+        }
+        if let Some(idx) = &wr {
+            let mut cases = String::new();
+            for k in 0..=123u64.saturating_sub(dst + words - 1) {
+                let writes = (0..words).map(|w| format!("{} = {};", self.sreg(dst + k + w), vals[w as usize])).collect::<Vec<_>>().join(" ");
+                cases.push_str(&format!(" case {k}u: {writes} break;"));
+            }
+            self.line(&format!("switch ({idx}) {{{cases} default: break; }}"));
+        } else {
+            for word in 0..words {
+                let d = self.sreg(dst + word);
+                self.line(&format!("{d} = {};", vals[word as usize]));
+            }
+        }
+        Ok(())
+    }
+
     fn salu64(&mut self, d: &Decoded, name: &str, dst: &Dst, ins: &[&Operand]) -> Result<(), &'static str> {
         let a = match ins.first() {
             Some(o) => Some(self.read64(d, o).ok_or("op")?),
@@ -861,8 +962,27 @@ impl Em {
             "s_wqm_b64" => (format!("wqm({al})"), format!("wqm({ah})"), Some(nz.clone())),
             "s_brev_b64" => (format!("reversebits({ah})"), format!("reversebits({al})"), None),
             "s_bcnt1_i32_b64" => (format!("countbits({al}) + countbits({ah})"), "0u".into(), Some(format!("{t0} != 0u"))),
+            "s_bcnt0_i32_b64" => (format!("64u - countbits({al}) - countbits({ah})"), "0u".into(), Some(format!("{t0} != 0u"))),
             "s_ff1_i32_b64" => {
                 (format!("({al} != 0u) ? firstbitlow({al}) : (({ah} != 0u) ? 32u + firstbitlow({ah}) : 0xFFFFFFFFu)"), "0u".into(), None)
+            }
+            "s_ff0_i32_b64" => {
+                (format!("(~{al} != 0u) ? firstbitlow(~{al}) : ((~{ah} != 0u) ? 32u + firstbitlow(~{ah}) : 0xFFFFFFFFu)"), "0u".into(), None)
+            }
+            "s_flbit_i32_b64" => (
+                format!("({ah} != 0u) ? 31u - firstbithigh({ah}) : (({al} != 0u) ? 63u - firstbithigh({al}) : 0xFFFFFFFFu)"),
+                "0u".into(),
+                None,
+            ),
+            "s_flbit_i32_i64" => {
+                // signed: invert both halves when the i64 sign is set, then count from bit 63
+                let (nl, nh) = (self.t(), self.t());
+                self.line(&format!("uint {nl} = select((int){ah} < 0, ~{al}, {al}); uint {nh} = select((int){ah} < 0, ~{ah}, {ah});"));
+                (
+                    format!("({nh} != 0u) ? 31u - firstbithigh({nh}) : (({nl} != 0u) ? 63u - firstbithigh({nl}) : 0xFFFFFFFFu)"),
+                    "0u".into(),
+                    None,
+                )
             }
             "s_lshl_b64" | "s_lshr_b64" | "s_ashr_i64" => {
                 let v = format!("(((uint64_t){ah} << 32) | (uint64_t){al})");
@@ -882,6 +1002,24 @@ impl Em {
                 ));
                 (format!("(uint){w}"), format!("(uint)({w} >> 32)"), None)
             }
+            "s_bfe_u64" | "s_bfe_i64" => {
+                let v = format!("(((uint64_t){ah} << 32) | (uint64_t){al})");
+                let w = self.t();
+                let o = self.t();
+                let x = self.t();
+                self.line(&format!("uint {w} = ({bl} >> 16) & 0x7Fu; uint {o} = {bl} & 63u; uint64_t {x} = {v} >> {o};"));
+                let r = self.t();
+                if name == "s_bfe_u64" {
+                    self.line(&format!(
+                        "uint64_t {r} = ({w} == 0u) ? 0ull : (({w} >= 64u) ? {x} : ({x} & (0xFFFFFFFFFFFFFFFFull >> (64u - {w}))));"
+                    ));
+                } else {
+                    self.line(&format!(
+                        "uint64_t {r} = ({w} == 0u) ? 0ull : (({w} >= 64u) ? (uint64_t)(int64_t){x} : (uint64_t)(((int64_t)({x} << (64u - {w}))) >> (64u - {w})));"
+                    ));
+                }
+                (format!("(uint){r}"), format!("(uint)({r} >> 32)"), Some(nz.clone()))
+            }
             _ => {
                 let op = name.trim_start_matches("s_").trim_end_matches("_b64");
                 match bitwise(op) {
@@ -894,7 +1032,7 @@ impl Em {
         if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
-        if name == "s_bcnt1_i32_b64" || name == "s_ff1_i32_b64" {
+        if matches!(name, "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" | "s_ff0_i32_b64" | "s_ff1_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64") {
             self.write32(dst, &t0);
         } else {
             self.write64(dst, &t0, &t1);
@@ -1007,9 +1145,11 @@ impl Em {
         if let Some((n, signed, store, half)) = d16_small(name.trim_start_matches("buffer_")) {
             return self.mubuf_d16(d, n, signed, store, half);
         }
-        let (kind, count) = match small {
-            Some(_) => (BufKind::Load, 1),
-            None => buffer_op(name).ok_or("MUBUF")?,
+        let d16_format = buffer_format_d16(name);
+        let (kind, count) = match (small, d16_format) {
+            (Some(_), _) => (BufKind::Load, 1),
+            (None, Some((kind, components, _))) => (kind, (components + 1) / 2),
+            (None, None) => buffer_op(name).ok_or("MUBUF")?,
         };
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if f("LDS") != 0 || f("TFE") != 0 {
@@ -1073,6 +1213,26 @@ impl Em {
                 self.line(&format!(
                     "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
                 ));
+                if let Some((_, components, high)) = d16_format {
+                    let half = |component: u64| {
+                        let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
+                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                    };
+                    let mut assigns = Vec::new();
+                    if high {
+                        let v = self.vreg(vdata);
+                        assigns.push(format!("{v} = ({v} & 0xFFFFu) | ({t}_ok ? ({} << 16) : 0u);", half(0)));
+                    } else {
+                        for i in 0..count {
+                            let lo = half(2 * i);
+                            let hi = if 2 * i + 1 < components { half(2 * i + 1) } else { "0u".into() };
+                            let v = self.vreg(vdata + i);
+                            assigns.push(format!("{v} = {t}_ok ? ({lo} | ({hi} << 16)) : 0u;"));
+                        }
+                    }
+                    self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
+                    return Ok(());
+                }
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
@@ -1084,6 +1244,18 @@ impl Em {
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
+                if let Some((_, components, high)) = d16_format {
+                    self.line(&format!("uint {t}_ty = ({t}_info >> 3) & 7u;"));
+                    let mut source = |component: u64| {
+                        let v = self.vreg(vdata + if high { 0 } else { component / 2 });
+                        let shift = if high || component & 1 != 0 { " >> 16" } else { "" };
+                        let h = format!("(({v}{shift}) & 0xFFFFu)");
+                        format!("select({t}_ty == 4u, {h}, select({t}_ty == 5u, (uint)(((int)({h} << 16)) >> 16), asuint(f16tof32({h}))))")
+                    };
+                    let vals: Vec<String> = (0..4).map(|i| if i < components { source(i) } else { "0u".into() }).collect();
+                    self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
+                    return Ok(());
+                }
                 let vals: Vec<String> = (0..4).map(|i| if i < count { self.vreg(vdata + i) } else { "0u".into() }).collect();
                 self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
             }
@@ -2041,6 +2213,40 @@ impl Em {
         Ok(())
     }
 
+    /// v_swaprel_b32: exchange the fixed VDST with the VGPR at SRC0 + M0. The spec marks
+    /// both read-write, so both old values are captured before either write – an
+    /// overlapping pair (VDST = SRC0 + M0) degenerates to a no-op. Writes honor EXEC.
+    fn swaprel(&mut self, d: &Decoded) -> Result<(), &'static str> {
+        if d.variant != Variant::Plain {
+            return Err("swaprel SDWA/DPP");
+        }
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+        let vdst = f("VDST");
+        let src_code = f("SRC0");
+        if src_code < 256 {
+            return Err("swaprel: the source is not a VGPR");
+        }
+        let base = src_code - 256;
+        let top = self.max_vgpr.max(vdst).max(base);
+        let m0 = self.sreg(124);
+        let act = self.act();
+        let (td, ts) = (self.t(), self.t());
+        let vd = self.vreg(vdst);
+        self.line(&format!("uint {td} = {vd};"));
+        let mut cases = String::new();
+        for k in 0..=top.saturating_sub(base) {
+            cases.push_str(&format!(" case {k}u: {ts} = {}; break;", self.vreg(base + k)));
+        }
+        self.line(&format!("uint {ts} = 0u; switch ({m0}) {{{cases} default: break; }}"));
+        let mut cases = String::new();
+        for k in 0..=top.saturating_sub(base) {
+            let v = self.vreg(base + k);
+            cases.push_str(&format!(" case {k}u: {v} = {td}; break;"));
+        }
+        self.line(&format!("if ({act}) {{ {vd} = {ts}; switch ({m0}) {{{cases} default: break; }} }}"));
+        Ok(())
+    }
+
     /// 16-bit VALU (f16 / u16 / i16 / b16): sources are the low halves (VOP3 op_sel picks the
     /// high half per source), results go to the low half (op_sel[3]: high half) and the other
     /// half is preserved – AnyPS5 `write16Bits` (GPL-2.0, ported 2026-11-20).
@@ -2095,6 +2301,7 @@ impl Em {
             "v_min_f16" => fr(format!("min({}, {})", fh(0), fh(1))),
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_div_fixup_f16" => fr(format!("div_fixup({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
@@ -2128,6 +2335,9 @@ impl Em {
             "v_cvt_f16_i16" => fr(format!("(float){}", si(0))),
             "v_cvt_u16_f16" => format!("(cvt_u32({}) > 0xFFFFu ? 0xFFFFu : cvt_u32({}))", fh(0), fh(0)),
             "v_cvt_i16_f16" => format!("((uint)clamp(cvt_i32({}), -32768, 32767) & 0xFFFFu)", fh(0)),
+            // f16 → unorm16 / snorm16: round(clamp(x) * range), like v_cvt_pknorm_*_f32
+            "v_cvt_norm_u16_f16" => format!("((uint)round(saturate({}) * 65535.0f) & 0xFFFFu)", fh(0)),
+            "v_cvt_norm_i16_f16" => format!("((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu)", fh(0)),
             "v_add_nc_u16" | "v_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
             "v_sub_nc_u16" | "v_sub_u16" => format!("(({a} - {b}) & 0xFFFFu)"),
             "v_subrev_nc_u16" | "v_subrev_u16" => format!("(({b} - {a}) & 0xFFFFu)"),
@@ -2187,6 +2397,12 @@ impl Em {
         let t = self.t();
         if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
             let (op, ty) = rest.rsplit_once('_').ok_or("VOPC")?;
+            if op == "class" && ty == "f64" {
+                let cond = format!("((({}) >> fclass64({})) & 1u) != 0u", lo_hi[1].0, f64v(0));
+                let dst = if name.starts_with("v_cmpx_") { Dst::S(126) } else { dst };
+                self.write_mask(&dst, &cond);
+                return Ok(());
+            }
             let (a, b) = match ty {
                 "u64" => (u64v(0), u64v(1)),
                 "i64" => (format!("(int64_t){}", u64v(0)), format!("(int64_t){}", u64v(1))),
@@ -2241,6 +2457,7 @@ impl Em {
                     "v_add_f64" => format!("{} + {}", f64v(0), f64v(1)),
                     "v_mul_f64" => format!("{} * {}", f64v(0), f64v(1)),
                     "v_fma_f64" => format!("fma({}, {}, {})", f64v(0), f64v(1), f64v(2)),
+                    "v_div_fixup_f64" => format!("div_fixup_d({}, {}, {})", f64v(0), f64v(1), f64v(2)),
                     "v_min_f64" => format!("min({}, {})", f64v(0), f64v(1)),
                     "v_max_f64" => format!("max({}, {})", f64v(0), f64v(1)),
                     "v_rcp_f64" => format!("(1.0 / {})", f64v(0)),
@@ -2248,6 +2465,12 @@ impl Em {
                     "v_cvt_f64_i32" => format!("(double)(int){}", lo_hi[0].0),
                     "v_cvt_f64_u32" => format!("(double){}", lo_hi[0].0),
                     "v_floor_f64" => format!("floor_d({})", f64v(0)),
+                    "v_ceil_f64" => format!("ceil_d({})", f64v(0)),
+                    "v_fract_f64" => format!("fract_d({})", f64v(0)),
+                    "v_rndne_f64" => format!("round_ne_d({})", f64v(0)),
+                    "v_frexp_mant_f64" => format!("frexp_mant_d({})", f64v(0)),
+                    "v_sqrt_f64" => format!("sqrt({})", f64v(0)),
+                    "v_rsq_f64" => format!("(1.0 / sqrt({}))", f64v(0)),
                     "v_trunc_f64" => format!("(double)(int64_t){}", f64v(0)),
                     "v_ldexp_f64" => format!("({} * (double)exp2((float)(int){}))", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
@@ -2262,6 +2485,11 @@ impl Em {
                     }
                     "v_cvt_u32_f64" => {
                         self.line(&format!("uint {t} = (uint)clamp({}, 0.0, 4294967295.0);", f64v(0)));
+                        self.write32(&dst, &t);
+                        return Ok(());
+                    }
+                    "v_frexp_exp_i32_f64" => {
+                        self.line(&format!("uint {t} = (uint)frexp_exp_d({});", f64v(0)));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
@@ -2287,18 +2515,24 @@ impl Em {
         }
         let (outs, ins) = Self::ops(d);
         // 32-bit operations whose names mention 16-bit halves
-        const WIDE16: &[&str] =
-            &["v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sad_u16", "v_sat_pk_u8_i16"];
+        const WIDE16: &[&str] = &[
+            "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16", "v_cvt_pk_u16_u32",
+            "v_cvt_pk_i16_i32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sad_u16", "v_sat_pk_u8_i16",
+        ];
         let f16 = (name.contains("f16") || name.contains("_i16") || name.contains("_u16") || name.contains("_b16")) && !WIDE16.contains(&name);
         let cmp = name.starts_with("v_cmp");
         // inline constants are f16 patterns only where the source itself is 16-bit
-        let src_f16 = matches!(name, "v_cvt_f32_f16" | "v_pack_b32_f16") || (cmp && name.ends_with("_f16"));
+        let src_f16 = matches!(name, "v_cvt_f32_f16" | "v_pack_b32_f16" | "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16")
+            || (cmp && name.ends_with("_f16"));
         let mix = name.starts_with("v_fma_mix");
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
         }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
+        }
+        if name == "v_swaprel_b32" {
+            return self.swaprel(d);
         }
         if name == "v_swap_b32" && d.variant == Variant::Plain {
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
@@ -2517,6 +2751,29 @@ impl Em {
                 fs(1)
             ),
             "v_cvt_pknorm_u16_f32" => format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", fs(0), fs(1)),
+            // packed f16 sources: op_sel[0]/[1] pick each source's half; result fills all 32 bits
+            "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16" => {
+                let hf = |i: usize| {
+                    let s = u.get(i).map(String::as_str).unwrap_or("0u");
+                    let mut s = if m.opsel >> i & 1 == 1 { format!("f16tof32({s} >> 16)") } else { format!("f16tof32({s} & 0xFFFFu)") };
+                    if m.abs[i] {
+                        s = format!("abs({s})");
+                    }
+                    if m.neg[i] {
+                        s = format!("(-{s})");
+                    }
+                    s
+                };
+                if name == "v_cvt_pknorm_i16_f16" {
+                    format!(
+                        "((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) | (((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) << 16)",
+                        hf(0),
+                        hf(1)
+                    )
+                } else {
+                    format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", hf(0), hf(1))
+                }
+            }
             "v_mul_hi_i32_i24" => format!("(uint)(((int64_t)i24({a}) * (int64_t)i24({b})) >> 32)"),
             "v_sat_pk_u8_i16" => format!("(uint)clamp(((int)({a} << 16)) >> 16, 0, 255) | ((uint)clamp((int){a} >> 16, 0, 255) << 8)"),
             "v_div_fmas_f32" => fr(format!("mad({}, {}, {})", fs(0), fs(1), fs(2))),
@@ -2839,16 +3096,27 @@ impl Em {
             "store_dwordx2" => (true, 2),
             "store_dwordx3" => (true, 3),
             "store_dwordx4" => (true, 4),
+            // the *_addtid forms have no ADDR operand in the spec: scalar base only
+            "load_dword_addtid" => (false, 1),
+            "store_dword_addtid" => (true, 1),
             _ => return Err("FLAT"),
         };
         let global = d.enc.name == "ENC_FLAT_GLBL";
-        let addr = self.vreg(f("ADDR"));
         let saddr = f("SADDR");
-        let base = if global && saddr != 0x7D && saddr != 0x7F {
-            let s = self.sreg(saddr);
-            format!("{s} + {addr}")
+        let base = if op.ends_with("_addtid") {
+            // EA = SADDR ("off"/null sentinel → 0) + 4 * lane index + signed OFFSET
+            match saddr {
+                0x7D | 0x7F => "4u * lane_id".to_string(),
+                _ => format!("{} + 4u * lane_id", self.sreg(saddr)),
+            }
         } else {
-            addr
+            let addr = self.vreg(f("ADDR"));
+            if global && saddr != 0x7D && saddr != 0x7F {
+                let s = self.sreg(saddr);
+                format!("{s} + {addr}")
+            } else {
+                addr
+            }
         };
         self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
@@ -3717,6 +3985,17 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
 /// A 64-bit atomic at byte address `a` of the flat memory (SM 6.6 InterlockedXxx64);
 /// `v`, `cmp`, `old` are uint64_t variables.
 fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<String> {
+    if matches!(op, "inc" | "dec") {
+        let c = format!("{t}_c");
+        let new = if op == "inc" {
+            format!("({c} >= {v}) ? (uint64_t)0 : {c} + (uint64_t)1")
+        } else {
+            format!("({c} == (uint64_t)0 || {c} > {v}) ? {v} : {c} - (uint64_t)1")
+        };
+        return Some(format!(
+            "uint64_t {t}_c = mem.Load<uint64_t>({a}); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; mem.InterlockedCompareExchange64({a}, {t}_c, {t}_n, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+        ));
+    }
     let f = match op {
         "add" | "sub" => "InterlockedAdd64",
         "and" => "InterlockedAnd64",
@@ -3729,7 +4008,9 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
             let f = if op == "smin" { "InterlockedMin64" } else { "InterlockedMax64" };
             return Some(format!("int64_t {t}_s = 0; mem.{f}({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s;"));
         }
-        "cmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        // float compare-swap compares the whole 64-bit payload bitwise (like rmw32's
+        // fcmpswap): differs from a numeric f64 compare only for -0 / NaN
+        "cmpswap" | "fcmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
         _ => return None,
     };
     let val = if op == "sub" { format!("((uint64_t)0 - {v})") } else { v.to_string() };
@@ -4049,6 +4330,7 @@ uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
 uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, select(r < -(int64_t)0x80000000u, 0x80000000u, (uint)r)); }
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
+double div_fixup_d(double q, double d, double n) { return (isnan(d) || isnan(n) || d == 0.0 || isinf(d) || isinf(n)) ? n / d : q; }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
@@ -4078,7 +4360,52 @@ uint perm_b32(uint s0, uint s1, uint sel) {
 uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and(!isnan(f), (h & 0x7FFFu) != 0u), abs(f16tof32(h)) > abs(f)); }
 float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
+// f64 frexp pair: input = mant * 2^exp with |mant| in [0.5, 1); denormals are normalized.
+// 0/±inf/NaN: mant = input, exp = 0 (per the ISA and the amdgcn frexp intrinsics).
+// Bit-exact by construction – HLSL frexp() only takes float and would narrow the input.
+double frexp_mant_d(double x) {
+    uint l, h; asuint(x, l, h);
+    uint e = (h >> 20) & 0x7FFu;
+    uint m = h & 0xFFFFFu;
+    if (e == 0x7FFu || (e == 0u && (m | l) == 0u)) return x;
+    uint s = h & 0x80000000u;
+    if (e != 0u) return asdouble(l, s | m | 0x3FE00000u);
+    uint top = m != 0u ? 32u + firstbithigh(m) : firstbithigh(l);
+    uint64_t f = ((uint64_t)m << 32) | (uint64_t)l;
+    uint64_t ff = (f << (52u - top)) & 0x000FFFFFFFFFFFFFull;
+    return asdouble((uint)ff, s | 0x3FE00000u | (uint)(ff >> 32));
+}
+int frexp_exp_d(double x) {
+    uint l, h; asuint(x, l, h);
+    uint e = (h >> 20) & 0x7FFu;
+    uint m = h & 0xFFFFFu;
+    if (e == 0x7FFu || (e == 0u && (m | l) == 0u)) return 0;
+    if (e != 0u) return (int)e - 1022;
+    uint top = m != 0u ? 32u + firstbithigh(m) : firstbithigh(l);
+    return (int)top - 1073;
+}
 double floor_d(double x) { double t = (double)(int64_t)x; return t > x ? t - 1.0 : t; }
+double ceil_d(double x) { return (isinf(x) || isnan(x)) ? x : -floor_d(-x); }
+double fract_d(double x) { return (isinf(x) || isnan(x)) ? x - x : min(x - floor_d(x), asdouble(0xFFFFFFFFu, 0x3FEFFFFFu)); }
+double round_ne_d(double x) {
+    uint l, h; asuint(x, l, h);
+    uint sign = h & 0x80000000u;
+    uint e = (h >> 20) & 0x7FFu;
+    uint64_t mag = ((uint64_t)(h & 0x7FFFFFFFu) << 32) | (uint64_t)l;
+    if (e == 0x7FFu || e >= 1075u) return x;
+    if (e < 1022u) return asdouble(0u, sign);
+    if (e == 1022u) {
+        bool above_half = (mag & 0x000FFFFFFFFFFFFFull) != 0ull;
+        return above_half ? asdouble(0u, sign | 0x3FF00000u) : asdouble(0u, sign);
+    }
+    uint shift = 1075u - e;
+    uint64_t mask = (1ull << shift) - 1ull;
+    uint64_t half = 1ull << (shift - 1u);
+    uint64_t fraction = mag & mask;
+    uint64_t whole = mag & ~mask;
+    if (fraction > half || (fraction == half && ((whole >> shift) & 1ull) != 0ull)) whole += 1ull << shift;
+    return asdouble((uint)whole, sign | (uint)(whole >> 32));
+}
 uint dot4_u8(uint a, uint b, uint c) { uint r = c; [unroll] for (uint i = 0u; i < 32u; i += 8u) r += ((a >> i) & 0xFFu) * ((b >> i) & 0xFFu); return r; }
 uint dot4_i8(uint a, uint b, uint c) { int r = (int)c; [unroll] for (uint i = 0u; i < 32u; i += 8u) r += (((int)(a << (24u - i))) >> 24) * (((int)(b << (24u - i))) >> 24); return (uint)r; }
 uint dot8_u4(uint a, uint b, uint c) { uint r = c; [unroll] for (uint i = 0u; i < 32u; i += 4u) r += ((a >> i) & 0xFu) * ((b >> i) & 0xFu); return r; }
@@ -4092,6 +4419,13 @@ uint fclass16(uint h) {
 uint fclass(float f) {
     uint u = asuint(f); uint e = (u >> 23) & 0xFFu; uint m = u & 0x7FFFFFu; bool n = (u >> 31) != 0u;
     if (e == 0xFFu) return m != 0u ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (n ? 2u : 9u);
+    if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
+    return n ? 3u : 8u;
+}
+uint fclass64(double f) {
+    uint l, h; asuint(f, l, h);
+    uint e = (h >> 20) & 0x7FFu; uint m = (h & 0xFFFFFu) | l; bool n = (h >> 31) != 0u;
+    if (e == 0x7FFu) return m != 0u ? (((h & 0x80000u) != 0u) ? 1u : 0u) : (n ? 2u : 9u);
     if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
     return n ? 3u : 8u;
 }
