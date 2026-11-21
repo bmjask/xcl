@@ -6,7 +6,7 @@ use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 
 use super::xasync::*;
-use crate::util::{from_cstr_ptr, E_INVALIDARG, HRESULT, S_OK};
+use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
@@ -63,10 +63,53 @@ pub struct Blob {
 type ContainerCb = unsafe extern "system" fn(*const ContainerInfo, *mut c_void) -> bool;
 type BlobCb = unsafe extern "system" fn(*const BlobInfo, *mut c_void) -> bool;
 
+/// `stem` – a file name's bytes before the first '.' – is a Windows reserved
+/// device name (CON, PRN, AUX, NUL, CLOCK$, COM1-9, LPT1-9), in any letter
+/// case. Windows opens the device itself for those names, extension or not
+/// ("con.txt" still addresses CON), so such a stem must never reach the disk
+/// unchanged.
+fn device_stem(stem: &[u8]) -> bool {
+    let up = stem.to_ascii_uppercase();
+    matches!(up.as_slice(), b"CON" | b"PRN" | b"AUX" | b"NUL" | b"CLOCK$")
+        || (up.len() == 4 && matches!(&up[..3], b"COM" | b"LPT") && matches!(up[3], b'1'..=b'9'))
+}
+
 /// File-name form of a container / blob name: unusual characters as %XX.
+///
+/// Some names look plain but may never hit the disk as written, so a byte of
+/// each is %XX-escaped too:
+///
+/// - a name ending in '.' or ' ' is stripped by Windows, silently folding it
+///   into the shorter name ("x." shares a file with "x"), and bare "." and ".."
+///   resolve against the path itself instead of naming a child – a container
+///   called ".." would let XGameSaveDeleteContainer remove the provider root's
+///   parent. The last byte is escaped ("x." -> "x%2E", ".." -> ".%2E").
+/// - a stem that is a reserved device name gets its first byte escaped
+///   ("con.txt" -> "%63on.txt").
+///
+/// Other names keep the exact file name they have always had, and dec()
+/// restores every escape like any other %XX.
 fn enc(name: &str) -> String {
-    name.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b"._- ".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+    let b = name.as_bytes();
+    if b.is_empty() {
+        return String::new();
+    }
+    // the stem: bytes before the first '.', less the trailing spaces Windows drops
+    let mut stem = b.iter().position(|&c| c == b'.').unwrap_or(b.len());
+    while stem > 0 && b[stem - 1] == b' ' {
+        stem -= 1;
+    }
+    let esc_first = device_stem(&b[..stem]);
+    let esc_last = matches!(b[b.len() - 1], b'.' | b' ');
+    b.iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if (i == 0 && esc_first) || (i == b.len() - 1 && esc_last) || !(c.is_ascii_alphanumeric() || b"._- ".contains(&c)) {
+                format!("%{c:02X}")
+            } else {
+                (c as char).to_string()
+            }
+        })
         .collect()
 }
 
@@ -170,6 +213,10 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuotaResult(b: *mut XAsyncBlo
 
 pub unsafe extern "system" fn XGameSaveDeleteContainer(p: *mut Provider, name: *const u8) -> HRESULT {
     let (Some(pr), Some(n)) = (provider(p), from_cstr_ptr(name)) else { return E_INVALIDARG };
+    // an empty name would join to the root itself; reject it like create does
+    if n.is_empty() || n.len() > 256 {
+        return E_GS_INVALID_CONTAINER_NAME;
+    }
     let _ = std::fs::remove_dir_all(pr.root.join(enc(&n)));
     S_OK
 }
@@ -315,11 +362,14 @@ fn read_layout(dir: &Path, names: &[String]) -> Result<(Vec<u8>, u32), HRESULT> 
     Ok((out, picked.len() as u32))
 }
 
-unsafe fn names_of(names: *const *const u8, count: u32) -> Vec<String> {
-    if names.is_null() {
-        return Vec::new();
+unsafe fn names_of(names: *const *const u8, count: u32) -> Result<Vec<String>, HRESULT> {
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    (0..count as usize).filter_map(|i| from_cstr_ptr(*names.add(i))).collect()
+    if names.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    (0..count as usize).map(|i| from_cstr_ptr(*names.add(i)).ok_or(E_INVALIDARG)).collect()
 }
 
 /// Turn the offsets of a copied layout into pointers.
@@ -336,7 +386,11 @@ pub unsafe extern "system" fn XGameSaveReadBlobData(c: *mut Container, names: *c
     if count.is_null() {
         return E_INVALIDARG;
     }
-    let (bytes, n) = match read_layout(&c.dir, &names_of(names, *count)) {
+    let requested = match names_of(names, *count) {
+        Ok(names) => names,
+        Err(e) => return e,
+    };
+    let (bytes, n) = match read_layout(&c.dir, &requested) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -353,7 +407,8 @@ static READ_ID: u8 = 0;
 
 pub unsafe extern "system" fn XGameSaveReadBlobDataAsync(c: *mut Container, names: *const *const u8, count: u32, b: *mut XAsyncBlock) -> HRESULT {
     let Some(c) = container(c) else { return E_INVALIDARG };
-    let (dir, list) = (c.dir.clone(), names_of(names, count));
+    let Ok(list) = names_of(names, count) else { return E_INVALIDARG };
+    let dir = c.dir.clone();
     begin_with(b, &READ_ID as *const u8 as usize, move || {
         let (mut bytes, n) = read_layout(&dir, &list)?;
         bytes.splice(0..0, n.to_le_bytes()); // count travels in front, dropped by the Result
@@ -367,6 +422,15 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, s
     if hr < 0 {
         return hr;
     }
+    if need < std::mem::size_of::<u32>() {
+        return E_FAIL;
+    }
+    let body_size = need - std::mem::size_of::<u32>();
+    if out.is_null() || size < body_size {
+        // Do not consume the one-shot XAsync result until the caller can
+        // receive it; the documented insufficient-buffer retry must succeed.
+        return E_GS_PROVIDED_BUFFER_TOO_SMALL;
+    }
     let mut tmp = vec![0u8; need];
     let hr = XAsyncGetResult(b, &READ_ID as *const u8 as *const c_void, need, tmp.as_mut_ptr() as *mut c_void, std::ptr::null_mut());
     if hr < 0 {
@@ -374,9 +438,7 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, s
     }
     let n = u32::from_le_bytes(tmp[..4].try_into().unwrap());
     let body = &tmp[4..];
-    if out.is_null() || size < body.len() {
-        return E_GS_PROVIDED_BUFFER_TOO_SMALL;
-    }
+    debug_assert_eq!(body.len(), body_size);
     std::ptr::copy_nonoverlapping(body.as_ptr(), out as *mut u8, body.len());
     fix_up(out, n);
     if !count.is_null() {
@@ -422,21 +484,61 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
     S_OK
 }
 
+/// Move `src` over `dst` atomically (they are always in the same directory here, so the
+/// move cannot cross volumes). Windows `std::fs::rename` fails when `dst` already exists;
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` replaces it, `MOVEFILE_WRITE_THROUGH`
+/// has the new data on disk before the call returns.
+#[cfg(windows)]
+fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    let s: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let d: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { MoveFileExW(s.as_ptr(), d.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// POSIX `rename` already replaces an existing destination atomically.
+#[cfg(not(windows))]
+fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::rename(src, dst)
+}
+
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
     }
     if let Some(d) = display {
-        let _ = std::fs::write(dir.join("display"), d);
+        if std::fs::write(dir.join("display"), d).is_err() {
+            return crate::util::E_FAIL;
+        }
     }
     for (name, data) in ops {
-        let path = blobs.join(enc(name));
+        let file = enc(name);
+        let path = blobs.join(&file);
         match data {
             Some(d) => {
-                // write next to it, then replace: a crash never leaves half a blob
-                let tmp = path.with_extension("xcltmp");
-                if std::fs::write(&tmp, d).is_err() || std::fs::rename(&tmp, &path).is_err() {
+                // Write next to it, then move it over the destination in one step: a
+                // crash never leaves half a blob, and an existing blob is replaced. The
+                // temporary name appends to the *whole* encoded filename
+                // (`with_extension` would drop the part after the last '.', so "a" and
+                // "a.b" would share one temporary name). A literal '%' is encoded as
+                // "%25", so the non-hex "%tmp" marker cannot occur in a blob filename.
+                // The sequence also prevents concurrent updates from sharing a temp file.
+                let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp = blobs.join(format!("{file}.olympus%tmp.{}.{seq}", std::process::id()));
+                if std::fs::write(&tmp, d).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return crate::util::E_FAIL;
+                }
+                if replace_file(&tmp, &path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
                     return crate::util::E_FAIL;
                 }
             }
@@ -480,6 +582,60 @@ mod tests {
     }
 
     #[test]
+    fn read_blob_names_require_a_complete_counted_array() {
+        unsafe {
+            let mut provider = std::ptr::null_mut();
+            assert_eq!(
+                XGameSaveInitializeProvider(
+                    std::ptr::null_mut(),
+                    b"olympus-read-name-validation\0".as_ptr(),
+                    false,
+                    &mut provider,
+                ),
+                S_OK
+            );
+            let _ = XGameSaveDeleteContainer(provider, b"slot\0".as_ptr());
+            let mut container = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(provider, b"slot\0".as_ptr(), &mut container), S_OK);
+            let mut update = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(container, std::ptr::null(), &mut update), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(update, b"data\0".as_ptr(), b"secret".as_ptr(), 6), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(update), S_OK);
+            XGameSaveCloseUpdate(update);
+
+            let mut count = 1u32;
+            let mut buffer = vec![0u64; 32];
+            assert_eq!(
+                XGameSaveReadBlobData(container, std::ptr::null(), &mut count, 256, buffer.as_mut_ptr() as *mut Blob),
+                E_INVALIDARG
+            );
+            assert_eq!(count, 1, "invalid filter changed the caller's count");
+            let null_name = [std::ptr::null()];
+            assert_eq!(
+                XGameSaveReadBlobData(container, null_name.as_ptr(), &mut count, 256, buffer.as_mut_ptr() as *mut Blob),
+                E_INVALIDARG
+            );
+
+            let mut async_block: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XGameSaveReadBlobDataAsync(container, std::ptr::null(), 1, &mut async_block), E_INVALIDARG);
+            assert_eq!(XAsyncGetStatus(&mut async_block, false), E_INVALIDARG, "invalid async filter started an operation");
+            assert_eq!(XGameSaveReadBlobDataAsync(container, null_name.as_ptr(), 1, &mut async_block), E_INVALIDARG);
+
+            // The documented empty filter remains the read-all form.
+            count = 0;
+            assert_eq!(
+                XGameSaveReadBlobData(container, std::ptr::null(), &mut count, 256, buffer.as_mut_ptr() as *mut Blob),
+                S_OK
+            );
+            assert_eq!(count, 1);
+
+            XGameSaveCloseContainer(container);
+            assert_eq!(XGameSaveDeleteContainer(provider, b"slot\0".as_ptr()), S_OK);
+            XGameSaveCloseProvider(provider);
+        }
+    }
+
+    #[test]
     fn containers_blobs_round_trip() {
     let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -517,7 +673,12 @@ mod tests {
             assert_eq!(XGameSaveReadBlobDataAsync(c, names.as_ptr(), 1, &mut blk), S_OK);
             assert_eq!(XAsyncGetStatus(&mut blk, true), S_OK);
             let mut buf2 = vec![0u64; 16];
-            let mut n2 = 0u32;
+            let mut n2 = u32::MAX;
+            assert_eq!(
+                XGameSaveReadBlobDataResult(&mut blk, 1, buf2.as_mut_ptr() as *mut Blob, &mut n2),
+                E_GS_PROVIDED_BUFFER_TOO_SMALL
+            );
+            assert_eq!(n2, u32::MAX, "failed result changed the output count");
             assert_eq!(XGameSaveReadBlobDataResult(&mut blk, 128, buf2.as_mut_ptr() as *mut Blob, &mut n2), S_OK);
             let b1 = &*(buf2.as_ptr() as *const Blob);
             assert_eq!((n2, std::slice::from_raw_parts(b1.data, 2)), (1, &b"xy"[..]));
@@ -539,5 +700,189 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// Names in `dir` still carrying the temporary-file suffix.
+    fn temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir.join("b"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".olympus%tmp."))
+            .collect()
+    }
+
+    #[test]
+    fn apply_overwrites_an_existing_blob_repeatedly() {
+        let dir = std::env::temp_dir().join(format!("olympus_gamesave_rewrite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // first write, then several overwrites: on Windows std::fs::rename cannot replace
+        // an existing destination, so every update after the first used to fail there
+        assert_eq!(apply(&dir, Some("Save A"), &[("data".into(), Some(b"save one".to_vec()))]), S_OK);
+        assert_eq!(std::fs::read(dir.join("b").join("data")).unwrap(), b"save one");
+        for i in 2..=4 {
+            let d = format!("save number {i}").into_bytes();
+            assert_eq!(apply(&dir, None, &[("data".into(), Some(d.clone()))]), S_OK);
+            assert_eq!(std::fs::read(dir.join("b").join("data")).unwrap(), d);
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Save A");
+        // a successful update leaves no temporary files behind
+        assert_eq!(temp_files(&dir), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_similar_names_never_collide_and_failures_clean_up() {
+        let dir = std::env::temp_dir().join(format!("olympus_gamesave_names_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // names that share everything before the last '.' used to share one temporary file
+        let ops: Vec<(String, Option<Vec<u8>>)> = [
+            ("data", b"base".as_slice()),
+            ("data.b", b"one".as_slice()),
+            ("data.b.c", b"two".as_slice()),
+        ]
+        .into_iter()
+        .map(|(n, d)| (n.to_string(), Some(d.to_vec())))
+        .collect();
+        assert_eq!(apply(&dir, None, &ops), S_OK);
+        for (n, want) in [
+            ("data", b"base".as_slice()),
+            ("data.b", b"one".as_slice()),
+            ("data.b.c", b"two".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(dir.join("b").join(n)).unwrap(), want);
+        }
+        // overwriting just the middle name does not disturb the neighbours
+        assert_eq!(apply(&dir, None, &[("data.b".into(), Some(b"ONE".to_vec()))]), S_OK);
+        for (n, want) in [
+            ("data", b"base".as_slice()),
+            ("data.b", b"ONE".as_slice()),
+            ("data.b.c", b"two".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(dir.join("b").join(n)).unwrap(), want);
+        }
+        assert_eq!(temp_files(&dir), Vec::<String>::new());
+        // a failed replacement (a directory sits at the blob path) removes its temp file
+        std::fs::create_dir(dir.join("b").join("blocked")).unwrap();
+        assert_eq!(apply(&dir, None, &[("blocked".into(), Some(b"x".to_vec()))]), crate::util::E_FAIL);
+        assert!(dir.join("b").join("blocked").is_dir(), "a failed write must not disturb the destination");
+        assert_eq!(temp_files(&dir), Vec::<String>::new());
+        // a failed display-file write reports the error instead of silently dropping it
+        std::fs::create_dir(dir.join("display")).unwrap();
+        assert_eq!(apply(&dir, Some("blocked"), &[("nope".into(), Some(b"v".to_vec()))]), crate::util::E_FAIL);
+        assert!(!dir.join("b").join("nope").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// enc() must put every non-empty name into exactly one safe file-name
+    /// component: dec(enc(n)) == n, no two names share a file, and ".", "..",
+    /// trailing '.'/' ' or reserved device stems can never alias a special path
+    /// or another name on Windows.
+    #[test]
+    fn names_round_trip_stay_one_component_and_never_collide() {
+        let names = [
+            // ordinary names - their on-disk form must not change
+            "default", "slot/1", "Save A", "data", "data.b", "data.b.c", "meta", "real_container",
+            // path components and every trailing '.'/' ' Windows would strip
+            ".", "..", "...", "....", ".a", "a.", "..a", "a..", " ", "  ", ". ", " .", ". .", ".. ", ".. .", "x ", "x.", "x. ",
+            "x .",
+            // reserved device basenames, bare or with extensions
+            "CON", "con", "CoN", "PRN", "prn.ini", "AUX", "aux2", "NUL", "nul.log", "CLOCK$", "clock$.x", "COM1", "com9", "com0",
+            "com10", "LPT1", "lpt9", "con.txt", "con.b.c", "con .x", "NUL ", "NUL .x",
+            // escapes, separators and control bytes
+            "%", "%%", "%2E", "%2e", "%25", "a%2F", ".%2E", "..%2E", "a/b", "a\\b", "a:b", "a?b", "a\"b", "a<b", "a>b", "a|b",
+            "a\tb", "a\nb", "a\0b",
+            // non-ASCII UTF-8
+            "säve", "日本語", "a\u{1F600}b",
+        ];
+        let mut encoded = std::collections::HashMap::new();
+        for n in names {
+            let e = enc(n);
+            assert!(
+                !e.is_empty() && e != "." && e != ".." && !e.contains(['/', '\\']) && !e.ends_with(['.', ' ']),
+                "{n:?} encoded to {e:?} - not one safe file-name component"
+            );
+            assert_eq!(dec(&e), n, "{n:?} -> {e:?} failed to decode back");
+            if let Some(other) = encoded.insert(e.clone(), n) {
+                panic!("{n:?} and {other:?} both encode to {e:?}");
+            }
+        }
+        assert_eq!(dec(&enc("")), "");
+        // names that were already safe keep their on-disk form byte for byte
+        for (n, e) in [
+            ("default", "default"),
+            ("slot/1", "slot%2F1"),
+            ("data.b.c", "data.b.c"),
+            ("Save A", "Save A"),
+            ("%", "%25"),
+            ("%2E", "%252E"),
+        ] {
+            assert_eq!(enc(n), e, "{n:?}");
+        }
+        // dangerous names become unmistakably different file names instead
+        for (n, e) in [
+            (".", "%2E"),
+            ("..", ".%2E"),
+            ("...", "..%2E"),
+            ("x ", "x%20"),
+            ("x.", "x%2E"),
+            ("con.txt", "%63on.txt"),
+            ("COM1", "%43OM1"),
+            ("clock$", "%63lock%24"),
+            ("NUL .x", "%4EUL .x"),
+            ("a/b", "a%2Fb"),
+        ] {
+            assert_eq!(enc(n), e, "{n:?}");
+        }
+    }
+
+    /// '..' and friends must never let XGameSaveDeleteContainer touch anything
+    /// outside the provider root: before the enc() fix, deleting ".." removed
+    /// the root's parent and every sibling of the save folder.
+    #[test]
+    fn delete_container_cannot_escape_the_provider_root() {
+        let base = std::env::temp_dir().join(format!("olympus_gamesave_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("provider");
+        let sentinel = base.join("sentinel");
+        std::fs::create_dir_all(sentinel.join("inner")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(sentinel.join("keep.txt"), b"keep").unwrap();
+        let real = root.join("real_container");
+        std::fs::create_dir_all(real.join("b")).unwrap();
+        std::fs::write(real.join("b").join("data"), b"save").unwrap();
+        unsafe {
+            let p = Box::into_raw(Box::new(Provider { magic: MAGIC_PROVIDER, root: root.clone() }));
+            for name in [b"..\0".as_ptr(), b".\0".as_ptr(), b"...\0".as_ptr(), b" \0".as_ptr(), b"con\0".as_ptr()] {
+                assert_eq!(XGameSaveDeleteContainer(p, name), S_OK);
+            }
+            // an empty name is rejected before it can join to the root itself
+            assert_eq!(XGameSaveDeleteContainer(p, b"\0".as_ptr()), E_GS_INVALID_CONTAINER_NAME);
+            assert!(sentinel.join("inner").is_dir() && sentinel.join("keep.txt").is_file(), "'..' escaped the provider root");
+            assert!(real.is_dir(), "a delete of '..' must not fall onto a sibling dir");
+            // a container literally named ".." lives inside the root, enumerates
+            // back under its own name and deletes cleanly
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"..\0".as_ptr(), &mut c), S_OK);
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"d\0".as_ptr(), b"1".as_ptr(), 1), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+            XGameSaveCloseContainer(c);
+            assert!(root.join(".%2E").join("b").join("d").is_file());
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(list.iter().any(|e| e == &("..".to_string(), "..".to_string(), 1, 1)));
+            assert_eq!(XGameSaveDeleteContainer(p, b"..\0".as_ptr()), S_OK);
+            assert!(!root.join(".%2E").exists());
+            assert!(sentinel.join("keep.txt").is_file() && real.is_dir());
+            // ordinary deletes still work
+            assert_eq!(XGameSaveDeleteContainer(p, b"real_container\0".as_ptr()), S_OK);
+            assert!(!real.exists());
+            XGameSaveCloseProvider(p);
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

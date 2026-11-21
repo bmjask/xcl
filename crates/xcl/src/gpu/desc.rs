@@ -159,20 +159,75 @@ pub fn component_mapping(dst_sel: [u32; 4], order: [u32; 4]) -> u32 {
 }
 
 /// Resource and SRV descriptions of a T# (None: format without a DXGI equivalent).
+pub fn valid_cube_view(t: &Image) -> bool {
+    if t.ty != ImageType::Cube {
+        return true;
+    }
+    t.depth.checked_sub(t.base_array).is_some_and(|faces| faces != 0 && faces % 6 == 0)
+}
+
+pub fn valid_image_shape(t: &Image) -> bool {
+    if t.width == 0 || (!matches!(t.ty, ImageType::D1 | ImageType::D1Array) && t.height == 0) {
+        return false;
+    }
+    if matches!(t.ty, ImageType::D1Array | ImageType::D2Array | ImageType::D2MsaaArray) && (t.depth == 0 || t.base_array >= t.depth) {
+        return false;
+    }
+    if t.ty == ImageType::D3 && t.depth == 0 {
+        return false;
+    }
+    if matches!(t.ty, ImageType::D1Array | ImageType::D2Array | ImageType::D2MsaaArray | ImageType::Cube | ImageType::D3) && t.depth > u16::MAX as u32 {
+        return false;
+    }
+    let within_d3d12_limits = match t.ty {
+        ImageType::D1 => t.width <= D3D12_REQ_TEXTURE1D_U_DIMENSION,
+        ImageType::D1Array => t.width <= D3D12_REQ_TEXTURE1D_U_DIMENSION && t.depth <= D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION,
+        ImageType::D2 | ImageType::D2Msaa => t.width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && t.height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+        ImageType::D2Array | ImageType::D2MsaaArray | ImageType::Cube => {
+            t.width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+                && t.height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+                && t.depth <= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION
+        }
+        ImageType::D3 => {
+            t.width <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+                && t.height <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+                && t.depth <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+        }
+    };
+    if !within_d3d12_limits {
+        return false;
+    }
+    if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) {
+        return true;
+    }
+    let largest = match t.ty {
+        ImageType::D1 | ImageType::D1Array => t.width,
+        ImageType::D3 => t.width.max(t.height).max(t.depth),
+        _ => t.width.max(t.height),
+    };
+    let highest = 31 - largest.leading_zeros();
+    t.base_level <= t.last_level && t.last_level <= t.max_mip && t.max_mip <= highest
+}
+
 pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    if !valid_cube_view(t) || !valid_image_shape(t) {
+        return None;
+    }
     let (format, order) = dxgi_format(t.format)?;
-    let mips = t.max_mip.max(t.last_level) + 1;
+    let mips = t.max_mip + 1;
     let (dim, depth) = match t.ty {
-        ImageType::D1 | ImageType::D1Array => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, t.depth),
+        ImageType::D1 => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1),
+        ImageType::D1Array => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, t.depth),
         ImageType::D3 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, t.depth),
-        _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
+        ImageType::D2 | ImageType::D2Msaa => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1),
+        ImageType::D2Array | ImageType::D2MsaaArray | ImageType::Cube => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
     };
     let samples = if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) { 1u32 << t.last_level.min(4) } else { 1 };
     let res = D3D12_RESOURCE_DESC {
         Dimension: dim,
         Width: t.width as u64,
         Height: if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D { 1 } else { t.height },
-        DepthOrArraySize: depth.min(u16::MAX as u32) as u16,
+        DepthOrArraySize: depth as u16,
         MipLevels: if samples > 1 { 1 } else { mips as u16 },
         Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
@@ -350,6 +405,166 @@ mod tests {
         assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
         assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
         assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
+    }
+
+    #[test]
+    fn non_array_resources_ignore_tsharp_depth() {
+        let mut t = image(&tsharp()).unwrap();
+        t.depth = 19;
+        for (ty, depth, want) in [
+            (ImageType::D1, 19, 1),
+            (ImageType::D2, 19, 1),
+            (ImageType::D2Msaa, 19, 1),
+            (ImageType::D1Array, 19, 19),
+            (ImageType::D2Array, 19, 19),
+            (ImageType::D2MsaaArray, 19, 19),
+            (ImageType::Cube, 18, 18),
+            (ImageType::D3, 19, 19),
+        ] {
+            t.ty = ty;
+            t.depth = depth;
+            assert_eq!(image_d3d12(&t).unwrap().0.DepthOrArraySize, want, "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn cube_views_require_a_nonempty_whole_number_of_faces() {
+        let mut t = image(&tsharp()).unwrap();
+        t.ty = ImageType::Cube;
+        t.depth = 12;
+        for (base, valid, cubes) in [(0, true, 2), (6, true, 1), (12, false, 0), (13, false, 0), (1, false, 0)] {
+            t.base_array = base;
+            assert_eq!(valid_cube_view(&t), valid, "base {base}");
+            let d = image_d3d12(&t);
+            assert_eq!(d.is_some(), valid, "base {base}");
+            if let Some((_, srv)) = d {
+                assert_eq!(unsafe { srv.Anonymous.TextureCubeArray.NumCubes }, cubes);
+            }
+        }
+        t.depth = 5;
+        t.base_array = 0;
+        assert!(!valid_cube_view(&t));
+        assert!(image_d3d12(&t).is_none());
+    }
+
+    #[test]
+    fn image_mips_and_array_views_stay_within_resource_dimensions() {
+        let mut t = image(&tsharp()).unwrap();
+        t.width = 8;
+        t.height = 4;
+        t.base_level = 0;
+        t.last_level = 3;
+        t.max_mip = 3;
+        assert!(valid_image_shape(&t));
+        assert_eq!(image_d3d12(&t).unwrap().0.MipLevels, 4);
+        let changes: [fn(&mut Image); 6] = [
+            |x: &mut Image| x.width = 0,
+            |x: &mut Image| x.height = 0,
+            |x: &mut Image| x.max_mip = 32,
+            |x: &mut Image| x.max_mip = 4,
+            |x: &mut Image| x.last_level = 4,
+            |x: &mut Image| x.base_level = 4,
+        ];
+        for change in changes {
+            let mut bad = t;
+            change(&mut bad);
+            assert!(!valid_image_shape(&bad));
+            assert!(image_d3d12(&bad).is_none());
+        }
+        t.ty = ImageType::D2Array;
+        t.depth = 3;
+        t.base_array = 2;
+        assert!(valid_image_shape(&t));
+        t.base_array = 3;
+        assert!(!valid_image_shape(&t));
+        t.base_array = 0;
+        t.depth = 0;
+        assert!(!valid_image_shape(&t));
+    }
+
+    #[test]
+    fn resource_depth_is_rejected_instead_of_silently_clamped() {
+        let mut t = image(&tsharp()).unwrap();
+        t.depth = u16::MAX as u32 + 1;
+        for ty in [ImageType::D1Array, ImageType::D2Array, ImageType::D2MsaaArray, ImageType::Cube, ImageType::D3] {
+            t.ty = ty;
+            assert!(!valid_image_shape(&t), "{ty:?}");
+            assert!(image_d3d12(&t).is_none(), "{ty:?}");
+        }
+        for ty in [ImageType::D1, ImageType::D2, ImageType::D2Msaa] {
+            t.ty = ty;
+            assert!(valid_image_shape(&t), "{ty:?}");
+            assert_eq!(image_d3d12(&t).unwrap().0.DepthOrArraySize, 1, "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn resource_dimensions_respect_d3d12_texture_limits() {
+        let mut t = image(&tsharp()).unwrap();
+        t.base_level = 0;
+        t.last_level = 0;
+        t.max_mip = 0;
+
+        t.ty = ImageType::D1;
+        t.width = D3D12_REQ_TEXTURE1D_U_DIMENSION;
+        assert!(image_d3d12(&t).is_some());
+        t.width += 1;
+        assert!(image_d3d12(&t).is_none());
+
+        t.ty = ImageType::D2;
+        for axis in 0..2 {
+            t.width = 1;
+            t.height = 1;
+            if axis == 0 {
+                t.width = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+            } else {
+                t.height = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+            }
+            assert!(image_d3d12(&t).is_some(), "2D axis {axis} at the limit");
+            if axis == 0 {
+                t.width += 1;
+            } else {
+                t.height += 1;
+            }
+            assert!(image_d3d12(&t).is_none(), "2D axis {axis} over the limit");
+        }
+
+        for ty in [ImageType::D1Array, ImageType::D2Array, ImageType::D2MsaaArray] {
+            t.width = 1;
+            t.height = 1;
+            t.ty = ty;
+            t.depth = D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
+            assert!(image_d3d12(&t).is_some(), "{ty:?} at the array limit");
+            t.depth += 1;
+            assert!(image_d3d12(&t).is_none(), "{ty:?} over the array limit");
+        }
+
+        t.ty = ImageType::Cube;
+        t.base_array = 0;
+        t.depth = 2046; // largest whole number of faces within the 2048-slice limit
+        assert!(image_d3d12(&t).is_some());
+        t.depth = 2052;
+        assert!(image_d3d12(&t).is_none());
+
+        t.ty = ImageType::D3;
+        t.depth = 1;
+        for axis in 0..3 {
+            t.width = 1;
+            t.height = 1;
+            t.depth = 1;
+            match axis {
+                0 => t.width = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+                1 => t.height = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+                _ => t.depth = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+            }
+            assert!(image_d3d12(&t).is_some(), "3D axis {axis} at the limit");
+            match axis {
+                0 => t.width += 1,
+                1 => t.height += 1,
+                _ => t.depth += 1,
+            }
+            assert!(image_d3d12(&t).is_none(), "3D axis {axis} over the limit");
+        }
     }
 
     #[test]

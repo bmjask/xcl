@@ -348,8 +348,8 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
 
 /// Title physical pages (64 KiB) emulated in the unified memory region: an allocation is one
 /// contiguous UMA block, page numbers = offset / 64 KiB in UMA. Mapping consecutive pages
-/// returns their UMA address (GPU-visible, no copy); mapping at an address of the title's
-/// choice or scattered pages cannot alias memory this way – logged and refused.
+/// returns their UMA address (GPU-visible, no copy); choosing that same address is supported.
+/// A different address or scattered pages cannot alias memory this way – logged and refused.
 const PHYS_PAGE: usize = 0x1_0000;
 
 /// first page number → (pages in the block, pages still allocated)
@@ -409,10 +409,25 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
         return std::ptr::null_mut();
     }
     let first = *arr;
-    let consecutive = (1..n).all(|i| *arr.add(i) == first + i);
-    let at = (u.base() + first * PHYS_PAGE) as *mut c_void;
-    if consecutive && (va.is_null() || va == at) {
-        return at;
+    let consecutive = (1..n).all(|i| first.checked_add(i).is_some_and(|page| *arr.add(i) == page));
+    let at = consecutive.then(|| {
+        let end_page = first.checked_add(n)?;
+        let blocks = PHYS_BLOCKS.lock().ok()?;
+        let (&block_first, &(block_pages, live_pages)) = blocks.range(..=first).next_back()?;
+        let block_end = block_first.checked_add(block_pages)?;
+        if live_pages == 0 || end_page > block_end {
+            return None;
+        }
+        let offset = first.checked_mul(PHYS_PAGE)?;
+        let bytes = n.checked_mul(PHYS_PAGE)?;
+        let address = u.base().checked_add(offset)?;
+        let end = address.checked_add(bytes)?;
+        (end <= u.base().checked_add(u.size())?).then_some(address as *mut c_void)
+    }).flatten();
+    if let Some(at) = at {
+        if va.is_null() || va == at {
+            return at;
+        }
     }
     static WARNED: AtomicU32 = AtomicU32::new(0);
     if WARNED.fetch_add(1, Ordering::Relaxed) < 5 {
@@ -898,6 +913,12 @@ mod tests {
             // scattered pages: refused
             let mut scattered = [pages[2], pages[0]];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, scattered.as_mut_ptr()).is_null());
+            // Page numbers must refer to one registered allocation; arithmetic is checked before
+            // constructing an address inside the reserved UMA region.
+            let mut outside = [u.size() / PHYS_PAGE];
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, outside.as_mut_ptr()).is_null());
+            let mut wrapping = [usize::MAX];
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, wrapping.as_mut_ptr()).is_null());
             let used = u.used();
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             assert_eq!(u.used(), used - 3 * PHYS_PAGE);

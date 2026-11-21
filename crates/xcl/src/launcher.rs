@@ -49,10 +49,28 @@ fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     xml_attrs(xml, tag, attr).into_iter().next()
 }
 
+fn decode_game_config(raw: &[u8]) -> Option<String> {
+    let (body, little_endian) = if let Some(body) = raw.strip_prefix(&[0xFF, 0xFE]) {
+        (body, true)
+    } else if let Some(body) = raw.strip_prefix(&[0xFE, 0xFF]) {
+        (body, false)
+    } else {
+        return String::from_utf8(raw.to_vec()).ok();
+    };
+    if body.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|b| if little_endian { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) })
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
 /// (executables, title) from MicrosoftGame.config if present.
 pub fn read_game_config(root: &Path) -> (Vec<String>, Option<String>) {
     let p = root.join("MicrosoftGame.config");
-    let Ok(xml) = std::fs::read_to_string(p) else { return (Vec::new(), None) };
+    let Some(xml) = std::fs::read(p).ok().and_then(|raw| decode_game_config(&raw)) else { return (Vec::new(), None) };
     (xml_attrs(&xml, "Executable", "Name"), xml_attr(&xml, "Identity", "Name"))
 }
 
@@ -335,6 +353,29 @@ mod tests {
             <ShellVisuals DefaultDisplayName="X" Name="no"/>"#;
         assert_eq!(xml_attrs(xml, "Executable", "Name"), vec!["Bin\\game.exe".to_string(), "tool.exe".to_string()]);
         assert_eq!(xml_attr(xml, "ShellVisuals", "Name").as_deref(), Some("no"), "DisplayName= must not match Name=");
+    }
+
+    #[test]
+    fn game_config_accepts_bom_marked_utf16_and_rejects_malformed_text() {
+        let dir = TempDir::new("utf16_config");
+        let xml = r#"<Game><Identity Name="Contoso.Test"/><Executable Name="Bin\game.exe"/></Game>"#;
+        for (bom, bytes) in [
+            ([0xFF, 0xFE], xml.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>()),
+            ([0xFE, 0xFF], xml.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<_>>()),
+        ] {
+            let mut raw = bom.to_vec();
+            raw.extend(bytes);
+            let decoded = decode_game_config(&raw).unwrap();
+            assert_eq!(xml_attr(&decoded, "Executable", "Name").as_deref(), Some(r"Bin\game.exe"));
+            assert_eq!(xml_attr(&decoded, "Identity", "Name").as_deref(), Some("Contoso.Test"));
+            std::fs::write(dir.0.join("MicrosoftGame.config"), &raw).unwrap();
+            assert_eq!(read_game_config(&dir.0), (vec![r"Bin\game.exe".into()], Some("Contoso.Test".into())));
+        }
+        assert!(decode_game_config(&[0xFF, 0xFE, b'<']).is_none());
+        assert!(decode_game_config(&[0xFF, 0xFE, 0x00, 0xD8]).is_none());
+        assert!(decode_game_config(&[0xFF, 0xFF]).is_none());
+        std::fs::write(dir.0.join("MicrosoftGame.config"), [0xFF, 0xFE, b'<']).unwrap();
+        assert_eq!(read_game_config(&dir.0), (Vec::new(), None));
     }
 
     struct TempDir(PathBuf);
