@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use crate::util::HRESULT;
+use crate::util::{E_INVALIDARG, HRESULT};
 
 /// bytes of title address space an arena stands for at least (and of video memory it takes)
 const ARENA: usize = 128 << 20;
@@ -228,13 +228,37 @@ fn heap_ranges(heap: u32, tiles: &[Tile]) -> Vec<(bool, u32, u32)> {
     ranges
 }
 
+/// The optimized clear value is optional. Some drivers refuse a console-derived value for a
+/// tiled target even though the resource itself is valid, so retry without that optimization.
+fn retry_reserved_without_clear(mut create: impl FnMut(u32, *const c_void) -> HRESULT, state: u32, clear: *const c_void) -> (HRESULT, bool) {
+    let (first, _) = super::device_x::retry_resource_with_common(|initial| create(initial, clear), state);
+    if first != E_INVALIDARG || clear.is_null() {
+        return (first, false);
+    }
+    let (fallback, _) = super::device_x::retry_resource_with_common(|initial| create(initial, std::ptr::null()), state);
+    (fallback, fallback >= 0)
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     if va % PAGE != 0 || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN { return None; }
     let mut lock = PAGES.lock().unwrap();
     let pages = lock.get_or_insert_with(|| Pages::new(dev)).as_mut()?;
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
-    let (hr, _) = super::device_x::retry_resource_with_common(|initial| super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, initial as usize, clear as usize, riid, ppv), state);
+    let (hr, ignored_clear) = retry_reserved_without_clear(
+        |initial, optimized_clear| {
+            *ppv = std::ptr::null_mut();
+            super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, initial as usize, optimized_clear as usize, riid, ppv)
+        },
+        state,
+        clear,
+    );
+    if ignored_clear {
+        static IGNORED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if IGNORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            crate::xlog_info!("D3D12.X: reserved target at {va:#x} accepted without its optional clear-value optimization");
+        }
+    }
     if hr < 0 || (*ppv).is_null() {
         static FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -331,6 +355,37 @@ mod tests {
         assert_eq!(heap_ranges(0, &tiles), [(true, 5, 2), (false, 0, 2), (true, 9, 3)]);
         assert_eq!(heap_ranges(1, &tiles), [(false, 0, 2), (true, 0, 2), (false, 0, 3)]);
         assert_eq!(heap_ranges(0, &[(0, 3), (0, 1), (0, 2)]), [(true, 3, 1), (true, 1, 2)]);
+    }
+
+    #[test]
+    fn reserved_target_retries_without_an_invalid_clear_value() {
+        let clear = 1usize as *const c_void;
+        let mut calls = Vec::new();
+        let (hr, ignored_clear) = retry_reserved_without_clear(
+            |state, value| {
+                calls.push((state, value.is_null()));
+                if value.is_null() && state == 0 { 0 } else { E_INVALIDARG }
+            },
+            0xC0,
+            clear,
+        );
+        assert_eq!(hr, 0);
+        assert!(ignored_clear);
+        assert_eq!(calls, [(0xC0, false), (0, false), (0xC0, true), (0, true)]);
+    }
+
+    #[test]
+    fn reserved_target_does_not_drop_a_clear_on_other_errors() {
+        let clear = 1usize as *const c_void;
+        let mut calls = Vec::new();
+        let (hr, ignored_clear) = retry_reserved_without_clear(
+            |state, value| { calls.push((state, value.is_null())); -1 },
+            0xC0,
+            clear,
+        );
+        assert_eq!(hr, -1);
+        assert!(!ignored_clear);
+        assert_eq!(calls, [(0xC0, false)]);
     }
 
     /// Applies placements to a list of arena ranges as `arena_for` does; returns the arena
