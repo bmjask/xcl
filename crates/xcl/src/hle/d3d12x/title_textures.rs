@@ -64,6 +64,10 @@ static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// Successful CPU-side streaming writes.  Write-watch remains the normal path, but producers
+/// such as DirectStorage can explicitly hand a completed range to the next submission.  This
+/// closes the timing gap where a write-watch reset races a streaming worker.
+static CPU_WRITES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -118,6 +122,46 @@ static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
     TEXTURES.lock().unwrap().iter().filter(|(_, e)| e.va < va + len && va < e.va + e.tex.size() as usize).map(|(&r, e)| (r, e.va)).take(4).collect()
+}
+
+/// Record bytes copied into title-visible virtual memory by an asynchronous CPU producer.
+/// The ranges are consumed by the next `refresh`, which still performs the usual write-watch
+/// scan and sparse-memory synchronization.
+pub fn note_cpu_write(va: usize, len: usize) {
+    if len == 0 || va.checked_add(len).is_none() {
+        return;
+    }
+    let mut writes = CPU_WRITES.lock().unwrap();
+    // Adjacent requests are common for streamed blocks. Keep the handoff bounded even if a
+    // title has not submitted a command list for a while.
+    if let Some((last, last_len)) = writes.last_mut() {
+        let last_end = last.saturating_add(*last_len);
+        if va <= last_end {
+            *last_len = last_end.max(va.saturating_add(len)).saturating_sub(*last);
+            return;
+        }
+    }
+    if writes.len() < 4096 {
+        writes.push((va, len));
+    }
+}
+
+fn take_cpu_writes() -> Vec<(usize, usize)> {
+    std::mem::take(&mut *CPU_WRITES.lock().unwrap())
+}
+
+fn pages_from_ranges(ranges: Vec<(usize, usize)>, page: usize) -> Vec<usize> {
+    let mut pages = Vec::new();
+    for (base, len) in ranges {
+        let Some(end) = base.checked_add(len) else { continue };
+        let mut at = base & !(page - 1);
+        while at < end {
+            pages.push(at);
+            let Some(next) = at.checked_add(page) else { break };
+            at = next;
+        }
+    }
+    pages
 }
 
 /// The PC texture was released for good.
@@ -230,7 +274,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 }
             }
         });
+        dirty.extend(pages_from_ranges(take_cpu_writes(), page as usize));
         dirty.sort_unstable();
+        dirty.dedup();
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
@@ -554,5 +600,13 @@ mod tests {
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+    }
+
+    #[test]
+    fn explicit_cpu_writes_cover_each_touched_page() {
+        assert_eq!(
+            pages_from_ranges(vec![(0x1ff0, 0x30), (0x3000, 0x1001)], 0x1000),
+            vec![0x1000, 0x2000, 0x3000, 0x4000]
+        );
     }
 }
