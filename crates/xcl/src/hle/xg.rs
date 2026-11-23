@@ -115,7 +115,7 @@ pub fn element(f: u32) -> Option<(u32, u32)> {
     Some(match f {
         1..=4 => (4, 1),
         9..=22 => (3, 1),
-        23..=47 | 67 | 87..=93 => (2, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 => (2, 1),
         48..=59 | 85 | 86 | 115 => (1, 1),
         60..=65 => (0, 1),
         70..=72 | 79..=81 => (3, 4),
@@ -155,15 +155,29 @@ impl Texture {
         if width == 0 || width > 16384 || height == 0 || height > 16384 || array == 0 {
             return Err(E_INVALIDARG);
         }
-        // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane
-        let planar = matches!(format, 19..=22 | 44..=47);
-        let (e, side) = if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
+        // depth + stencil formats: a 4-byte (or extended-format 2-byte) depth plane and
+        // a 1-byte stencil plane
+        let planar16 = matches!(format, 118..=120);
+        let planar = matches!(format, 19..=22 | 44..=47) || planar16;
+        let (e, side) = if planar { (if planar16 { 1 } else { 2 }, 1) } else { element(format).ok_or(E_INVALIDARG)? };
         let mode = match layout {
             1 => 0,
             0 if line => 0, // a 1D texture is linear
             0x100..=0x11F => layout & 0x1F,
             // the choice goes by the whole format's size (D32_S8X24: 64 bits a pixel)
-            0 | 2 => optimal_mode(layout, flags, if matches!(format, 19..=22) { 64 } else { (8u64 << e) / (side * side) as u64 }, width, height),
+            0 | 2 => optimal_mode(
+                layout,
+                flags,
+                if matches!(format, 19..=22) {
+                    64
+                } else if planar16 {
+                    32
+                } else {
+                    (8u64 << e) / (side * side) as u64
+                },
+                width,
+                height,
+            ),
             _ => return Err(E_INVALIDARG),
         };
         let full = 32 - (width as u32).max(height).leading_zeros();
@@ -679,5 +693,44 @@ mod tests {
         assert_eq!(offsets, [0x20000, 0x10000, 0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600, 0x500]);
         assert_eq!((mip(2, 0), mip(2, 9), mip(2, 10), mip(2, 18), mip(6, 9), mip(6, 10)), (0x8000, 0x40, 0x80, 1, 8, 8));
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+    }
+
+    #[test]
+    fn console_extended_packed_formats_are_32_bit() {
+        for format in [116, 117] {
+            let t = Texture::new(&desc(256, 256, 1, 1, format, 0x105)).unwrap();
+            let rgba = Texture::new(&desc(256, 256, 1, 1, 28, 0x105)).unwrap();
+            assert_eq!((t.size(), t.alignment()), (rgba.size(), rgba.alignment()));
+        }
+    }
+
+    #[test]
+    fn console_extended_depth_stencil_formats_share_a_finite_layout() {
+        let layouts: Vec<(u64, u64, Vec<u64>)> = (118..=120)
+            .map(|format| {
+                let t = Texture::new(&desc(2560, 1440, 1, 1, format, 0)).unwrap();
+                (t.size(), t.alignment(), t.planes.iter().map(Plane::bytes).collect())
+            })
+            .collect();
+        assert!(layouts[0].0 > 0 && layouts[0].0 < u64::MAX);
+        assert!(layouts[0].1 > 0);
+        assert_eq!(layouts[0], layouts[1]);
+        assert_eq!(layouts[0], layouts[2]);
+        assert_eq!(layouts[0].2.len(), 2);
+        assert!(layouts[0].2[0] > layouts[0].2[1]);
+    }
+
+    #[test]
+    fn console_extended_depth_stencil_selects_mode_as_a_32_bit_family() {
+        let mut extended = desc(256, 128, 1, 1, 118, 0);
+        extended[0x30..0x34].copy_from_slice(&4u32.to_le_bytes());
+        let mut d24s8 = desc(256, 128, 1, 1, 45, 0);
+        d24s8[0x30..0x34].copy_from_slice(&4u32.to_le_bytes());
+        let extended = Texture::new(&extended).unwrap();
+        let d24s8 = Texture::new(&d24s8).unwrap();
+        assert_eq!(extended.texels().unwrap().mode, 27);
+        assert_eq!(extended.texels().unwrap().mode, d24s8.texels().unwrap().mode);
+        assert_eq!(extended.alignment(), d24s8.alignment());
+        assert!(extended.size() > 0 && extended.size() < d24s8.size());
     }
 }

@@ -658,6 +658,14 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d
 }
 
+fn console_texture_allocation_info(x: &[u8; 0x38]) -> Option<(u64, u64)> {
+    let dimension = u32::from_le_bytes(x[0..4].try_into().unwrap());
+    crate::hle::xg::Texture::new(x)
+        .ok()
+        .filter(|_| dimension != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32)
+        .map(|t| (t.size(), t.alignment()))
+}
+
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
 /// returned through a hidden pointer. Called the C way – (return buffer, device, …), XDefiant –
 /// or the C++ way – (device, return buffer, …): whichever argument is the device is `this`.
@@ -670,8 +678,8 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
     let (mut size, mut align) = (0u64, 0u64);
     for k in 0..n as usize {
         let x = if descs.is_null() { [0u8; 0x38] } else { descs.add(k).read_unaligned() };
-        let (s, a) = match crate::hle::xg::Texture::new(&x).ok().filter(|_| u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32) {
-            Some(t) => (t.size(), t.alignment()),
+        let (s, a) = match console_texture_allocation_info(&x) {
+            Some(info) => info,
             None => {
                 let d = pc_resource_desc(&x);
                 let mut r = [0u64; 2];
@@ -914,6 +922,23 @@ mod tests {
         assert_eq!((d[8], u32::from_le_bytes(d[0x2C..0x30].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap())), (0, 1, 0x34));
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn console_extended_format_allocation_info_is_finite() {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&3u32.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&2560u64.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&1440u32.to_le_bytes());
+        x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        for format in 116u32..=120 {
+            x[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+            let (size, alignment) = console_texture_allocation_info(&x).unwrap();
+            assert!(size > 0 && size < u64::MAX, "format {format}");
+            assert!(alignment > 0, "format {format}");
+        }
     }
 
     #[test]
