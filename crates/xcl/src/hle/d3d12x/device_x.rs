@@ -650,11 +650,20 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let mut d = *x;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
-    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let mut flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()) & 0xFF;
+    if flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32 != 0 {
+        let conflicts = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32
+            | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32
+            | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER.0 as u32
+            | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0 as u32
+            | D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY.0 as u32
+            | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY.0 as u32;
+        flags &= !conflicts;
+    }
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
-    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
+    d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
     d
 }
 
@@ -922,6 +931,31 @@ mod tests {
         assert_eq!((d[8], u32::from_le_bytes(d[0x2C..0x30].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap())), (0, 1, 0x34));
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn pc_resource_desc_keeps_depth_intent_and_drops_incompatible_flags() {
+        let converted_flags = |flags: u32| {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&(D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32).to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            u32::from_le_bytes(pc_resource_desc(&x)[0x30..0x34].try_into().unwrap())
+        };
+        let depth = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32;
+        let uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+        let cross_adapter = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER.0 as u32;
+        let simultaneous = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0 as u32;
+        let render_target = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32;
+        let video_decode = D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY.0 as u32;
+        let video_encode = D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY.0 as u32;
+        let deny_shader = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 as u32;
+        let conflicts = render_target | uav | cross_adapter | simultaneous | video_decode | video_encode;
+        for conflict in [render_target, uav, cross_adapter, simultaneous, video_decode, video_encode] {
+            assert_eq!(converted_flags(depth | conflict | deny_shader), depth | deny_shader);
+        }
+        assert_eq!(converted_flags(0x8030_0000 | depth | conflicts | deny_shader), depth | deny_shader);
+        assert_eq!(converted_flags(uav), uav);
+        assert_eq!(converted_flags(render_target | uav), render_target | uav);
     }
 
     #[test]
