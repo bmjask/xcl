@@ -161,6 +161,9 @@ impl Occlusion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingWait {
     va: u64,
+    cpu: usize,
+    native_resource: usize,
+    native_offset: u64,
     width: u8, // 4 or 8
     comparison: u32,
     value: u64,
@@ -182,8 +185,7 @@ fn compare_u64(op: u32, lhs: u64, rhs: u64) -> Option<bool> {
 }
 
 impl PendingWait {
-    unsafe fn read_value(&self) -> Option<u64> {
-        let addr = self.va as usize;
+    unsafe fn read_at(&self, addr: usize) -> Option<u64> {
         if !crate::gpu::shader::readable(addr, self.width as usize) {
             return None;
         }
@@ -192,6 +194,25 @@ impl PendingWait {
             8 => Some((*(addr as *const AtomicU64)).load(Ordering::Acquire)),
             _ => None,
         }
+    }
+
+    unsafe fn read_value(&self) -> Option<u64> {
+        if self.native_resource == 0 {
+            return self.read_at(self.cpu);
+        }
+        let buffers = NATIVE_BUFFERS.lock().unwrap();
+        let buffers = buffers.as_ref()?;
+        let range = buffers.ranges.iter().find(|b| b.resource == self.native_resource)?;
+        let end = self.native_offset.checked_add(self.width as u64)?;
+        if end > range.end - range.start {
+            return None;
+        }
+        let mapping = buffers.mappings.get(&self.native_resource)?;
+        if mapping.depth == 0 || mapping.address == 0 {
+            return None;
+        }
+        let addr = mapping.address.checked_add(self.native_offset as usize)?;
+        self.read_at(addr)
     }
 
     unsafe fn is_satisfied(&self) -> bool {
@@ -572,6 +593,87 @@ static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Set once any list uses `RSSetDepthBiasX` (fast-path guard for Draw* hooks).
 static DEPTH_BIAS_USED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeBuffer {
+    resource: usize,
+    start: u64,
+    end: u64,
+    mapped: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NativeMapping {
+    address: usize,
+    depth: usize,
+}
+
+#[derive(Default)]
+struct NativeBuffers {
+    ranges: Vec<NativeBuffer>,
+    mappings: HashMap<usize, NativeMapping>,
+}
+
+/// PC buffers whose native GPU virtual addresses can appear in the console memory-semaphore
+/// methods. Console buffers in unified memory are resolved before this registry.
+static NATIVE_BUFFERS: Mutex<Option<NativeBuffers>> = Mutex::new(None);
+
+pub(super) fn note_native_buffer(resource: usize, start: u64, size: u64) {
+    let Some(end) = start.checked_add(size) else { return };
+    if resource == 0 || start == 0 || size == 0 {
+        return;
+    }
+    let mut buffers = NATIVE_BUFFERS.lock().unwrap();
+    let buffers = buffers.get_or_insert_with(NativeBuffers::default);
+    let mapped = buffers.mappings.get(&resource).map_or(0, |m| m.address);
+    buffers.ranges.retain(|b| b.resource != resource);
+    buffers.ranges.push(NativeBuffer { resource, start, end, mapped });
+}
+
+pub(super) fn note_native_mapping(resource: usize, mapped: usize) {
+    let mut buffers = NATIVE_BUFFERS.lock().unwrap();
+    let buffers = buffers.get_or_insert_with(NativeBuffers::default);
+    let mapping = buffers.mappings.entry(resource).or_default();
+    mapping.depth = mapping.depth.saturating_add(1);
+    if mapped != 0 {
+        mapping.address = mapped;
+    }
+    if let Some(buffer) = buffers.ranges.iter_mut().find(|b| b.resource == resource) {
+        buffer.mapped = mapping.address;
+    }
+}
+
+pub(super) fn note_native_unmapping(resource: usize) {
+    let mut buffers = NATIVE_BUFFERS.lock().unwrap();
+    let Some(buffers) = buffers.as_mut() else { return };
+    let Some(mapping) = buffers.mappings.get_mut(&resource) else { return };
+    mapping.depth = mapping.depth.saturating_sub(1);
+    if mapping.depth == 0 {
+        mapping.address = 0;
+        if let Some(buffer) = buffers.ranges.iter_mut().find(|b| b.resource == resource) {
+            buffer.mapped = 0;
+        }
+    }
+}
+
+pub(super) fn forget_native_buffer(resource: usize) {
+    if let Some(buffers) = NATIVE_BUFFERS.lock().unwrap().as_mut() {
+        buffers.ranges.retain(|b| b.resource != resource);
+        buffers.mappings.remove(&resource);
+    }
+}
+
+fn find_native_buffer_in(buffers: &[NativeBuffer], va: u64, size: u64) -> Option<NativeBuffer> {
+    if size == 0 {
+        return None;
+    }
+    let end = va.checked_add(size)?;
+    buffers.iter().copied().find(|b| va >= b.start && end <= b.end)
+}
+
+fn native_buffer(va: u64, size: u64) -> Option<NativeBuffer> {
+    NATIVE_BUFFERS.lock().unwrap().as_ref().and_then(|b| find_native_buffer_in(&b.ranges, va, size))
+}
 
 /// Record a newly created title command queue so `KickoffX` can find a compatible queue.
 pub(super) fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE) {
@@ -1018,17 +1120,49 @@ pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size:
 unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = 4 * words.len() as u64;
-    if !va.is_multiple_of(n) {
-        return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
+    if !valid_regular_write(va, words.len()) {
+        return warn(&N, what, format_args!("{va:#x} is not 4-byte aligned"));
     }
-    let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
-        return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    let Some(target) = buffer_target(va, n) else {
+        return warn(&N, what, format_args!("{va:#x} is not in a known buffer"));
     };
     note_write(list as usize, va, n);
-    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
+    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: target.pc_va + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
-    as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
+    as_copy_dest(list, target.resource, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
+}
+
+fn valid_regular_write(va: u64, words: usize) -> bool {
+    words != 0 && va.is_multiple_of(4)
+}
+
+fn valid_timestamp_write(va: u64) -> bool {
+    va.is_multiple_of(8)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferTarget {
+    resource: usize,
+    offset: u64,
+    pc_va: u64,
+    cpu: usize,
+    native: bool,
+}
+
+fn prefer_uma(uma: Option<BufferTarget>, native: Option<BufferTarget>) -> Option<BufferTarget> {
+    uma.or(native)
+}
+
+fn buffer_target(va: u64, size: u64) -> Option<BufferTarget> {
+    let uma = real::uma_window_buffer(va as usize, size as usize).and_then(|(resource, offset)| {
+        real::uma_va_of(va as usize).map(|pc_va| BufferTarget { resource, offset, pc_va, cpu: va as usize, native: false })
+    });
+    let native = native_buffer(va, size).map(|b| {
+        let offset = va - b.start;
+        BufferTarget { resource: b.resource, offset, pc_va: va, cpu: if b.mapped == 0 { 0 } else { b.mapped + offset as usize }, native: true }
+    });
+    prefer_uma(uma, native)
 }
 
 /// timestamp queries (one heap per device, used round-robin)
@@ -1043,8 +1177,11 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return warn(&N, what, format_args!("a timestamp on a type-{} list", ty.0));
     }
-    let Some((d, off)) = real::uma_window_buffer(va as usize, 8).filter(|_| va.is_multiple_of(8)) else {
-        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned in unified memory"));
+    if !valid_timestamp_write(va) {
+        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned"));
+    }
+    let Some(target) = buffer_target(va, 8) else {
+        return warn(&N, what, format_args!("{va:#x} is not in a known buffer"));
     };
     let Some(dev) = device_of(list) else { return };
     let heap = {
@@ -1064,7 +1201,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     let i = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed) % TIMESTAMP_SLOTS;
     pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
-    as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+    as_copy_dest(list, target.resource, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, target.resource, target.offset));
 }
 
 /// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
@@ -1094,8 +1231,9 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if !va.is_multiple_of(n) {
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
-    if real::uma_window_buffer(va as usize, width as usize).is_none() {
-        return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    let Some(target) = buffer_target(va, n) else { return warn(&N, what, format_args!("{va:#x} is not in a known buffer")) };
+    if target.cpu == 0 {
+        return warn(&N, what, format_args!("{va:#x} has no CPU-visible mapping"));
     }
     if compare_u64(comparison, 0, 0).is_none() {
         return warn(&N, what, format_args!("unknown comparison op {comparison}"));
@@ -1111,7 +1249,16 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if s.has_prior_write(va, n) {
         return;
     }
-    s.push_wait(PendingWait { va, width, comparison, value, mask });
+    s.push_wait(PendingWait {
+        va,
+        cpu: if target.native { 0 } else { target.cpu },
+        native_resource: if target.native { target.resource } else { 0 },
+        native_offset: target.offset,
+        width,
+        comparison,
+        value,
+        mask,
+    });
 }
 
 /// command list #71 Wait32BitValueX(address, comparison, value, mask, flags)
@@ -2096,6 +2243,92 @@ mod tests {
     }
 
     #[test]
+    fn native_buffer_ranges_resolve_boundaries_and_cleanup() {
+        let resource = 0x7fff_1001;
+        let start = 0x1234_0000_0000;
+        let mapped = 0x4321_0000usize;
+        forget_native_buffer(resource);
+
+        // Mapping may happen before the first GPU virtual-address query.
+        note_native_mapping(resource, mapped);
+        note_native_buffer(resource, start, 0x100);
+        assert_eq!(native_buffer(start, 1).unwrap().mapped, mapped);
+        note_native_mapping(resource, 0);
+        note_native_unmapping(resource);
+        assert_eq!(native_buffer(start, 1).unwrap().mapped, mapped);
+        assert!(native_buffer(start + 0xff, 1).is_some());
+        assert!(native_buffer(start, 0x100).is_some());
+        assert!(native_buffer(start - 1, 1).is_none());
+        assert!(native_buffer(start + 0xff, 2).is_none());
+        assert!(native_buffer(start + 0x100, 0).is_none());
+
+        note_native_unmapping(resource);
+        assert_eq!(native_buffer(start, 1).unwrap().mapped, 0);
+        note_native_unmapping(resource);
+        assert_eq!(native_buffer(start, 1).unwrap().mapped, 0);
+
+        forget_native_buffer(resource);
+        assert!(native_buffer(start, 1).is_none());
+        note_native_buffer(resource, start, 0x100);
+        assert_eq!(native_buffer(start, 1).unwrap().mapped, 0);
+        forget_native_buffer(resource);
+    }
+
+    #[test]
+    fn uma_target_is_preferred_to_native_target() {
+        let uma = BufferTarget { resource: 1, offset: 2, pc_va: 3, cpu: 4, native: false };
+        let native = BufferTarget { resource: 5, offset: 6, pc_va: 7, cpu: 8, native: true };
+        assert_eq!(prefer_uma(Some(uma), Some(native)), Some(uma));
+        assert_eq!(prefer_uma(None, Some(native)), Some(native));
+    }
+
+    #[test]
+    fn regular_64_bit_write_accepts_four_byte_alignment() {
+        assert!(valid_regular_write(0x1004, 2));
+        assert!(valid_regular_write(0x1008, 2));
+        assert!(!valid_regular_write(0x1002, 2));
+        assert!(!valid_regular_write(0x1004, 0));
+    }
+
+    #[test]
+    fn timestamp_write_requires_eight_byte_alignment() {
+        assert!(valid_timestamp_write(0x1008));
+        assert!(!valid_timestamp_write(0x1004));
+    }
+
+    #[test]
+    fn invalid_buffer_address_is_not_resolved() {
+        assert!(buffer_target(0x123, 8).is_none());
+    }
+
+    #[test]
+    fn native_wait_resolves_mapping_at_read_time() {
+        let resource = 0x7fff_1002;
+        let start = 0x1235_0000_0000;
+        let first = AtomicU32::new(7);
+        let second = AtomicU32::new(9);
+        forget_native_buffer(resource);
+        note_native_buffer(resource, start, 4);
+        note_native_mapping(resource, &first as *const AtomicU32 as usize);
+        let wait = PendingWait {
+            va: start,
+            cpu: 0,
+            native_resource: resource,
+            native_offset: 0,
+            width: 4,
+            comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
+            value: 7,
+            mask: u32::MAX as u64,
+        };
+        unsafe { assert_eq!(wait.read_value(), Some(7)) };
+        note_native_unmapping(resource);
+        unsafe { assert_eq!(wait.read_value(), None) };
+        note_native_mapping(resource, &second as *const AtomicU32 as usize);
+        unsafe { assert_eq!(wait.read_value(), Some(9)) };
+        forget_native_buffer(resource);
+    }
+
+    #[test]
     fn nested_occlusion_queries_end_the_outer_one_early() {
         let ty = D3D12_QUERY_TYPE_OCCLUSION;
         let mut o = Occlusion::default();
@@ -2221,6 +2454,9 @@ mod tests {
         let cell32 = Arc::new(AtomicU32::new(0xDEAD_0000));
         let w32 = PendingWait {
             va: Arc::as_ptr(&cell32) as u64,
+            cpu: Arc::as_ptr(&cell32) as usize,
+            native_resource: 0,
+            native_offset: 0,
             width: 4,
             comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
             value: 0x0000_005A,
@@ -2240,6 +2476,9 @@ mod tests {
         let cell64 = Arc::new(AtomicU64::new(0x0000_0001_0000_0000));
         let w64 = PendingWait {
             va: Arc::as_ptr(&cell64) as u64,
+            cpu: Arc::as_ptr(&cell64) as usize,
+            native_resource: 0,
+            native_offset: 0,
             width: 8,
             comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
             value: 0x0000_0002_0000_0000,
@@ -2284,6 +2523,9 @@ mod tests {
             let s = g.as_mut().unwrap().get_mut(&(l1 as usize)).unwrap();
             s.push_wait(PendingWait {
                 va,
+                cpu: va as usize,
+                native_resource: 0,
+                native_offset: 0,
                 width: 4,
                 comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
                 value: 42,

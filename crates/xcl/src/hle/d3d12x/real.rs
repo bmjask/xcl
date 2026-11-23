@@ -1317,6 +1317,8 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
     let hr = f(this, sub, range, data);
     if hr >= 0 {
+        let mapped = if data.is_null() || (*data).is_null() { 0 } else { *data as usize };
+        super::list_x::note_native_mapping(this as usize, mapped);
         return hr;
     }
     match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
@@ -1379,14 +1381,16 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
         return;
     }
+    super::list_x::note_native_unmapping(this as usize);
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
-    f(this, sub, range)
+    f(this, sub, range);
 }
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::list_x::forget_native_buffer(this as usize);
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
@@ -1498,7 +1502,16 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
         return p as u64;
     }
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, 11));
-    f(this)
+    let va = f(this);
+    if va != 0 {
+        if let Some(resource) = ID3D12Resource::from_raw_borrowed(&this) {
+            let desc = resource.GetDesc();
+            if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                super::list_x::note_native_buffer(this as usize, va, desc.Width);
+            }
+        }
+    }
+    va
 }
 
 fn note_buffer_view() {
