@@ -727,7 +727,11 @@ pub unsafe fn pc_clear_value(clear: *const c_void, storage: &mut [u8; 20]) -> *c
         return clear;
     }
     let format = (clear as *const u32).read_unaligned();
-    let mapped = if matches!(format, 118 | 119 | 120) { 45 } else { pc_color_format(format) };
+    let mapped = match format {
+        86 | 115 => 28,
+        118 | 119 | 120 => 45,
+        _ => pc_color_format(format),
+    };
     if mapped == format {
         return clear;
     }
@@ -1065,6 +1069,20 @@ mod tests {
         assert_eq!(pc_shader_view_format(39, 40), 41);
         assert_eq!(pc_shader_view_format(44, 118), 46);
         assert_eq!(pc_shader_view_format(44, 120), 47);
+    }
+
+    #[test]
+    fn clear_values_match_replaced_target_formats() {
+        for format in [86u32, 115] {
+            let mut clear = [0u8; 20];
+            clear[..4].copy_from_slice(&format.to_le_bytes());
+            clear[4..].fill(0xA5);
+            let mut storage = [0u8; 20];
+            let converted = unsafe { pc_clear_value(clear.as_ptr() as *const c_void, &mut storage) };
+            assert_eq!(converted, storage.as_ptr() as *const c_void);
+            assert_eq!(u32::from_le_bytes(storage[..4].try_into().unwrap()), 28);
+            assert_eq!(&storage[4..], &clear[4..]);
+        }
     }
 
     #[test]
