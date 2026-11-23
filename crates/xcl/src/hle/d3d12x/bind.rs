@@ -242,10 +242,81 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
 }
 
+/// Expand independent three-corner rectangles to two triangles apiece.
+fn expand_rect_vertices(src: &[u8], stride: usize) -> Option<Vec<u8>> {
+    if stride == 0 || stride % 4 != 0 || src.len() % (3 * stride) != 0 {
+        return None;
+    }
+    let rects = src.len() / (3 * stride);
+    let mut out = vec![0; rects.checked_mul(6)?.checked_mul(stride)?];
+    for rect in 0..rects {
+        let input = &src[rect * 3 * stride..(rect + 1) * 3 * stride];
+        let output = &mut out[rect * 6 * stride..(rect + 1) * 6 * stride];
+        // v0 v1 v2, then v0 v2 v3.
+        output[..3 * stride].copy_from_slice(input);
+        output[3 * stride..4 * stride].copy_from_slice(&input[..stride]);
+        output[4 * stride..5 * stride].copy_from_slice(&input[2 * stride..3 * stride]);
+        for word in 0..stride / 4 {
+            let read = |vertex| u32::from_le_bytes(input[vertex * stride + word * 4..vertex * stride + word * 4 + 4].try_into().unwrap());
+            let (a, b, c) = (read(0), read(1), read(2));
+            let d = if a == b && b == c { a } else { (f32::from_bits(a) + f32::from_bits(c) - f32::from_bits(b)).to_bits() };
+            output[5 * stride + word * 4..5 * stride + word * 4 + 4].copy_from_slice(&d.to_le_bytes());
+        }
+    }
+    Some(out)
+}
+
+/// Expand the console's rect list (three corners, fourth implied) to two host triangles.
+///
+/// The console topology has no host equivalent. The vertex layout is opaque here, so words
+/// common to every corner are preserved (for packed attributes); other words use the rect
+/// relation `v3 = v0 + v2 - v1`. If the input cannot be bounded safely, the caller retains
+/// the existing one-triangle fallback.
+unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    let Some(vbs) = super::list_x::rect_list_state(this) else { return false };
+    let rects = (vertices / 3) as usize;
+    if vbs.is_empty() || rects == 0 || rects > 4096 {
+        return false;
+    }
+    let mut views = Vec::new();
+    for &(slot, (va, bytes, stride), _) in &vbs {
+        let s = stride as usize;
+        let start = va as usize + first_vertex as usize * s;
+        let len = rects * 3 * s;
+        if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(start, len) {
+            return false;
+        }
+        let expanded = expand_rect_vertices(std::slice::from_raw_parts(start as *const u8, len), s).expect("validated rect-list source");
+        let out = allocate_upload_memory(this, expanded.len(), 16);
+        if out.is_null() {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(expanded.as_ptr(), out, expanded.len());
+        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(out as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: stride }));
+    }
+    for (slot, view) in &views {
+        list.IASetVertexBuffers(*slot, Some(&[*view]));
+    }
+    list.DrawInstanced((rects * 6) as u32, instances, 0, first_instance);
+    for &(slot, _, native) in &vbs {
+        if let Some(view) = native {
+            list.IASetVertexBuffers(slot, Some(&[view]));
+        }
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("D3D12.X: rect lists expand to two host triangles; the fourth corner is reconstructed on the CPU");
+    }
+    true
+}
+
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
+        if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            return;
+        }
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
 }
@@ -492,7 +563,8 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
     let wanted = traced_shaders();
     if wanted.is_empty() {
         // draws into a presented target, or – `XCL_TRACE_UI_ANY` – into any target
-        if super::present::activity().0 < 300 || (!super::present::is_presented(rt) && std::env::var_os("XCL_TRACE_UI_ANY").is_none()) {
+        let trace_any = std::env::var_os("XCL_TRACE_UI_ANY").is_some();
+        if !should_trace_ui_target(super::present::activity().0, super::present::is_presented(rt), trace_any) {
             return;
         }
     } else if !super::real::pso_shaders(super::pso_async::resolve(pso)).is_some_and(|(v, p)| wanted.contains(&v) || wanted.contains(&p)) {
@@ -512,6 +584,12 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
             super::list_x::geometry_summary(this, args)
         );
     }
+}
+
+/// The broad early-startup trace is opt-in.  Normal frame tracing waits until the title has
+/// settled, and only follows draws to a presented target, so logs stay bounded during play.
+fn should_trace_ui_target(presents: u64, is_presented: bool, trace_any: bool) -> bool {
+    trace_any || (presents >= 300 && is_presented)
 }
 
 /// A draw's root arguments for the frame trace: constants, root buffers (their first words, as
@@ -808,6 +886,33 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn early_trace_any_is_not_delayed_until_steady_state() {
+        assert!(should_trace_ui_target(0, false, true));
+        assert!(should_trace_ui_target(0, true, true));
+        assert!(!should_trace_ui_target(299, true, false));
+        assert!(!should_trace_ui_target(300, false, false));
+        assert!(should_trace_ui_target(300, true, false));
+    }
+
+    #[test]
+    fn rect_vertices_expand_to_two_triangles_and_preserve_common_words() {
+        let vertex = |x: f32, y: f32, colour: u32| {
+            [x.to_bits(), y.to_bits(), colour].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()
+        };
+        let mut input = vertex(-1.0, 1.0, 0xff00_ff00);
+        input.extend(vertex(-1.0, -1.0, 0xff00_ff00));
+        input.extend(vertex(1.0, -1.0, 0xff00_ff00));
+        let output = expand_rect_vertices(&input, 12).unwrap();
+        assert_eq!(output.len(), 72);
+        assert_eq!(&output[..36], &input[..]);
+        let fourth = &output[60..72];
+        assert_eq!(f32::from_bits(u32::from_le_bytes(fourth[..4].try_into().unwrap())), 1.0);
+        assert_eq!(f32::from_bits(u32::from_le_bytes(fourth[4..8].try_into().unwrap())), 1.0);
+        assert_eq!(u32::from_le_bytes(fourth[8..12].try_into().unwrap()), 0xff00_ff00);
+        assert!(expand_rect_vertices(&input[..23], 12).is_none());
+    }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
     fn test_rts0_blob() -> Vec<u8> {
