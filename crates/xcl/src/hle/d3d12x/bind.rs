@@ -281,18 +281,21 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     let mut views = Vec::new();
     for &(slot, (va, bytes, stride), _) in &vbs {
         let s = stride as usize;
-        let start = va as usize + first_vertex as usize * s;
-        let len = rects * 3 * s;
-        if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(start, len) {
+        let Some(offset) = (first_vertex as usize).checked_mul(s) else { return false };
+        let Some(len) = rects.checked_mul(3).and_then(|n| n.checked_mul(s)) else { return false };
+        let Some(end) = offset.checked_add(len) else { return false };
+        let Some(start) = (va as usize).checked_add(offset) else { return false };
+        if va == 0 || s == 0 || s % 4 != 0 || end > bytes as usize || !crate::gpu::shader::readable(start, len) {
             return false;
         }
         let expanded = expand_rect_vertices(std::slice::from_raw_parts(start as *const u8, len), s).expect("validated rect-list source");
+        let Ok(size) = u32::try_from(expanded.len()) else { return false };
         let out = allocate_upload_memory(this, expanded.len(), 16);
         if out.is_null() {
             return false;
         }
         std::ptr::copy_nonoverlapping(expanded.as_ptr(), out, expanded.len());
-        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(out as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: stride }));
+        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(out as u64), SizeInBytes: size, StrideInBytes: stride }));
     }
     for (slot, view) in &views {
         list.IASetVertexBuffers(*slot, Some(&[*view]));
