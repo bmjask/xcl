@@ -1318,7 +1318,13 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     let hr = f(this, sub, range, data);
     if hr >= 0 {
         let mapped = if data.is_null() || (*data).is_null() { 0 } else { *data as usize };
-        super::list_x::note_native_mapping(this as usize, mapped);
+        if let Some(resource) = ID3D12Resource::from_raw_borrowed(&this) {
+            let desc = resource.GetDesc();
+            if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                let gpu_va = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u64>(orig_fn(this, 11))(this);
+                super::list_x::note_native_map(this as usize, gpu_va, desc.Width, mapped);
+            }
+        }
         return hr;
     }
     match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {

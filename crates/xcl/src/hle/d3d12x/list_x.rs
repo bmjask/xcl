@@ -643,6 +643,11 @@ pub(super) fn note_native_mapping(resource: usize, mapped: usize) {
     }
 }
 
+pub(super) fn note_native_map(resource: usize, start: u64, size: u64, mapped: usize) {
+    note_native_buffer(resource, start, size);
+    note_native_mapping(resource, mapped);
+}
+
 pub(super) fn note_native_unmapping(resource: usize) {
     let mut buffers = NATIVE_BUFFERS.lock().unwrap();
     let Some(buffers) = buffers.as_mut() else { return };
@@ -664,15 +669,39 @@ pub(super) fn forget_native_buffer(resource: usize) {
 }
 
 fn find_native_buffer_in(buffers: &[NativeBuffer], va: u64, size: u64) -> Option<NativeBuffer> {
+    find_native_buffer_alias_in(buffers, va, size).map(|(buffer, _)| buffer)
+}
+
+fn alias_offset(base: u64, length: u64, va: u64, size: u64) -> Option<u64> {
     if size == 0 {
         return None;
     }
     let end = va.checked_add(size)?;
-    buffers.iter().copied().find(|b| va >= b.start && end <= b.end)
+    let range_end = base.checked_add(length)?;
+    if va >= base && end <= range_end { Some(va - base) } else { None }
+}
+
+fn find_native_buffer_alias_in(buffers: &[NativeBuffer], va: u64, size: u64) -> Option<(NativeBuffer, u64)> {
+    for &buffer in buffers {
+        let length = buffer.end - buffer.start;
+        if let Some(offset) = alias_offset(buffer.start, length, va, size) {
+            return Some((buffer, offset));
+        }
+        if buffer.mapped != 0 {
+            if let Some(offset) = alias_offset(buffer.mapped as u64, length, va, size) {
+                return Some((buffer, offset));
+            }
+        }
+    }
+    None
 }
 
 fn native_buffer(va: u64, size: u64) -> Option<NativeBuffer> {
     NATIVE_BUFFERS.lock().unwrap().as_ref().and_then(|b| find_native_buffer_in(&b.ranges, va, size))
+}
+
+fn native_buffer_alias(va: u64, size: u64) -> Option<(NativeBuffer, u64)> {
+    NATIVE_BUFFERS.lock().unwrap().as_ref().and_then(|b| find_native_buffer_alias_in(&b.ranges, va, size))
 }
 
 /// Record a newly created title command queue so `KickoffX` can find a compatible queue.
@@ -1158,9 +1187,8 @@ fn buffer_target(va: u64, size: u64) -> Option<BufferTarget> {
     let uma = real::uma_window_buffer(va as usize, size as usize).and_then(|(resource, offset)| {
         real::uma_va_of(va as usize).map(|pc_va| BufferTarget { resource, offset, pc_va, cpu: va as usize, native: false })
     });
-    let native = native_buffer(va, size).map(|b| {
-        let offset = va - b.start;
-        BufferTarget { resource: b.resource, offset, pc_va: va, cpu: if b.mapped == 0 { 0 } else { b.mapped + offset as usize }, native: true }
+    let native = native_buffer_alias(va, size).map(|(b, offset)| {
+        BufferTarget { resource: b.resource, offset, pc_va: b.start + offset, cpu: if b.mapped == 0 { 0 } else { b.mapped + offset as usize }, native: true }
     });
     prefer_uma(uma, native)
 }
@@ -2256,6 +2284,7 @@ mod tests {
         note_native_mapping(resource, 0);
         note_native_unmapping(resource);
         assert_eq!(native_buffer(start, 1).unwrap().mapped, mapped);
+        assert!(native_buffer_alias(mapped as u64, 1).is_some());
         assert!(native_buffer(start + 0xff, 1).is_some());
         assert!(native_buffer(start, 0x100).is_some());
         assert!(native_buffer(start - 1, 1).is_none());
@@ -2264,6 +2293,7 @@ mod tests {
 
         note_native_unmapping(resource);
         assert_eq!(native_buffer(start, 1).unwrap().mapped, 0);
+        assert!(native_buffer_alias(mapped as u64, 1).is_none());
         note_native_unmapping(resource);
         assert_eq!(native_buffer(start, 1).unwrap().mapped, 0);
 
@@ -2272,6 +2302,35 @@ mod tests {
         note_native_buffer(resource, start, 0x100);
         assert_eq!(native_buffer(start, 1).unwrap().mapped, 0);
         forget_native_buffer(resource);
+    }
+
+    #[test]
+    fn native_map_only_registers_equivalent_gpu_and_cpu_aliases() {
+        let resource = 0x7fff_1003;
+        let gpu = 0x1236_0000_0000;
+        let cpu = 0x4322_0000usize;
+        forget_native_buffer(resource);
+        note_native_map(resource, gpu, 0x100, cpu);
+
+        let (gpu_buffer, gpu_offset) = native_buffer_alias(gpu + 0x40, 8).unwrap();
+        let (cpu_buffer, cpu_offset) = native_buffer_alias(cpu as u64 + 0x40, 8).unwrap();
+        assert_eq!(gpu_buffer.resource, resource);
+        assert_eq!(cpu_buffer.resource, resource);
+        assert_eq!(gpu_offset, 0x40);
+        assert_eq!(cpu_offset, gpu_offset);
+        let gpu_target = buffer_target(gpu + 0x40, 8).unwrap();
+        let cpu_target = buffer_target(cpu as u64 + 0x40, 8).unwrap();
+        assert_eq!(gpu_target, cpu_target);
+        assert_eq!(gpu_target.pc_va, gpu + 0x40);
+        assert_eq!(gpu_target.cpu, cpu + 0x40);
+
+        assert!(native_buffer_alias(cpu as u64, 1).is_some());
+        assert!(native_buffer_alias(cpu as u64 + 0xff, 1).is_some());
+        assert!(native_buffer_alias(cpu as u64 - 1, 1).is_none());
+        assert!(native_buffer_alias(cpu as u64 + 0xff, 2).is_none());
+        forget_native_buffer(resource);
+        assert!(native_buffer_alias(gpu, 1).is_none());
+        assert!(native_buffer_alias(cpu as u64, 1).is_none());
     }
 
     #[test]
@@ -2323,9 +2382,13 @@ mod tests {
         unsafe { assert_eq!(wait.read_value(), Some(7)) };
         note_native_unmapping(resource);
         unsafe { assert_eq!(wait.read_value(), None) };
+        assert!(native_buffer_alias(&first as *const AtomicU32 as u64, 4).is_none());
         note_native_mapping(resource, &second as *const AtomicU32 as usize);
         unsafe { assert_eq!(wait.read_value(), Some(9)) };
+        assert_eq!(native_buffer_alias(&second as *const AtomicU32 as u64, 4).unwrap().1, 0);
         forget_native_buffer(resource);
+        assert!(native_buffer_alias(start, 4).is_none());
+        assert!(native_buffer_alias(&second as *const AtomicU32 as u64, 4).is_none());
     }
 
     #[test]
