@@ -140,8 +140,70 @@ pub fn install_crash_handler() {
         }
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(clzero_handler));
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
     }
+}
+
+const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+const CLZERO: [u8; 3] = [0x0F, 0x01, 0xFC];
+const CACHE_LINE: usize = 64;
+
+fn clzero_line(address: usize) -> usize {
+    address & !(CACHE_LINE - 1)
+}
+
+fn is_clzero(bytes: &[u8]) -> bool {
+    bytes == CLZERO
+}
+
+/// Whether a complete cache line can be written without raising another exception from inside
+/// the vectored exception handler.
+unsafe fn writable_cache_line(address: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(address as *const c_void, &mut info, std::mem::size_of_val(&info)) == 0 || info.State != MEM_COMMIT {
+        return false;
+    }
+    let protect = info.Protect;
+    if protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+        || !matches!(protect & 0xFF, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+    {
+        return false;
+    }
+    let base = info.BaseAddress as usize;
+    let Some(region_end) = base.checked_add(info.RegionSize) else { return false };
+    address >= base && address.checked_add(CACHE_LINE).is_some_and(|end| end <= region_end)
+}
+
+/// Xbox Series titles target AMD Zen 2 and may use CLZERO. Intel CPUs do not implement it: at
+/// first chance, emulate the exact three-byte instruction for manually mapped title images.
+unsafe extern "system" fn clzero_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if info.is_null() || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null() {
+        return 0;
+    }
+    let rec = &*(*info).ExceptionRecord;
+    if rec.ExceptionCode as u32 != ILLEGAL_INSTRUCTION {
+        return 0;
+    }
+    let ctx = &mut *(*info).ContextRecord;
+    let rip = ctx.Rip as usize;
+    let Some(base) = modules::image_base_for_addr(rip) else { return 0 };
+    if modules::image_base_for_addr(rip + CLZERO.len() - 1) != Some(base)
+        || !is_clzero(std::slice::from_raw_parts(rip as *const u8, CLZERO.len()))
+    {
+        return 0;
+    }
+    let line = clzero_line(ctx.Rax as usize);
+    if !writable_cache_line(line) {
+        return 0;
+    }
+    std::ptr::write_bytes(line as *mut u8, 0, CACHE_LINE);
+    ctx.Rip += CLZERO.len() as u64;
+    -1 // EXCEPTION_CONTINUE_EXECUTION
 }
 
 /// MSVC's x64 `__security_check_cookie` (vcruntime): `cmp rcx, [__security_cookie]; jne fail;
@@ -771,5 +833,30 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    #[test]
+    fn clzero_opcode_alignment_and_writable_line() {
+        assert!(is_clzero(&[0x0F, 0x01, 0xFC]));
+        assert!(!is_clzero(&[0x0F, 0x01, 0xFD]));
+        assert!(!is_clzero(&[0x0F, 0x01]));
+        assert_eq!(clzero_line(0x12340), 0x12340);
+        assert_eq!(clzero_line(0x1237F), 0x12340);
+
+        unsafe {
+            use windows_sys::Win32::System::Memory::{
+                VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+                PAGE_READONLY, PAGE_READWRITE,
+            };
+            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(page, 0);
+            assert!(writable_cache_line(page));
+            assert!(writable_cache_line(page + 0xFC0));
+            assert!(!writable_cache_line(page + 0x1000));
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page as *const _, 0x1000, PAGE_READONLY, &mut old), 0);
+            assert!(!writable_cache_line(page));
+            assert_ne!(VirtualFree(page as *mut _, 0, MEM_RELEASE), 0);
+        }
     }
 }

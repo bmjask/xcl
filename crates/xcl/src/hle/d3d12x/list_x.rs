@@ -1368,7 +1368,9 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         };
         if let Some(base) = need_restore_base {
             let resolved = super::pso_async::resolve_for_bind(base);
-            pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+            if resolved != 0 {
+                pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+            }
         }
         if !need_native_call {
             return;
@@ -1412,7 +1414,9 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     };
     if let Some(base) = restore {
         let resolved = super::pso_async::resolve_for_bind(base);
-        pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+        if resolved != 0 {
+            pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+        }
     }
 }
 
@@ -1452,7 +1456,9 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
         None => (bound_pso, false),
     };
     let resolved = super::pso_async::resolve_for_bind(target);
-    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+    if resolved != 0 {
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+    }
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }

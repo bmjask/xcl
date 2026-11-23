@@ -1472,7 +1472,7 @@ pub(super) fn forget_pso_for_test(pso: usize) {
     forget_pso(pso);
 }
 
-fn forget_pso(pso: usize) {
+pub(super) fn forget_pso(pso: usize) {
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
@@ -3141,13 +3141,33 @@ unsafe fn go_background(
     standin: unsafe fn(*mut c_void, PsoFn, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool,
 ) -> Option<HRESULT> {
+    if !ppv.is_null() {
+        *ppv = std::ptr::null_mut();
+    }
     let hr = standin(this, f, desc, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         static ONCE: AtomicU64 = AtomicU64::new(0);
         if ONCE.fetch_add(1, Ordering::Relaxed) < 3 {
-            crate::xlog_warn!("D3D12.X: no stand-in pipeline ({hr:#x}) – building this one in the call");
+            crate::xlog_warn!("D3D12.X: no driver stand-in pipeline ({hr:#x}) – using a deferred stand-in");
         }
-        return None;
+        if ppv.is_null() {
+            return Some(E_INVALIDARG);
+        }
+        if !(*ppv).is_null() {
+            super::pso_async::release(*ppv as usize);
+            *ppv = std::ptr::null_mut();
+        }
+        let dev = Dev(this as usize, f as usize);
+        *ppv = super::pso_async::submit_deferred(
+            this as usize,
+            compute,
+            if riid.is_null() { None } else { Some(*riid) },
+            Box::new(move || {
+                let mut out: *mut c_void = std::ptr::null_mut();
+                if unsafe { build(dev, &owned, &mut out) } && !out.is_null() { out as usize } else { 0 }
+            }),
+        ) as *mut c_void;
+        return Some(S_OK);
     }
     let dev = Dev(this as usize, f as usize);
     super::pso_async::submit(
@@ -3843,7 +3863,10 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let resolved = super::pso_async::resolve_for_bind(pso as usize);
+    if resolved != 0 {
+        f(this, resolved as *mut c_void);
+    }
     super::list_x::on_set_pipeline_state(this, pso as usize);
 }
 
@@ -4244,6 +4267,67 @@ mod cache_report_tests {
             decoded.dxil_cache,
             crate::gpu::recomp::dxc::CacheStats::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_pso_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    static BUILD_DONE: AtomicBool = AtomicBool::new(false);
+    static BUILD_GATE: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
+
+    unsafe extern "system" fn reject_standin(
+        _this: *mut c_void,
+        _desc: *const c_void,
+        _iid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        if !out.is_null() {
+            *out = std::ptr::null_mut();
+        }
+        E_INVALIDARG
+    }
+
+    unsafe fn slow_failed_build(_dev: Dev, _desc: &OwnedDesc, _out: *mut *mut c_void) -> bool {
+        let gate = BUILD_GATE.lock().unwrap().take().expect("build gate");
+        let _ = gate.recv_timeout(std::time::Duration::from_secs(2));
+        BUILD_DONE.store(true, AtomicOrdering::Release);
+        false
+    }
+
+    #[test]
+    fn rejected_driver_standin_never_builds_synchronously() {
+        BUILD_DONE.store(false, AtomicOrdering::Release);
+        let (allow_build, gate) = mpsc::channel();
+        *BUILD_GATE.lock().unwrap() = Some(gate);
+        let owned = OwnedDesc::Compute(Box::new(D3D12_COMPUTE_PIPELINE_STATE_DESC::default()), Vec::new());
+        let mut out = std::ptr::null_mut();
+        let hr = unsafe {
+            go_background(
+                std::ptr::null_mut(),
+                reject_standin,
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut out,
+                false,
+                owned,
+                |this, f, desc, iid, ppv| f(this, desc, iid, ppv),
+                slow_failed_build,
+            )
+        };
+        assert_eq!(hr, Some(S_OK));
+        assert!(!out.is_null());
+        assert!(super::super::pso_async::is_deferred(out as usize));
+        assert!(!BUILD_DONE.load(AtomicOrdering::Acquire), "background build completed before CreatePipelineState returned");
+        allow_build.send(()).unwrap();
+        assert_eq!(super::super::pso_async::resolve_wait(out as usize), 0);
+        unsafe {
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(out as *const *const usize)).add(2));
+            assert_eq!(release(out), 0);
+        }
     }
 }
 

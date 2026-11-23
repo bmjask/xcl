@@ -208,7 +208,12 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let tracked = with(this, |s| s.pso);
+    let pso = super::pso_async::resolve_for_bind(tracked);
+    if pso == 0 && super::pso_async::is_deferred(tracked) {
+        count(DRAWS_SKIPPED);
+        return;
+    }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -287,8 +292,14 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    // Graphics work stays non-blocking: a native stand-in draws nothing, while a deferred
+    // stand-in (driver creation failed) skips until its real pipeline is ready.
+    let resolved = super::pso_async::resolve(pso);
+    if resolved == 0 && super::pso_async::is_deferred(pso) {
+        count(DRAWS_SKIPPED);
+        return None;
+    }
+    if !super::real::is_translated_graphics(resolved) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -296,7 +307,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
+                let real = super::pso_async::resolve(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),

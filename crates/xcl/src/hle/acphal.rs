@@ -14,8 +14,8 @@
 //! `AcpHalCreate(&hal)` – an object whose vtable is Connect(commands, messages), Disconnect,
 //! SubmitCommand(type, id, frame, data, size), PopMessage(&message) -> bool,
 //! GetNumMessages, Release; messages {u32 type, u32, u64 value, u64 id}: 2 audio frame,
-//! 0x10 command done (id), 0x80 disconnected. `chad.dll` (XDsp) is left to the stub database:
-//! E_NOTIMPL, the processor's DSP is not there.
+//! 0x10 command done (id), 0x80 disconnected. The silent XDsp client and stream lifecycle
+//! lives in the `chad` module.
 
 #![allow(non_snake_case)]
 

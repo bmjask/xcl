@@ -1588,7 +1588,7 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   ordinal #1 (`stubdb.toml`). `XCL_PRESS_A_AT=s1,s2…` presses A for 200 ms at those seconds (tests). With it the
   title screen takes A and goes to a loading screen (spinner) – it then waits, most likely for Ubisoft's services
   (the network gate, next).
-- **Audio processor** (`hle::acphal`, routes acphal.dll and xapu.dll; chad.dll / XDsp stays E_NOTIMPL): APU memory
+- **Audio processor** (`hle::acphal`, routes acphal.dll and xapu.dll; `hle::chad` provides a silent, stateful XDsp client/stream lifecycle): APU memory
   (32-bit APU addresses for ApuAlloc / ApuMapVirtualAddress), AcpHalCreate's channel (commands acknowledged at once,
   an audio frame message every 2.667 ms), SHAPE context arrays, the xapu decoder answering with silence. Before,
   `ApuCreateHeap` got E_NOTIMPL and XDefiant dropped its whole audio setup (+0x7639ef). Now it creates a 350 MB APU

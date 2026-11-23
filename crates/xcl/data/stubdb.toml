@@ -14,7 +14,6 @@
 "acphal.dll" = "E_NOTIMPL"
 # the console's audio decoder and DSP: what XCL does not answer is not there
 "xapu.dll" = "E_NOTIMPL"
-"chad.dll" = "E_NOTIMPL"
 # console DirectStorage (DStorageGetFactory) and the Xbox One texture layout library: a fake S_OK
 # would leave the title's output pointer as it was
 "xcrdapi.dll" = "E_NOTIMPL"
