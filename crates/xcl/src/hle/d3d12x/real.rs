@@ -1807,6 +1807,18 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
     crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
 }
 
+fn null_uav_desc(
+    resource: &D3D12_RESOURCE_DESC,
+    supplied: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut desc = supplied.copied().unwrap_or(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        ViewDimension: D3D12_UAV_DIMENSION(resource_dim_to_view(resource)),
+        ..Default::default()
+    });
+    desc.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+    desc
+}
+
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
@@ -1817,8 +1829,28 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
         }
     }
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
-    f(this, res, counter, desc, slot.pc_uav);
+    // A resource translated without unordered access cannot receive a real PC UAV. Publish a
+    // null view of the same dimension instead of forwarding an invalid descriptor to the driver.
+    let null_desc;
+    let (res_pc, counter, desc_pc) = match ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()) {
+        Some(rd) if rd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_info!(
+                    "D3D12.X: UAV of a resource without unordered access ({}x{}, format {}, flags {:#x}) – a null view",
+                    rd.Width,
+                    rd.Height,
+                    rd.Format.0,
+                    rd.Flags.0
+                );
+            }
+            null_desc = null_uav_desc(&rd, desc.as_ref());
+            (std::ptr::null_mut(), std::ptr::null_mut(), &null_desc as *const D3D12_UNORDERED_ACCESS_VIEW_DESC)
+        }
+        _ => (res, counter, desc),
+    };
+    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res_pc, counter, desc_pc, cpu) };
+    f(this, res_pc, counter, desc_pc, slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
@@ -3838,6 +3870,36 @@ mod pipeline_input_tests {
         graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
         pc_topology_type(&mut graphics);
         assert_eq!(graphics.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
+    }
+}
+
+#[cfg(test)]
+mod null_uav_tests {
+    use super::*;
+
+    #[test]
+    fn null_uav_uses_a_driver_valid_format_and_resource_dimension() {
+        let resource = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 128,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let generated = null_uav_desc(&resource, None);
+        assert_eq!(generated.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D);
+        assert_eq!(generated.Format, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT);
+
+        let supplied = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            ..Default::default()
+        };
+        let preserved = null_uav_desc(&resource, Some(&supplied));
+        assert_eq!(preserved.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+        assert_eq!(preserved.Format, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT);
     }
 }
 
