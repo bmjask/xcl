@@ -1661,8 +1661,8 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let mut pc_desc = D3D12_SHADER_RESOURCE_VIEW_DESC::default();
-    let pc = srv_desc_pc(desc, &mut pc_desc);
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, pc, cpu) };
+    let desc = srv_desc_pc(res, desc, &mut pc_desc);
+    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
@@ -1679,7 +1679,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
-    f(this, res, pc, slot.pc_srv);
+    f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
@@ -1715,7 +1715,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
                 10 => (a.TextureCubeArray.NumCubes.max(1) * 6, a.TextureCubeArray.MipLevels),
                 _ => (1, 1),
             };
-            (dxgi(super::device_x::pc_srv_format(v.Format.0 as u32)), v.ViewDimension.0, array, mips)
+            (v.Format, v.ViewDimension.0, array, mips)
         }
         None => {
             let d = r.GetDesc();
@@ -4129,10 +4129,11 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // presentation tracking
 // ---------------------------------------------------------------------------------------
 
-unsafe fn srv_desc_pc<'a>(desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, storage: &'a mut D3D12_SHADER_RESOURCE_VIEW_DESC) -> *const D3D12_SHADER_RESOURCE_VIEW_DESC {
+unsafe fn srv_desc_pc<'a>(res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, storage: &'a mut D3D12_SHADER_RESOURCE_VIEW_DESC) -> *const D3D12_SHADER_RESOURCE_VIEW_DESC {
     let Some(v) = (unsafe { desc.as_ref() }) else { return desc };
     *storage = *v;
-    storage.Format = dxgi(super::device_x::pc_srv_format(v.Format.0 as u32));
+    let resource_format = ID3D12Resource::from_raw_borrowed(&res).map_or(0, |resource| resource.GetDesc().Format.0 as u32);
+    storage.Format = dxgi(super::device_x::pc_shader_view_format(resource_format, v.Format.0 as u32));
     storage
 }
 
@@ -4140,7 +4141,7 @@ unsafe extern "system" fn dev_create_srv(this: *mut c_void, res: *mut c_void, de
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateShaderResourceView")));
     let mut storage = D3D12_SHADER_RESOURCE_VIEW_DESC::default();
-    f(this, res, srv_desc_pc(desc, &mut storage), handle);
+    f(this, res, srv_desc_pc(res, desc, &mut storage), handle);
 }
 
 unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {

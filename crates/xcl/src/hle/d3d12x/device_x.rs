@@ -706,6 +706,21 @@ pub fn pc_target_view_format(resource: u32, view: u32) -> u32 {
     }
 }
 
+/// A shader-readable host view for a resource whose format may have become typeless.
+pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
+    let view = pc_srv_format(view);
+    match (resource, view) {
+        (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41) => 21,
+        (19..=22, 22 | 61 | 62) => 22,
+        (44..=47, 0 | 41 | 44 | 45 | 46 | 53 | 54 | 55 | 56) => 46,
+        (44..=47, 47 | 61 | 62) => 47,
+        (39 | 40, 0 | 39 | 40) => 41,
+        (53 | 55, 0 | 53 | 55) => 56,
+        (28, 86 | 115) => 28,
+        (_, view) => view,
+    }
+}
+
 /// A clear value in the same depth family (typed, which is what a typeless resource's clear uses).
 pub unsafe fn pc_clear_value(clear: *const c_void, storage: &mut [u8; 20]) -> *const c_void {
     if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 20) {
@@ -1040,6 +1055,9 @@ mod tests {
         assert_eq!(pc_resource_format(86, 0), 86);
         assert_eq!(pc_target_view_format(28, 86), 28);
         assert_eq!(pc_target_view_format(86, 86), 86);
+        assert_eq!(pc_shader_view_format(39, 40), 41);
+        assert_eq!(pc_shader_view_format(44, 118), 46);
+        assert_eq!(pc_shader_view_format(44, 120), 47);
     }
 
     #[test]
