@@ -107,6 +107,50 @@ fn take_sparse_in(
     Some(at)
 }
 
+/// Carve an aligned sparse block from the high end of a free range. This is used for
+/// GPU-protected pools so a later large physical-page allocation can still obtain one
+/// contiguous low-address run.
+fn take_sparse_high_in(
+    g: &mut (BTreeMap<usize, usize>, BTreeMap<usize, usize>),
+    lo_bound: usize,
+    hi_bound: usize,
+    size: usize,
+    align: usize,
+    single_window: bool,
+) -> Option<usize> {
+    if lo_bound >= hi_bound {
+        return None;
+    }
+    let found = g.0.iter().rev().find_map(|(&o, &l)| {
+        let lo = o.max(lo_bound);
+        let hi = o.saturating_add(l).min(hi_bound);
+        if hi.saturating_sub(lo) < size {
+            return None;
+        }
+        let mut end = hi;
+        loop {
+            let at = end.checked_sub(size)? & !(align - 1);
+            if at < lo {
+                return None;
+            }
+            if !single_window || size > WINDOW || at / WINDOW == (at + size - 1) / WINDOW {
+                return Some((o, l, at));
+            }
+            end = (at / WINDOW).checked_mul(WINDOW)?;
+        }
+    });
+    let (start, len, at) = found?;
+    g.0.remove(&start);
+    if at > start {
+        g.0.insert(start, at - start);
+    }
+    if at + size < start + len {
+        g.0.insert(at + size, start + len - (at + size));
+    }
+    g.1.insert(at, size);
+    Some(at)
+}
+
 impl Uma {
     /// Commit `size` bytes (split into as few equal windows as fit, at most 4) at the first
     /// free 16 GiB-aligned address from 16 GiB up, with remaining windows reserved as sparse.
@@ -327,6 +371,33 @@ impl Uma {
             take_sparse_in(&mut g, above_0, end, size, align, false)
                 .or_else(|| take_sparse_in(&mut g, lo, end, size, align, false))
                 .map(|at| (at, size))
+        }
+    }
+
+    /// Reserve an aligned title range from the high end of sparse space. Like
+    /// [`Self::sparse_alloc`], small ranges never straddle a window boundary.
+    pub fn sparse_alloc_high(&self, size: usize, align: usize) -> Option<(usize, usize)> {
+        if !self.has_sparse() {
+            return None;
+        }
+        let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+        let align = align.max(GRAIN).checked_next_power_of_two()?;
+        let mut g = self.sparse_free.lock().unwrap();
+        let lo = self.title_sparse_start();
+        let end = self.base + MAX_WINDOWS * WINDOW;
+        if size <= WINDOW {
+            for k in (0..MAX_WINDOWS).rev() {
+                if !self.is_sparse_window(k) {
+                    continue;
+                }
+                let (start, len) = self.window(k);
+                if let Some(at) = take_sparse_high_in(&mut g, start.max(lo), start + len, size, align, true) {
+                    return Some((at, size));
+                }
+            }
+            None
+        } else {
+            take_sparse_high_in(&mut g, lo, end, size, align, false).map(|at| (at, size))
         }
     }
 
@@ -809,6 +880,15 @@ mod tests {
         assert_eq!(u.sparse_release(d), Some(ld));
         assert_eq!(u.sparse_release(r), Some(big));
         assert_eq!(u.sparse_used(), 0);
+    }
+
+    #[test]
+    fn high_sparse_pool_leaves_one_low_contiguous_run() {
+        let mut g = (BTreeMap::from([(0usize, 3 * WINDOW)]), BTreeMap::new());
+        let high = take_sparse_high_in(&mut g, 0, 3 * WINDOW, WINDOW, GRAIN, true).unwrap();
+        assert_eq!(high, 2 * WINDOW);
+        let low = take_sparse_in(&mut g, 0, 2 * WINDOW, WINDOW + GRAIN, GRAIN, false).unwrap();
+        assert_eq!(low, 0);
     }
 
     #[test]

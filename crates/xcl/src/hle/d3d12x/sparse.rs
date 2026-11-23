@@ -1033,6 +1033,19 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
     Some((addr, rounded))
 }
 
+/// Like [`alloc`], but reserves from high sparse addresses first. GPU-protected pools use
+/// this placement so physical pages can retain a large contiguous low-address range.
+pub unsafe fn alloc_high(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc_high(size, align)?;
+    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    committed(addr, rounded);
+    Some((addr, rounded))
+}
+
 /// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
 /// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {

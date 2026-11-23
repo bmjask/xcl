@@ -104,6 +104,9 @@ mod placeholders;
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
 const STD_PROTECT_MASK: u32 = 0xFF | 0x100 | 0x200 | 0x400;
+/// Console-only page protections that describe GPU-visible memory. They are supplied in
+/// addition to the regular Win32 access bits (for example, `PAGE_READWRITE`).
+const PAGE_GRAPHICS_MASK: u32 = 0x0007_f800;
 
 static WARNED_FLAGS: AtomicU32 = AtomicU32::new(0);
 
@@ -127,6 +130,14 @@ pub fn sanitize_protect(p: u32) -> u32 {
     } else {
         s
     }
+}
+
+/// A graphics page protection is another way console code marks GPU-visible allocations.
+/// Some callers use it without `MEM_GRAPHICS`, so dropping it before allocation would make
+/// the CPU address ordinary system memory that translated shaders cannot address.
+#[inline]
+pub fn has_graphics_protection(p: u32) -> bool {
+    p & PAGE_GRAPHICS_MASK != 0
 }
 
 /// Graphics address space the title reserved (no commit) that unified memory had no room for
@@ -175,6 +186,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         return q;
     }
     let uma = crate::gpu::uma::get();
+    let graphics = t & MEM_GRAPHICS != 0 || has_graphics_protection(p);
     // committing inside one of the title's reservations in a sparse window
     if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_sparse(addr as usize)) {
         let q = commit_sparse(addr as usize, size, p);
@@ -192,7 +204,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q as *mut c_void;
         }
     }
-    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x1000 != 0 {
+    if addr.is_null() && graphics && t & 0x1000 != 0 {
         let align = if t & 0x8000_0000 != 0 {
             4 << 20
         } else if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 {
@@ -201,7 +213,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             crate::gpu::uma::GRAIN
         };
         let rounded = size.max(1).div_ceil(align) * align;
-        if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+        let sparse = if has_graphics_protection(p) {
+            crate::hle::d3d12x::sparse::alloc_high(rounded, align)
+        } else {
+            crate::hle::d3d12x::sparse::alloc(rounded, align)
+        };
+        if let Some((q, _)) = sparse {
             trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -210,7 +227,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q as *mut c_void;
         }
     }
-    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 {
+    if addr.is_null() && graphics && t & 0x2000 != 0 {
         // on the console all graphics memory is GPU-visible, reserved address space too (titles
         // reserve a range, then commit or map pages and place resources in it): prefer the
         // sparse VRAM windows first so reservations consume zero system RAM until committed
@@ -854,7 +871,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         return 0;
     }
     let n = *num;
-    let Some(bytes) = n.checked_mul(PHYS_PAGE) else {
+    let Some(_bytes) = n.checked_mul(PHYS_PAGE) else {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
@@ -862,18 +879,47 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
-    // (a sparse home is committed when it is used: `home_again`)
-    let block = u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize));
-    let Some(block) = block else {
-        crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room in UMA");
-        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
-        return 0;
-    };
-    let first = (block - u.base()) / PHYS_PAGE;
-    for i in 0..n {
-        *arr.add(i) = page_number(first + i);
+    // A physical-page allocation returns an array, not one virtual range.  Keep a contiguous
+    // fast path, then split only when prior GPU-visible pools have fragmented sparse space.
+    // Homes remain sparse reservations until a page is actually mapped or read/written.
+    let mut blocks = Vec::new();
+    let mut remaining = n;
+    while remaining != 0 {
+        let mut pages = remaining;
+        let mut block = None;
+        while pages != 0 {
+            let bytes = pages * PHYS_PAGE;
+            block = u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| (p, pages)).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| (p as usize, pages)));
+            if block.is_some() {
+                break;
+            }
+            pages /= 2;
+        }
+        let Some((base, pages)) = block else {
+            for (base, _) in blocks {
+                if u.is_sparse(base) {
+                    u.sparse_release(base);
+                } else {
+                    u.free(base);
+                }
+            }
+            crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room in UMA");
+            fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
+        };
+        blocks.push((base, pages));
+        remaining -= pages;
     }
-    PHYS_BLOCKS.lock().unwrap().insert(first, (n, n));
+    let mut out = 0;
+    let mut physical = PHYS_BLOCKS.lock().unwrap();
+    for (base, count) in blocks {
+        let first = (base - u.base()) / PHYS_PAGE;
+        for i in 0..count {
+            *arr.add(out + i) = page_number(first + i);
+        }
+        physical.insert(first, (count, count));
+        out += count;
+    }
     1
 }
 
@@ -1525,6 +1571,11 @@ mod tests {
         assert_eq!(sanitize_alloc_type(MEM_TITLE), 0x3000);
         assert_eq!(sanitize_protect(0x1000_0004), 0x04);
         assert_eq!(sanitize_protect(0x2000_0000), mem::PAGE_READWRITE);
+        assert!(has_graphics_protection(0x0000_2004));
+        assert!(has_graphics_protection(0x0002_2004));
+        assert!(has_graphics_protection(0x0004_2404));
+        assert!(!has_graphics_protection(mem::PAGE_READWRITE));
+        assert!(!has_graphics_protection(mem::PAGE_WRITECOMBINE));
         unsafe {
             let p = VirtualAlloc(std::ptr::null(), 0x10000, MEM_GRAPHICS | MEM_TITLE | 0x3000, 0x0400_0004);
             assert!(!p.is_null());
