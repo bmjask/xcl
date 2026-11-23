@@ -77,12 +77,42 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().len(), UPLOADS.load(Ordering::Relaxed))
 }
 
+/// A small colour target with a metadata plane can still be CPU-populated.  Keep those in step
+/// with title memory, but leave depth, multisample, placeholder, and large targets GPU-owned.
+fn small_cpu_target(desc: &[u8; 0x38], planes: usize) -> bool {
+    if planes <= 1 {
+        return false;
+    }
+    let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
+    let height = u32::from_le_bytes(desc[0x18..0x1c].try_into().unwrap());
+    let samples = u32::from_le_bytes(desc[0x24..0x28].try_into().unwrap());
+    let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
+    width <= 1024
+        && height <= 1024
+        && width.saturating_mul(height as u64) >= 64 * 64
+        && samples == 1
+        && flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32 == 0
+}
+
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
-    // render targets and depth buffers are the GPU's (their metadata planes, empty planes)
-    if tex.planes.len() != 1 || tex.texels().is_none() {
+    // Render targets and depth buffers are normally GPU-owned, but some small colour targets
+    // have an extra metadata plane while their texels are populated by CPU-side streaming.
+    // Upload only those bounded targets after CPU writes; a GPU-only target stays untouched.
+    // `XCL_SYNC_SMALL_TARGETS=0` disables this compatibility path.
+    static SYNC_SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let sync_small = *SYNC_SMALL.get_or_init(|| !std::env::var("XCL_SYNC_SMALL_TARGETS").is_ok_and(|v| v.trim() == "0"));
+    let sync_target = sync_small && small_cpu_target(desc, tex.planes.len());
+    if tex.texels().is_none() || (tex.planes.len() != 1 && !sync_target) {
         return Err("a render target / depth buffer".into());
+    }
+    if sync_target {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a small CPU-populated target at {va:#x} ({} planes) is kept in step with title memory ({n} so far)", tex.planes.len());
+        }
     }
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
@@ -609,5 +639,26 @@ mod tests {
             pages_from_ranges(vec![(0x1ff0, 0x30), (0x3000, 0x1001)], 0x1000),
             vec![0x1000, 0x2000, 0x3000, 0x4000]
         );
+    }
+
+    fn target_desc(width: u64, height: u32, samples: u32, flags: u32) -> [u8; 0x38] {
+        let mut desc = [0; 0x38];
+        desc[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+        desc[0x18..0x1c].copy_from_slice(&height.to_le_bytes());
+        desc[0x24..0x28].copy_from_slice(&samples.to_le_bytes());
+        desc[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+        desc
+    }
+
+    #[test]
+    fn small_cpu_targets_have_tight_eligibility_bounds() {
+        assert!(small_cpu_target(&target_desc(64, 64, 1, 0), 2));
+        assert!(small_cpu_target(&target_desc(1024, 1024, 1, 0), 3));
+        assert!(!small_cpu_target(&target_desc(63, 64, 1, 0), 2));
+        assert!(!small_cpu_target(&target_desc(1025, 64, 1, 0), 2));
+        assert!(!small_cpu_target(&target_desc(256, 256, 0, 0), 2));
+        assert!(!small_cpu_target(&target_desc(256, 256, 2, 0), 2));
+        assert!(!small_cpu_target(&target_desc(256, 256, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32), 2));
+        assert!(!small_cpu_target(&target_desc(256, 256, 1, 0), 1));
     }
 }
