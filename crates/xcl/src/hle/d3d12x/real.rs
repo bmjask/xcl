@@ -3811,6 +3811,31 @@ fn pc_pso_formats(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     }
 }
 
+#[cfg(test)]
+mod pipeline_input_tests {
+    use super::*;
+
+    #[test]
+    fn console_topology_types_become_valid_pc_types() {
+        let mut graphics = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE(19),
+            ..Default::default()
+        };
+        pc_topology_type(&mut graphics);
+        assert_eq!(graphics.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+
+        graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE(0);
+        graphics.HS.pShaderBytecode = 1usize as *const c_void;
+        graphics.HS.BytecodeLength = 1;
+        pc_topology_type(&mut graphics);
+        assert_eq!(graphics.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH);
+
+        graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        pc_topology_type(&mut graphics);
+        assert_eq!(graphics.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
+    }
+}
+
 enum StreamPipeline {
     Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>),
     Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>),
@@ -3821,7 +3846,7 @@ enum StreamPipeline {
 /// A pipeline stream with a console VS (+ PS / GS) or CS as the plain pipeline desc, which is
 /// translated like any other (`dev_create_graphics_pso`). The stream itself must not reach the
 /// driver: AMD's shader compiler fails on the console's stripped DXIL and takes the device with
-/// it (0x887A0020 at the retail game's first graphics pipeline). Depth bounds, view instancing and the
+/// it (0x887A0020 at a graphics pipeline). Depth bounds, view instancing and the
 /// float depth bias' fraction have no place in the plain desc.
 unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     use crate::gpu::recomp::pso::is_console;
