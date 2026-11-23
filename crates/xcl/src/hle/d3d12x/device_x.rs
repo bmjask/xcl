@@ -667,6 +667,15 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d
 }
 
+pub(super) fn retry_resource_with_common(mut create: impl FnMut(u32) -> HRESULT, state: u32) -> (HRESULT, u32) {
+    let hr = create(state);
+    if hr == E_INVALIDARG && state != 0 {
+        (create(0), 0)
+    } else {
+        (hr, state)
+    }
+}
+
 fn console_texture_allocation_info(x: &[u8; 0x38]) -> Option<(u64, u64)> {
     let dimension = u32::from_le_bytes(x[0..4].try_into().unwrap());
     crate::hle::xg::Texture::new(x)
@@ -799,10 +808,13 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         }
     }
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-    let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+    let (hr, effective_state) = retry_resource_with_common(
+        |initial| real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, initial as usize, clear as usize, riid, ppv),
+        state,
+    );
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
-        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(effective_state as i32)) {
             Ok(()) => return hr,
             Err(e) if once(&M, 4) => {
                 let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
@@ -956,6 +968,39 @@ mod tests {
         assert_eq!(converted_flags(0x8030_0000 | depth | conflicts | deny_shader), depth | deny_shader);
         assert_eq!(converted_flags(uav), uav);
         assert_eq!(converted_flags(render_target | uav), render_target | uav);
+    }
+
+    #[test]
+    fn resource_creation_retries_only_invalid_noncommon_state_and_publishes_success() {
+        let mut states = Vec::new();
+        let mut published = 0usize;
+        let (hr, effective_state) = retry_resource_with_common(
+            |state| {
+                states.push(state);
+                if state == 0 {
+                    published = 0x1234;
+                    S_OK
+                } else {
+                    E_INVALIDARG
+                }
+            },
+            0x840000,
+        );
+        assert_eq!((hr, effective_state, states, published), (S_OK, 0, vec![0x840000, 0], 0x1234));
+
+        for (initial, first) in [(0, E_INVALIDARG), (7, E_FAIL), (7, S_OK)] {
+            let mut states = Vec::new();
+            let (hr, effective_state) = retry_resource_with_common(
+                |state| {
+                    states.push(state);
+                    first
+                },
+                initial,
+            );
+            assert_eq!(hr, first);
+            assert_eq!(effective_state, initial);
+            assert_eq!(states, [initial]);
+        }
     }
 
     #[test]

@@ -152,7 +152,10 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
         return None;
     }
     let (heap, offset) = arena_for(dev, va, info.SizeInBytes as usize)?;
-    let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset as usize, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    let (hr, _effective_state) = super::device_x::retry_resource_with_common(
+        |initial| super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset as usize, desc as *const _ as usize, initial as usize, clear as usize, riid, ppv),
+        state,
+    );
     if hr < 0 || (*ppv).is_null() {
         return None;
     }
