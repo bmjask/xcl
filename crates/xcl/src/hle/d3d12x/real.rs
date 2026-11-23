@@ -1320,6 +1320,18 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
         return S_OK;
     }
+    // A PC texture that mirrors a title-addressed resource is normally in DEFAULT memory.
+    // Its CPU view is the title allocation; calling the native Map first only produces an
+    // invalid D3D12 call before reaching the fallback below.
+    if let Some(p) = super::title_textures::address(this as usize)
+        .or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied()))
+    {
+        if !data.is_null() {
+            *data = p as *mut c_void;
+        }
+        UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+        return S_OK;
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
     let hr = f(this, sub, range, data);
     if hr >= 0 {
@@ -1333,23 +1345,12 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         }
         return hr;
     }
-    match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
-        Some(p) => {
-            if !data.is_null() {
-                *data = p as *mut c_void;
-            }
-            UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
-            S_OK
-        }
-        None => {
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
-                crate::xlog_warn!("D3D12.X: Map of a resource not in unified memory → {:#x} ({:?})", hr as u32, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)));
-            }
-            hr
-        }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+        crate::xlog_warn!("D3D12.X: Map of a resource not in unified memory → {:#x} ({:?})", hr as u32, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)));
     }
+    hr
 }
 
 /// WriteToSubresource(subresource, box, data, row pitch, depth pitch): the CPU writing texels.
