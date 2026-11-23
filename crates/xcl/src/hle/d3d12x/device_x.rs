@@ -661,13 +661,28 @@ pub fn pc_dsv_format(format: u32) -> u32 {
     }
 }
 
-/// A resource's format. The typeless parent of D16+S8 becomes the typeless parent of D24+S8,
-/// so a depth view of 118 still matches.
-pub fn pc_resource_format(format: u32) -> u32 {
+fn depth_typeless(format: u32) -> Option<u32> {
+    match format {
+        20 => Some(19), // D32_FLOAT_S8X24_UINT
+        40 => Some(39), // D32_FLOAT
+        45 | 118..=120 => Some(44), // D24S8 and the console D16S8 family
+        55 => Some(53), // D16_UNORM
+        _ => None,
+    }
+}
+
+/// A resource's host format. Depth resources must be typeless so their depth and shader views
+/// can coexist; formats unsupported for render/UAV targets use a host renderable equivalent.
+pub fn pc_resource_format(format: u32, flags: u32) -> u32 {
+    if flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32 != 0 {
+        if let Some(typeless) = depth_typeless(format) {
+            return typeless;
+        }
+    }
     match format {
         116 | 117 => 10,
-        118 => 45,
-        119 | 120 => 44, // R16_UNORM_X8 / X16_G8 → R24G8_TYPELESS
+        86 | 115 if flags & 5 != 0 => 28,
+        119 | 120 => 44, // readable members of the console D16S8 family
         other => other,
     }
 }
@@ -679,6 +694,15 @@ pub fn pc_srv_format(format: u32) -> u32 {
         118 | 119 => 46, // R24_UNORM_X8_TYPELESS
         120 => 47,       // X24_TYPELESS_G8_UINT
         other => other,
+    }
+}
+
+/// A render-target or unordered-access view format for a host resource. A console B5 target
+/// may have been created as R8G8B8A8 on the host, so its matching view must use that format.
+pub fn pc_target_view_format(resource: u32, view: u32) -> u32 {
+    match (resource, view) {
+        (28, 86 | 115) => 28,
+        (_, view) => pc_color_format(view),
     }
 }
 
@@ -714,7 +738,7 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     }
     d[8..16].fill(0); // alignment: the driver's
     let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
-    d[0x20..0x24].copy_from_slice(&pc_resource_format(format).to_le_bytes());
+    d[0x20..0x24].copy_from_slice(&pc_resource_format(format, flags).to_le_bytes());
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
     d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
@@ -1000,10 +1024,22 @@ mod tests {
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
         x[0x20..0x24].copy_from_slice(&118u32.to_le_bytes());
-        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 45);
+        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 118);
         x[0x20..0x24].copy_from_slice(&119u32.to_le_bytes());
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 44);
         assert_eq!((pc_dsv_format(118), pc_srv_format(119), pc_srv_format(120)), (45, 46, 47));
+    }
+
+    #[test]
+    fn pc_resources_keep_depth_views_and_renderable_target_formats() {
+        let depth = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32;
+        assert_eq!(pc_resource_format(40, depth), 39);
+        assert_eq!(pc_resource_format(118, depth), 44);
+        assert_eq!(pc_resource_format(40, 0), 40);
+        assert_eq!(pc_resource_format(86, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32), 28);
+        assert_eq!(pc_resource_format(86, 0), 86);
+        assert_eq!(pc_target_view_format(28, 86), 28);
+        assert_eq!(pc_target_view_format(86, 86), 86);
     }
 
     #[test]

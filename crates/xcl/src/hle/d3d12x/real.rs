@@ -1824,6 +1824,11 @@ fn null_uav_desc(
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
+    let mut copy = desc.as_ref().copied();
+    if let (Some(view), Some(resource)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
+        view.Format = dxgi(super::device_x::pc_target_view_format(resource.GetDesc().Format.0 as u32, view.Format.0 as u32));
+    }
+    let desc = copy.as_ref().map_or(desc, |view| view as *const _);
     if super::present::trace_frame() {
         let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
         if d.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
@@ -4156,6 +4161,11 @@ unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, de
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
+    let mut copy = (!desc.is_null()).then(|| (desc as *const D3D12_RENDER_TARGET_VIEW_DESC).read_unaligned());
+    if let (Some(view), Some(resource)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
+        view.Format = dxgi(super::device_x::pc_target_view_format(resource.GetDesc().Format.0 as u32, view.Format.0 as u32));
+    }
+    let desc = copy.as_ref().map_or(desc, |view| view as *const _ as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
