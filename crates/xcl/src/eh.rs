@@ -140,21 +140,60 @@ pub fn install_crash_handler() {
         }
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
-        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(clzero_handler));
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(amd_ud_handler));
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
     }
 }
 
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 const CLZERO: [u8; 3] = [0x0F, 0x01, 0xFC];
+const MONITORX: [u8; 3] = [0x0F, 0x01, 0xFA];
+const MWAITX: [u8; 3] = [0x0F, 0x01, 0xFB];
 const CACHE_LINE: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AmdUdInstruction {
+    Monitorx,
+    Mwaitx,
+    Clzero,
+}
+
+fn decode_amd_ud(bytes: &[u8]) -> Option<AmdUdInstruction> {
+    match bytes {
+        x if x == MONITORX => Some(AmdUdInstruction::Monitorx),
+        x if x == MWAITX => Some(AmdUdInstruction::Mwaitx),
+        x if x == CLZERO => Some(AmdUdInstruction::Clzero),
+        _ => None,
+    }
+}
 
 fn clzero_line(address: usize) -> usize {
     address & !(CACHE_LINE - 1)
 }
 
 fn is_clzero(bytes: &[u8]) -> bool {
-    bytes == CLZERO
+    decode_amd_ud(bytes) == Some(AmdUdInstruction::Clzero)
+}
+
+fn bounded_mwaitx(extensions: u32, timeout: u32) {
+    let turns = if extensions & 2 != 0 { timeout.clamp(1, 64) } else { 1 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(50);
+    for _ in 0..turns {
+        std::thread::yield_now();
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+}
+
+unsafe fn emulate_amd_wait(instruction: AmdUdInstruction, ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> bool {
+    match instruction {
+        AmdUdInstruction::Monitorx => {}
+        AmdUdInstruction::Mwaitx => bounded_mwaitx(ctx.Rcx as u32, ctx.Rbx as u32),
+        AmdUdInstruction::Clzero => return false,
+    }
+    ctx.Rip += 3;
+    true
 }
 
 /// Whether a complete cache line can be written without raising another exception from inside
@@ -181,7 +220,7 @@ unsafe fn writable_cache_line(address: usize) -> bool {
 
 /// Xbox Series titles target AMD Zen 2 and may use CLZERO. Intel CPUs do not implement it: at
 /// first chance, emulate the exact three-byte instruction for manually mapped title images.
-unsafe extern "system" fn clzero_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+unsafe extern "system" fn amd_ud_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if info.is_null() || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null() {
         return 0;
     }
@@ -192,10 +231,12 @@ unsafe extern "system" fn clzero_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let ctx = &mut *(*info).ContextRecord;
     let rip = ctx.Rip as usize;
     let Some(base) = modules::image_base_for_addr(rip) else { return 0 };
-    if modules::image_base_for_addr(rip + CLZERO.len() - 1) != Some(base)
-        || !is_clzero(std::slice::from_raw_parts(rip as *const u8, CLZERO.len()))
-    {
+    if modules::image_base_for_addr(rip + CLZERO.len() - 1) != Some(base) {
         return 0;
+    }
+    let Some(instruction) = decode_amd_ud(std::slice::from_raw_parts(rip as *const u8, CLZERO.len())) else { return 0 };
+    if emulate_amd_wait(instruction, ctx) {
+        return -1;
     }
     let line = clzero_line(ctx.Rax as usize);
     if !writable_cache_line(line) {
@@ -858,5 +899,48 @@ mod tests {
             assert!(!writable_cache_line(page));
             assert_ne!(VirtualFree(page as *mut _, 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn amd_wait_decoder_rejects_partial_and_adjacent_opcodes() {
+        assert_eq!(decode_amd_ud(&MONITORX), Some(AmdUdInstruction::Monitorx));
+        assert_eq!(decode_amd_ud(&MWAITX), Some(AmdUdInstruction::Mwaitx));
+        assert_eq!(decode_amd_ud(&CLZERO), Some(AmdUdInstruction::Clzero));
+        assert_eq!(decode_amd_ud(&[0x0F, 0x01]), None);
+        assert_eq!(decode_amd_ud(&[0x0F, 0x01, 0xF9]), None);
+        assert_eq!(decode_amd_ud(&[0x0F, 0x01, 0xFD]), None);
+        assert_eq!(decode_amd_ud(&[0x90, 0x0F, 0x01, 0xFA]), None);
+    }
+
+    #[test]
+    fn amd_wait_emulation_advances_only_wait_instructions() {
+        let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rip = 0x1234;
+        unsafe { assert!(emulate_amd_wait(AmdUdInstruction::Monitorx, &mut ctx)) };
+        assert_eq!(ctx.Rip, 0x1237);
+        ctx.Rcx = 2;
+        ctx.Rbx = u32::MAX as u64;
+        unsafe { assert!(emulate_amd_wait(AmdUdInstruction::Mwaitx, &mut ctx)) };
+        assert_eq!(ctx.Rip, 0x123a);
+        unsafe { assert!(!emulate_amd_wait(AmdUdInstruction::Clzero, &mut ctx)) };
+        assert_eq!(ctx.Rip, 0x123a);
+    }
+
+    #[test]
+    fn cooperative_mwait_loop_observes_cross_thread_change() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let cell = Arc::new(AtomicU64::new(0));
+        let writer = cell.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            writer.store(1, Ordering::Release);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while cell.load(Ordering::Acquire) == 0 {
+            bounded_mwaitx(2, 64);
+            assert!(std::time::Instant::now() < deadline);
+        }
+        thread.join().unwrap();
     }
 }
