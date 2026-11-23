@@ -838,6 +838,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (43, b::set_compute_root_descriptor as usize),
                 (45, b::set_compute_root_descriptor as usize),
                 (10, l::reset_x as usize),
+                // Newer console runtimes use Reset with an extra trailing argument at #139.
+                // The Windows x64 ABI leaves that fourth argument harmless to reset_x.
+                (139, l::reset_x as usize),
                 (28, l::begin_query_x as usize),
                 (29, l::end_query_x as usize),
                 (30, l::resolve_query_data_x as usize),
@@ -865,6 +868,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (148, b::allocate_upload_memory as usize),
             ]
         }
+        // The paired console allocator Reset sits one slot after the PC method.  It must
+        // reach the real reset path: returning a stub success leaves lists closed.
+        Kind::CommandAllocator => vec![(9, alloc_reset as usize)],
         _ => vec![],
     }
 }
@@ -4362,6 +4368,26 @@ pub fn stop_if_device_removed() {
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
         }
+    }
+}
+
+#[cfg(test)]
+mod console_reset_slot_tests {
+    use super::*;
+
+    #[test]
+    fn console_reset_variants_use_the_native_reset_wrappers() {
+        let list_slots = console_slots(Kind::CommandList);
+        assert_eq!(
+            list_slots.iter().find(|&&(slot, _)| slot == 139).map(|&(_, f)| f),
+            Some(super::super::list_x::reset_x as usize),
+        );
+
+        let allocator_slots = console_slots(Kind::CommandAllocator);
+        assert_eq!(
+            allocator_slots.iter().find(|&&(slot, _)| slot == 9).map(|&(_, f)| f),
+            Some(alloc_reset as usize),
+        );
     }
 }
 
