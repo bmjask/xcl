@@ -214,15 +214,15 @@ fn heap_ranges(heap: u32, tiles: &[Tile]) -> Vec<(bool, u32, u32)> {
     ranges
 }
 
-/// The optimized clear value is optional. Some drivers refuse a console-derived value for a
-/// tiled target even though the resource itself is valid, so retry without that optimization.
-fn retry_reserved_without_clear(mut create: impl FnMut(u32, *const c_void) -> HRESULT, state: u32, clear: *const c_void) -> (HRESULT, bool) {
-    let (first, _) = super::device_x::retry_resource_with_common(|initial| create(initial, clear), state);
+/// The optimized clear value is optional. Some drivers refuse a console-derived value even
+/// though the resource itself is valid, so retry without that optimization.
+pub(super) fn retry_without_clear(mut create: impl FnMut(u32, *const c_void) -> HRESULT, state: u32, clear: *const c_void) -> (HRESULT, u32, bool) {
+    let (first, effective_state) = super::device_x::retry_resource_with_common(|initial| create(initial, clear), state);
     if first != E_INVALIDARG || clear.is_null() {
-        return (first, false);
+        return (first, effective_state, false);
     }
-    let (fallback, _) = super::device_x::retry_resource_with_common(|initial| create(initial, std::ptr::null()), state);
-    (fallback, fallback >= 0)
+    let (fallback, effective_state) = super::device_x::retry_resource_with_common(|initial| create(initial, std::ptr::null()), state);
+    (fallback, effective_state, fallback >= 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,7 +231,7 @@ unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, va: usize, desc:
     let mut lock = PAGES.lock().unwrap();
     let pages = lock.get_or_insert_with(|| Pages::new(dev)).as_mut()?;
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
-    let (hr, ignored_clear) = retry_reserved_without_clear(
+    let (hr, _, ignored_clear) = retry_without_clear(
         |initial, optimized_clear| {
             *ppv = std::ptr::null_mut();
             super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, initial as usize, optimized_clear as usize, riid, ppv)
@@ -320,10 +320,14 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     let alignment = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
     let (heap, offset, arena) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, alignment, now, |size, align| arena_heap(dev, va, size, align))?;
-    let (hr, _effective_state) = super::device_x::retry_resource_with_common(
-        |initial| super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, initial as usize, clear as usize, riid, ppv),
+    let (hr, _, ignored_clear) = retry_without_clear(
+        |initial, optimized_clear| super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, initial as usize, optimized_clear as usize, riid, ppv),
         state,
+        clear,
     );
+    if ignored_clear {
+        crate::xlog_info!("D3D12.X: placement at {va:#x} accepted without its optional clear-value optimization");
+    }
     if hr < 0 || (*ppv).is_null() {
         ARENAS.lock().unwrap().release(arena, now);
         return None;
@@ -351,7 +355,7 @@ mod tests {
     fn reserved_target_retries_without_an_invalid_clear_value() {
         let clear = 1usize as *const c_void;
         let mut calls = Vec::new();
-        let (hr, ignored_clear) = retry_reserved_without_clear(
+        let (hr, effective_state, ignored_clear) = retry_without_clear(
             |state, value| {
                 calls.push((state, value.is_null()));
                 if value.is_null() && state == 0 { 0 } else { E_INVALIDARG }
@@ -361,21 +365,32 @@ mod tests {
         );
         assert_eq!(hr, 0);
         assert!(ignored_clear);
-        assert_eq!(calls, [(0xC0, false), (0, false), (0xC0, true), (0, true)]);
+        assert_eq!((effective_state, calls), (0, vec![(0xC0, false), (0, false), (0xC0, true), (0, true)]));
     }
 
     #[test]
     fn reserved_target_does_not_drop_a_clear_on_other_errors() {
         let clear = 1usize as *const c_void;
         let mut calls = Vec::new();
-        let (hr, ignored_clear) = retry_reserved_without_clear(
+        let (hr, effective_state, ignored_clear) = retry_without_clear(
             |state, value| { calls.push((state, value.is_null())); -1 },
             0xC0,
             clear,
         );
         assert_eq!(hr, -1);
         assert!(!ignored_clear);
-        assert_eq!(calls, [(0xC0, false)]);
+        assert_eq!((effective_state, calls), (0xC0, vec![(0xC0, false)]));
+    }
+
+    #[test]
+    fn null_clear_value_does_not_retry_the_same_resource_creation() {
+        let mut calls = Vec::new();
+        let (hr, effective_state, ignored_clear) = retry_without_clear(
+            |state, value| { calls.push((state, value.is_null())); E_INVALIDARG },
+            0xC0,
+            std::ptr::null(),
+        );
+        assert_eq!((hr, effective_state, ignored_clear, calls), (E_INVALIDARG, 0, false, vec![(0xC0, true), (0, true)]));
     }
 
     fn take(arena: &mut Arenas<u32>, va: usize, bytes: usize, align: usize, now: std::time::Instant) -> u64 {

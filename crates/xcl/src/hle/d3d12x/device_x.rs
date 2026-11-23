@@ -911,10 +911,14 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         }
     }
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-    let (hr, effective_state) = retry_resource_with_common(
-        |initial| real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, initial as usize, clear as usize, riid, ppv),
+    let (hr, effective_state, ignored_clear) = super::vram::retry_without_clear(
+        |initial, optimized_clear| real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, initial as usize, optimized_clear as usize, riid, ppv),
         state,
+        clear,
     );
+    if ignored_clear {
+        crate::xlog_info!("D3D12.X: resource at {va:#x} accepted without its optional clear-value optimization");
+    }
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(effective_state as i32)) {
