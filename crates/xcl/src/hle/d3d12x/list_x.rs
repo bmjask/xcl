@@ -1908,6 +1908,122 @@ fn pc_va(va: u64) -> u64 {
     real::uma_va_of(va as usize).unwrap_or(va)
 }
 
+/// GPU-visible mirrors for readable buffers outside the unified-memory windows.  The host GPU
+/// cannot dereference a title virtual address directly, while console lists may bind one.
+static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
+const MAX_MIRROR_BYTES: u64 = 2 << 30;
+
+fn mirrored(va: u64, bytes: usize) -> Option<usize> {
+    let end = va.checked_add(bytes as u64)?;
+    MIRRORS.lock().unwrap().iter().find(|&&(start, len, _)| va >= start && end <= start + len as u64).map(|&(start, _, mirror)| mirror + (va - start) as usize)
+}
+
+unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
+    if let Some(mirror) = mirrored(va, bytes) {
+        return Some(mirror);
+    }
+    let mut mirrors = MIRRORS.lock().unwrap();
+    let end = va.checked_add(bytes as u64)?;
+    if let Some(&(start, _, mirror)) = mirrors.iter().find(|&&(start, len, _)| va >= start && end <= start + len as u64) {
+        return Some(mirror + (va - start) as usize);
+    }
+    let start = va & !0xffff;
+    let rounded_end = end.checked_add(0xffff)? & !0xffff;
+    let len = rounded_end.checked_sub(start)? as usize;
+    let (start, len) = if crate::gpu::shader::readable(start as usize, len) { (start, len) } else { (va, bytes) };
+    if MIRROR_BYTES.load(Ordering::Relaxed).saturating_add(len as u64) > MAX_MIRROR_BYTES {
+        static FULL: AtomicBool = AtomicBool::new(false);
+        if !FULL.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("D3D12.X: buffer mirror budget exhausted; subsequent {what} bindings use a one-time copy");
+        }
+        return None;
+    }
+    let uma = crate::gpu::uma::get()?;
+    let mirror = match uma.has_sparse().then(|| super::sparse::alloc(len, 0x1_0000)).flatten() {
+        Some((p, _)) => p,
+        None => uma.alloc(len, 0x1_0000)? as usize,
+    };
+    std::ptr::copy_nonoverlapping(start as *const u8, mirror as *mut u8, len);
+    mirrors.push((start, len, mirror));
+    MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    Some(mirror + (va - start) as usize)
+}
+
+unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, persistent: bool) -> u64 {
+    let pc = pc_va(va);
+    if pc != va || va == 0 || bytes == 0 || crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+        return pc;
+    }
+    if persistent {
+        if let Some(mirror) = mirror_of(va, bytes, what) {
+            return pc_va(mirror as u64);
+        }
+    }
+    let copy = super::bind::allocate_upload_memory(list, bytes, 16);
+    if copy.is_null() {
+        return pc;
+    }
+    std::ptr::copy_nonoverlapping(va as *const u8, copy, bytes);
+    pc_va(copy as u64)
+}
+
+/// Refresh mirrored vertex/index ranges immediately before a draw.
+pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
+    if MIRROR_BYTES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let (vbs, ib) = {
+        let lists = LISTS.lock().unwrap();
+        let Some(bindings) = lists.as_ref().and_then(|lists| lists.get(&(list as usize))).map(|state| &state.bindings) else { return };
+        (bindings.vertex_titles.values().copied().collect::<Vec<_>>(), bindings.index_title)
+    };
+    let mut mirrors: Vec<Option<usize>> = vbs.iter().map(|&(va, bytes, _)| mirrored(va, bytes as usize)).collect();
+    mirrors.push(ib.and_then(|(va, bytes, _)| mirrored(va, bytes as usize)));
+    if mirrors.iter().all(Option::is_none) {
+        return;
+    }
+    let copy = |va: u64, mirror: usize, bytes: u32, from: u64, length: u64| {
+        let from = from.min(bytes as u64);
+        let length = length.min(bytes as u64 - from) as usize;
+        if length > 0 && crate::gpu::shader::readable(va as usize + from as usize, length) {
+            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, length);
+        }
+    };
+    let (lo, hi) = match (indexed, ib) {
+        (Some((first, count, base)), Some((va, bytes, format))) => {
+            let size = if format == DXGI_FORMAT_R32_UINT.0 { 4 } else { 2 };
+            let from = first as u64 * size;
+            let length = count as u64 * size;
+            if let Some(mirror) = mirrors[vbs.len()] { copy(va, mirror, bytes, from, length); }
+            let count = (length.min((bytes as u64).saturating_sub(from)) / size) as usize;
+            if count == 0 || !crate::gpu::shader::readable((va + from) as usize, count * size as usize) {
+                (0, u64::MAX)
+            } else {
+                let input = (va + from) as *const u8;
+                let (mut lo, mut hi) = (u32::MAX, 0u32);
+                for k in 0..count {
+                    let value = if size == 4 { input.add(4 * k).cast::<u32>().read_unaligned() } else { input.add(2 * k).cast::<u16>().read_unaligned() as u32 };
+                    lo = lo.min(value);
+                    hi = hi.max(value);
+                }
+                if lo > hi { return; }
+                ((lo as i64 + base as i64).max(0) as u64, (hi as i64 + base as i64 + 1).max(0) as u64)
+            }
+        }
+        (Some(_), None) => (0, u64::MAX),
+        (None, _) => (first_vertex as u64, first_vertex as u64 + vertices as u64),
+    };
+    for (k, &(va, bytes, stride)) in vbs.iter().enumerate() {
+        let Some(mirror) = mirrors[k] else { continue };
+        if instances > 1 || hi == u64::MAX || stride == 0 || hi.saturating_mul(stride as u64) > bytes as u64 {
+            copy(va, mirror, bytes, 0, bytes as u64);
+        } else {
+            copy(va, mirror, bytes, lo * stride as u64, (hi - lo) * stride as u64);
+        }
+    }
+}
+
 unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
@@ -1972,7 +2088,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
         .map(|k| {
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
-            v.BufferLocation = pc_va(v.BufferLocation);
+            v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer", true);
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let i = N.fetch_add(1, Ordering::Relaxed);
@@ -2018,9 +2134,11 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     }
     let mut v = view.read_unaligned();
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
-    v.BufferLocation = pc_va(v.BufferLocation);
-    s.index_buffer = Some(v);
     drop(g);
+    v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
+    if let Some(state) = LISTS.lock().unwrap().as_mut().and_then(|lists| lists.get_mut(&(this as usize))) {
+        state.index_buffer = Some(v);
+    }
     set_index_buffer(this, Some(&v));
 }
 
@@ -2040,7 +2158,8 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
         return;
     };
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
-    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
+    sync_title_buffers(this, None, 0, 0, 2);
+    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
     super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());
