@@ -47,6 +47,8 @@ const PC_RESOLVE_QUERY_DATA: usize = 54;
 const PC_SET_PREDICATION: usize = 55;
 const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
+const PC_RS_SET_SHADING_RATE: usize = 77;
+const PC_RS_SET_SHADING_RATE_IMAGE: usize = 78;
 const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 
 /// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
@@ -1543,6 +1545,17 @@ pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_voi
 pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: f32, max: f32) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_bounds = Some((min, max));
     pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS)(this, min, max);
+}
+
+/// Console #124 RSSetShadingRate(base rate, two combiners). The newer list layout places
+/// this at #126; `real::NEWER_LIST_SLOTS` routes that entry here too.
+pub(super) unsafe extern "system" fn rs_set_shading_rate_x(this: *mut c_void, rate: D3D12_SHADING_RATE, combiners: *const D3D12_SHADING_RATE_COMBINER) {
+    pc::<unsafe extern "system" fn(*mut c_void, D3D12_SHADING_RATE, *const D3D12_SHADING_RATE_COMBINER)>(this, PC_RS_SET_SHADING_RATE)(this, rate, combiners);
+}
+
+/// Console #125 RSSetShadingRateImage(image). The newer list layout places it at #127.
+pub(super) unsafe extern "system" fn rs_set_shading_rate_image_x(this: *mut c_void, image: *mut c_void) {
+    pc::<unsafe extern "system" fn(*mut c_void, *mut c_void)>(this, PC_RS_SET_SHADING_RATE_IMAGE)(this, image);
 }
 
 /// command list #78 DispatchX(x, y, z, flags)

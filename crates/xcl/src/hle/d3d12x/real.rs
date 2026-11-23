@@ -863,6 +863,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                (124, l::rs_set_shading_rate_x as usize),
+                (125, l::rs_set_shading_rate_image_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -4334,9 +4336,12 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 21] = [
+const NEWER_LIST_SLOTS: [(usize, usize); 23] = [
     (61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72),
-    (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10),
+    (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94),
+    // The newer runtime keeps the shading-rate pair two slots later too. Its #126 call
+    // has the RSSetShadingRate ABI (rate enum plus the two-combiner structure).
+    (126, 124), (127, 125), (139, 10),
 ];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
@@ -5017,7 +5022,7 @@ mod queue_tests {
 
     #[test]
     fn newer_layout_routes_shifted_submission_and_memory_slots() {
-        for pair in [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (74, 72), (96, 94), (139, 10)] {
+        for pair in [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (74, 72), (96, 94), (126, 124), (127, 125), (139, 10)] {
             assert!(NEWER_LIST_SLOTS.contains(&pair), "missing newer-layout mapping {pair:?}");
         }
         assert_eq!(QUEUE_SLOTS.len(), 22);
