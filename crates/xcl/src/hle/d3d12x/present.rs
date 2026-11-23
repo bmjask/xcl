@@ -702,11 +702,15 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
 }
 
-/// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder
+/// `XCL_FRAME_DUMP=1`: the first two shown frames and every 120th later frame are written to the logs folder
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XCL_FRAME_DUMP").is_some()) && PRESENTS.load(Ordering::Relaxed) % 120 == 20
+    *ON.get_or_init(|| std::env::var_os("XCL_FRAME_DUMP").is_some()) && frame_dump_index(PRESENTS.load(Ordering::Relaxed))
+}
+
+fn frame_dump_index(presents: u64) -> bool {
+    presents < 2 || presents % 120 == 20
 }
 
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
@@ -882,5 +886,20 @@ impl Drop for Presenter {
         unsafe {
             let _ = CloseHandle(self.event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_dump_schedule_captures_startup_and_periodic_frames() {
+        assert!(frame_dump_index(0));
+        assert!(frame_dump_index(1));
+        assert!(!frame_dump_index(2));
+        assert!(frame_dump_index(20));
+        assert!(frame_dump_index(140));
+        assert!(!frame_dump_index(141));
     }
 }
