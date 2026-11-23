@@ -4491,6 +4491,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::readback_sparse_writes(this, chunk);
+        let writes = super::list_x::take_host_writes(chunk);
+        super::list_x::complete_host_writes(this, writes);
     });
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();

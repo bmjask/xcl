@@ -171,6 +171,23 @@ struct PendingWait {
     mask: u64,
 }
 
+/// A completion value addressed in ordinary title memory rather than a D3D12 resource.
+///
+/// Console command streams can use the unified CPU address space for completion mailboxes.
+/// PC `WriteBufferImmediate` cannot address those allocations, so keep the operation attached
+/// to its list and perform it only after that list's queue submission has completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct HostWrite {
+    address: usize,
+    kind: HostWriteKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostWriteKind {
+    Words(Vec<u32>),
+    Timestamp,
+}
+
 fn compare_u64(op: u32, lhs: u64, rhs: u64) -> Option<bool> {
     match op {
         1 => Some(false),        // D3D12_COMPARISON_FUNC_NEVER
@@ -556,6 +573,9 @@ struct ListState {
     sparse_writes: Vec<(usize, usize)>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
+    /// Completion words for ordinary writable title memory.  These cannot be emitted through
+    /// `WriteBufferImmediate`, which only accepts a GPU virtual address in a D3D12 resource.
+    pending_host_writes: Vec<HostWrite>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
     /// Native command lists may only be submitted after a successful Close.
@@ -607,6 +627,14 @@ impl ListState {
             PENDING_WAIT_LISTS.fetch_add(1, Ordering::AcqRel);
         }
         self.pending_waits.push(w);
+    }
+
+    fn push_host_write(&mut self, address: usize, words: &[u32]) {
+        self.pending_host_writes.push(HostWrite { address, kind: HostWriteKind::Words(words.to_vec()) });
+    }
+
+    fn push_host_timestamp(&mut self, address: usize) {
+        self.pending_host_writes.push(HostWrite { address, kind: HostWriteKind::Timestamp });
     }
 }
 
@@ -1015,6 +1043,108 @@ fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
+pub(super) fn take_host_writes(lists: &[*mut c_void]) -> Vec<HostWrite> {
+    let mut g = LISTS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return Vec::new() };
+    let mut writes = Vec::new();
+    for &list in lists {
+        if let Some(state) = m.get_mut(&(list as usize)) {
+            writes.append(&mut state.pending_host_writes);
+        }
+    }
+    writes
+}
+
+/// Is the entire range committed, writable, and not guarded?  This is deliberately separate
+/// from `shader::readable`: completion writes must never turn a bad guest pointer into a host
+/// access violation.
+fn writable_host_memory(address: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+
+    if address == 0 || len == 0 || len > 256 << 20 {
+        return false;
+    }
+    let Some(end) = address.checked_add(len) else { return false };
+    let mut at = address;
+    while at < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const c_void, &mut info, std::mem::size_of_val(&info)) } == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+            || !matches!(info.Protect & 0xff, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+        {
+            return false;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else { return false };
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    true
+}
+
+/// Commit system-memory completion words after a queue reaches the point following its prior
+/// submission.  Waiting here is intentionally conservative: committing at record time would
+/// advertise unfinished GPU work to the title.
+pub(super) unsafe fn complete_host_writes(queue: *mut c_void, writes: Vec<HostWrite>) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if writes.is_empty() || queue.is_null() {
+        return;
+    }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let mut device: Option<ID3D12Device> = None;
+    if q.GetDevice(&mut device).is_err() {
+        return warn(&N, "host completion write", format_args!("could not find queue device"));
+    }
+    let Some(device) = device else { return };
+    let fence = match device.CreateFence(0, D3D12_FENCE_FLAG_NONE) {
+        Ok(fence) => fence,
+        Err(e) => return warn(&N, "host completion write", format_args!("CreateFence: {e}")),
+    };
+    if let Err(e) = q.Signal(&fence, 1) {
+        return warn(&N, "host completion write", format_args!("Signal: {e}"));
+    }
+    if let Err(e) = crate::gpu::fence::wait(&fence, 1, &device, None, WAIT_TIMEOUT.as_millis() as u32) {
+        return warn(&N, "host completion write", format_args!("queue completion: {e}"));
+    }
+    let mut gpu_timestamp = 0u64;
+    let mut cpu_timestamp = 0u64;
+    let timestamp = q.GetClockCalibration(&mut gpu_timestamp, &mut cpu_timestamp).ok().map(|_| gpu_timestamp);
+    commit_host_writes(writes, timestamp);
+}
+
+unsafe fn commit_host_writes(writes: Vec<HostWrite>, timestamp: Option<u64>) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    for write in writes {
+        let (words, bytes) = match write.kind {
+            HostWriteKind::Words(words) => {
+                let Some(bytes) = words.len().checked_mul(std::mem::size_of::<u32>()) else { continue };
+                (words, bytes)
+            }
+            HostWriteKind::Timestamp => match timestamp {
+                Some(value) => (vec![value as u32, (value >> 32) as u32], std::mem::size_of::<u64>()),
+                None => {
+                    warn(&N, "host completion write", format_args!("no queue timestamp calibration"));
+                    continue;
+                }
+            },
+        };
+        if !writable_host_memory(write.address, bytes) {
+            warn(&N, "host completion write", format_args!("{:#x} is no longer writable", write.address));
+            continue;
+        }
+        for (i, value) in words.iter().copied().enumerate() {
+            // `write` validates four-byte alignment.  Release pairs with a title's Acquire
+            // polling load and preserves the order of a 64-bit completion's two dwords.
+            (write.address as *const AtomicU32).add(i).as_ref().unwrap().store(value, Ordering::Release);
+        }
+    }
+}
+
 unsafe fn wait_all(waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     for w in waits {
@@ -1223,7 +1353,14 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not 4-byte aligned"));
     }
     let Some(target) = buffer_target(va, n) else {
-        return warn(&N, what, format_args!("{va:#x} is not in a known buffer"));
+        if !writable_host_memory(va as usize, n as usize) {
+            return warn(&N, what, format_args!("{va:#x} is not in a known buffer or writable host memory"));
+        }
+        let mut g = LISTS.lock().unwrap();
+        let state = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+        state.note_write(va, n);
+        state.push_host_write(va as usize, words);
+        return;
     };
     note_write(list as usize, va, n);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: target.pc_va + 4 * i as u64, Value: w }).collect();
@@ -1279,6 +1416,13 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned"));
     }
     let Some(target) = buffer_target(va, 8) else {
+        if writable_host_memory(va as usize, 8) {
+            let mut g = LISTS.lock().unwrap();
+            let state = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+            state.note_write(va, 8);
+            state.push_host_timestamp(va as usize);
+            return;
+        }
         return warn(&N, what, format_args!("{va:#x} is not in a known buffer"));
     };
     let Some(dev) = device_of(list) else { return };
@@ -1329,10 +1473,17 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if !va.is_multiple_of(n) {
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
-    let Some(target) = buffer_target(va, n) else { return warn(&N, what, format_args!("{va:#x} is not in a known buffer")) };
-    if target.cpu == 0 {
-        return warn(&N, what, format_args!("{va:#x} has no CPU-visible mapping"));
-    }
+    let target = buffer_target(va, n);
+    let (cpu, native_resource, native_offset) = match target {
+        Some(target) if target.cpu != 0 => (
+            if target.native { 0 } else { target.cpu },
+            if target.native { target.resource } else { 0 },
+            target.offset,
+        ),
+        Some(_) => return warn(&N, what, format_args!("{va:#x} has no CPU-visible mapping")),
+        None if crate::gpu::shader::readable(va as usize, n as usize) => (va as usize, 0, 0),
+        None => return warn(&N, what, format_args!("{va:#x} is not in known or readable host memory")),
+    };
     if compare_u64(comparison, 0, 0).is_none() {
         return warn(&N, what, format_args!("unknown comparison op {comparison}"));
     }
@@ -1349,9 +1500,9 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     }
     s.push_wait(PendingWait {
         va,
-        cpu: if target.native { 0 } else { target.cpu },
-        native_resource: if target.native { target.resource } else { 0 },
-        native_offset: target.offset,
+        cpu,
+        native_resource,
+        native_offset,
         width,
         comparison,
         value,
@@ -1452,7 +1603,7 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return;
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, active_query, waits, sparse_writes) = {
+    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, active_query, waits, sparse_writes, host_writes) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
@@ -1480,8 +1631,9 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             std::mem::take(&mut s.pending_waits)
         };
         let sparse_writes = s.clear_sparse_writes();
+        let host_writes = std::mem::take(&mut s.pending_host_writes);
         s.written_ranges.clear();
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, sparse_writes)
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, sparse_writes, host_writes)
     };
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
@@ -1511,6 +1663,7 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             super::sparse::readback_after_execute(q, &sparse_writes);
         }
     }
+    complete_host_writes(q_raw, host_writes);
 
     let ext_closed = *(this as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
@@ -1904,6 +2057,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.written_ranges.clear();
         s.clear_sparse_writes();
         s.clear_waits();
+        s.pending_host_writes.clear();
         s.bindings = Bindings::default();
         s.submit_state = SubmitState::Open;
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
@@ -2526,6 +2680,36 @@ mod tests {
         assert!(valid_regular_write(0x1008, 2));
         assert!(!valid_regular_write(0x1002, 2));
         assert!(!valid_regular_write(0x1004, 0));
+    }
+
+    #[test]
+    fn host_completion_writes_are_committed_in_dword_order() {
+        let words = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+        let address = words.as_ptr() as usize;
+        assert!(writable_host_memory(address, std::mem::size_of_val(&words)));
+        unsafe {
+            commit_host_writes(vec![HostWrite { address, kind: HostWriteKind::Words(vec![0x1122_3344, 0x5566_7788]) }], None);
+        }
+        assert_eq!(words[0].load(Ordering::Acquire), 0x1122_3344);
+        assert_eq!(words[1].load(Ordering::Acquire), 0x5566_7788);
+        assert_eq!(words[2].load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn host_completion_write_rejects_invalid_ranges() {
+        assert!(!writable_host_memory(0, 4));
+        assert!(!writable_host_memory(usize::MAX - 1, 4));
+    }
+
+    #[test]
+    fn host_timestamp_uses_queue_calibration_value() {
+        let words = [AtomicU32::new(0), AtomicU32::new(0)];
+        let address = words.as_ptr() as usize;
+        unsafe {
+            commit_host_writes(vec![HostWrite { address, kind: HostWriteKind::Timestamp }], Some(0x5566_7788_1122_3344));
+        }
+        assert_eq!(words[0].load(Ordering::Acquire), 0x1122_3344);
+        assert_eq!(words[1].load(Ordering::Acquire), 0x5566_7788);
     }
 
     #[test]
