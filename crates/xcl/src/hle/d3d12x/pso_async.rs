@@ -191,8 +191,74 @@ impl Drop for ComRef {
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
-static BUILT: AtomicUsize = AtomicUsize::new(0);
-static FAILED: AtomicUsize = AtomicUsize::new(0);
+
+/// Background pipeline work, kept separate from DXC's shader-cache/compiler counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PipelineStats {
+    pub workers: usize,
+    pub queued: usize,
+    pub building: usize,
+    pub completed: usize,
+    pub failed: usize,
+    #[serde(default)]
+    pub rejected: usize,
+}
+
+struct StageCounters {
+    queued: AtomicUsize,
+    building: AtomicUsize,
+    completed: AtomicUsize,
+    failed: AtomicUsize,
+    rejected: AtomicUsize,
+}
+
+impl StageCounters {
+    const fn new() -> Self {
+        Self {
+            queued: AtomicUsize::new(0),
+            building: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            rejected: AtomicUsize::new(0),
+        }
+    }
+
+    fn submit(&self) {
+        self.queued.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn start(&self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        self.building.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish(&self, success: bool) {
+        self.building.fetch_sub(1, Ordering::AcqRel);
+        if success {
+            self.completed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn reject(&self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get(&self, workers: usize) -> PipelineStats {
+        PipelineStats {
+            workers,
+            queued: self.queued.load(Ordering::Acquire),
+            building: self.building.load(Ordering::Acquire),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static STAGES: StageCounters = StageCounters::new();
 
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
@@ -201,24 +267,41 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<(Arc<Pending>, Job)>>> = OnceLock::new();
+fn configured_workers(value: Option<&str>, default: usize) -> usize {
+    value.and_then(|v| v.parse::<usize>().ok()).unwrap_or(default).clamp(1, 64)
+}
+
+/// PSO translation/creation workers. By default this stays exactly in step with the DXC pool;
+/// `XCL_PSO_THREADS` permits independent tuning when driver pipeline creation is the bottleneck.
+pub fn worker_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let default = crate::gpu::recomp::dxc::compile_threads();
+        configured_workers(std::env::var("XCL_PSO_THREADS").ok().as_deref(), default)
+    })
+}
+
+struct PsoQueue {
+    tx: Mutex<mpsc::Sender<(Arc<Pending>, Job)>>,
+    /// Threads whose OS spawn actually succeeded, rather than the configured target.
+    workers: usize,
+}
+
+fn queue() -> &'static PsoQueue {
+    static Q: OnceLock<PsoQueue> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<(Arc<Pending>, Job)>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = worker_threads();
+        let mut workers = 0;
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+            if std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok((p, job)) = next else { return };
+                STAGES.start();
                 let real = job();
-                if real == 0 {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    BUILT.fetch_add(1, Ordering::Relaxed);
-                }
                 let orphan = {
                     let mut done = p.done.lock().unwrap();
                     let orphan = p.orphan.load(Ordering::Acquire);
@@ -233,9 +316,15 @@ fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
                 if orphan {
                     release(real);
                 }
-            });
+                // Publish completion only after the Pending state and any orphan cleanup.
+                STAGES.finish(real != 0);
+            }).is_ok() {
+                workers += 1;
+            }
         }
-        Mutex::new(tx)
+        // If every spawn failed, this function drops the final receiver. The first send then
+        // rejects synchronously and marks its Pending done instead of waiting forever.
+        PsoQueue { tx: Mutex::new(tx), workers }
     })
 }
 
@@ -254,9 +343,10 @@ fn submit_inner(standin: usize, compute: bool, deferred: bool, job: Job) {
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
-    if let Err(e) = queue().lock().unwrap().send((p, job)) {
+    STAGES.submit();
+    if let Err(e) = queue().tx.lock().unwrap().send((p, job)) {
         let (p, _job) = e.0;
-        FAILED.fetch_add(1, Ordering::Relaxed);
+        STAGES.reject();
         let mut done = p.done.lock().unwrap();
         *done = true;
         p.cv.notify_all();
@@ -346,8 +436,14 @@ pub fn is_deferred(pso: usize) -> bool {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
-    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+    let s = stats();
+    // Preserve the legacy tuple: queue rejection used to be included in `failed`.
+    (s.completed, s.failed + s.rejected, s.queued + s.building)
+}
+
+pub fn stats() -> PipelineStats {
+    let q = queue();
+    STAGES.get(q.workers)
 }
 
 #[cfg(test)]
@@ -379,6 +475,56 @@ mod tests {
         static VTABLE: OnceLock<usize> = OnceLock::new();
         let vtbl = *VTABLE.get_or_init(|| Box::leak(Box::new([fake_query as usize, fake_add_ref as usize, fake_release as usize])).as_ptr() as usize);
         Box::into_raw(Box::new(FakePso { vtbl: vtbl as *const usize })) as usize
+    }
+
+    #[test]
+    fn pso_worker_configuration_defaults_parses_and_bounds() {
+        assert_eq!(configured_workers(None, 23), 23);
+        assert_eq!(configured_workers(Some(""), 23), 23);
+        assert_eq!(configured_workers(Some("no"), 23), 23);
+        assert_eq!(configured_workers(Some("0"), 23), 1);
+        assert_eq!(configured_workers(Some("1"), 23), 1);
+        assert_eq!(configured_workers(Some("17"), 23), 17);
+        assert_eq!(configured_workers(Some("65"), 23), 64);
+    }
+
+    #[test]
+    fn pipeline_stage_counters_follow_queue_build_and_result_transitions() {
+        let c = StageCounters::new();
+        assert_eq!(c.get(7), PipelineStats { workers: 7, ..Default::default() });
+        c.submit();
+        assert_eq!(c.get(7), PipelineStats { workers: 7, queued: 1, ..Default::default() });
+        c.start();
+        assert_eq!(c.get(7), PipelineStats { workers: 7, building: 1, ..Default::default() });
+        c.finish(true);
+        assert_eq!(c.get(7), PipelineStats { workers: 7, completed: 1, ..Default::default() });
+        c.submit();
+        c.start();
+        c.finish(false);
+        assert_eq!(c.get(7), PipelineStats { workers: 7, completed: 1, failed: 1, ..Default::default() });
+        c.submit();
+        c.reject();
+        assert_eq!(c.get(7), PipelineStats { workers: 7, completed: 1, failed: 1, rejected: 1, ..Default::default() });
+    }
+
+    #[test]
+    fn disconnected_zero_worker_queue_rejects_without_leaving_pending_work() {
+        let counters = StageCounters::new();
+        let (tx, rx) = mpsc::channel::<usize>();
+        drop(rx);
+        counters.submit();
+        assert!(tx.send(1).is_err());
+        counters.reject();
+        assert_eq!(counters.get(0), PipelineStats { rejected: 1, ..Default::default() });
+    }
+
+    #[test]
+    fn pipeline_stats_from_before_rejection_telemetry_still_deserialize() {
+        let stats: PipelineStats = serde_json::from_str(
+            r#"{"workers":3,"queued":2,"building":1,"completed":9,"failed":4}"#,
+        )
+        .unwrap();
+        assert_eq!(stats, PipelineStats { workers: 3, queued: 2, building: 1, completed: 9, failed: 4, rejected: 0 });
     }
 
     #[test]

@@ -121,6 +121,9 @@ pub struct D3d12Stats {
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
+    /// Background PSO stage telemetry, separate from DXC cache/compiler activity.
+    #[serde(default)]
+    pub pipeline_stages: super::pso_async::PipelineStats,
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
@@ -302,6 +305,7 @@ pub fn stats() -> D3d12Stats {
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
+        pipeline_stages: super::pso_async::stats(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
 }
@@ -4262,11 +4266,13 @@ mod cache_report_tests {
     fn reports_without_dxil_cache_statistics_still_deserialize() {
         let mut old = serde_json::to_value(D3d12Stats::default()).unwrap();
         old.as_object_mut().unwrap().remove("dxil_cache");
+        old.as_object_mut().unwrap().remove("pipeline_stages");
         let decoded: D3d12Stats = serde_json::from_value(old).unwrap();
         assert_eq!(
             decoded.dxil_cache,
             crate::gpu::recomp::dxc::CacheStats::default()
         );
+        assert_eq!(decoded.pipeline_stages, super::super::pso_async::PipelineStats::default());
     }
 }
 
