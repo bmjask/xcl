@@ -1,10 +1,10 @@
 //! Shader capture and classification.
 //!
 //! Every shader blob a title hands to D3D12.X (pipeline state creation, root
-//! signatures) is classified and – once per unique hash – written to
-//! `<data>\shaders\`. Unknown formats are scanned for RDNA2 programs and a
-//! disassembly is written next to the blob. This is how we learn, per title, whether
-//! shaders still carry DXIL/DXBC or only console GPU microcode.
+//! signatures) is classified once per unique hash. Writing the blob, the RDNA2
+//! disassembly and a second translation to `<data>\shaders\` is `XCL_SHADER_DUMP=1`:
+//! that work repeats the pipeline's own translation and is what a cold load spends
+//! its time on.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -201,6 +201,14 @@ fn dump_dir() -> PathBuf {
     crate::state::data_dir().join("shaders")
 }
 
+/// Disk dumps and the extra translation that produces them. Off unless asked: the
+/// pipeline path already translates each shader, and doing it again here serialises
+/// the load on the title's thread.
+fn dump_shaders() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SHADER_DUMP").is_ok_and(|v| v == "1"))
+}
+
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
 pub fn readable(p: usize, len: usize) -> bool {
@@ -225,9 +233,11 @@ pub fn readable(p: usize, len: usize) -> bool {
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
+/// Without `XCL_SHADER_DUMP=1` this returns immediately: copying, hashing and
+/// translating every shader here runs on the title thread, ahead of the real pipeline.
 pub fn capture(stage: &str, ptr: usize, len: usize) {
-    if ptr == 0 && len == 0 {
-        return; // unused stage
+    if !dump_shaders() || (ptr == 0 && len == 0) {
+        return;
     }
     let mut g = STATE.lock().unwrap();
     let st = g.get_or_insert_with(|| State { seen: HashSet::new(), stats: ShaderStats::default(), insts: xbox::InstStats::default() });

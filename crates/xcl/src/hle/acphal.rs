@@ -717,8 +717,65 @@ pub unsafe extern "system" fn XApuGetUtilization(_a: u32, _b: u32, u: *mut u32) 
     S_OK
 }
 
+// ---------------------------------------------------------------------------------------
+// the DSP (chad.dll): connected, with nothing to run
+// ---------------------------------------------------------------------------------------
+
+/// a DSP connection (what the handle points at)
+struct XDsp {
+    streams: u32,
+}
+
+/// XDspConnectWithMaximumStreamLimit(a, b, c, max streams, flags, &handle)
+pub unsafe extern "system" fn XDspConnectWithMaximumStreamLimit(_a: usize, _b: u32, _c: u32, streams: u32, _flags: u32, handle: *mut *mut c_void) -> HRESULT {
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    *handle = Box::into_raw(Box::new(XDsp { streams })) as *mut c_void;
+    crate::xlog_info!("acphal: DSP connected ({streams} streams) – its commands are taken, nothing runs");
+    S_OK
+}
+
+pub unsafe extern "system" fn XDspDisconnect(handle: *mut c_void) -> HRESULT {
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    drop(Box::from_raw(handle as *mut XDsp));
+    S_OK
+}
+
+pub unsafe extern "system" fn XDspActivate(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+    if handle.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
+}
+
+pub unsafe extern "system" fn XDspDeactivate(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+    if handle.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
+}
+
+pub unsafe extern "system" fn XDspSubmitCommand(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    FIRST.call_once(|| crate::xlog_info!("acphal: first DSP command ({} streams) – taken, not run", (*(handle as *const XDsp)).streams));
+    S_OK
+}
+
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![
+        XDspConnectWithMaximumStreamLimit,
+        XDspDisconnect,
+        XDspActivate,
+        XDspDeactivate,
+        XDspSubmitCommand,
         ApuCreateHeap,
         ApuAlloc,
         ApuFree,
@@ -741,6 +798,20 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dsp_connects_and_takes_commands() {
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XDspConnectWithMaximumStreamLimit(0, 0, 0, 0x80, 1, &mut h), S_OK);
+            assert!(!h.is_null());
+            assert_eq!(XDspActivate(h, 0, 0, 0), S_OK);
+            assert_eq!(XDspSubmitCommand(h, 1, 2, 3), S_OK);
+            assert_eq!(XDspDeactivate(h, 0, 0, 0), S_OK);
+            assert_eq!(XDspDisconnect(h), S_OK);
+            assert_eq!(XDspSubmitCommand(std::ptr::null_mut(), 0, 0, 0), E_INVALIDARG);
+        }
+    }
 
     #[test]
     fn apu_memory_maps_both_ways() {

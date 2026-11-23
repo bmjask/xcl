@@ -645,6 +645,58 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
     real::dev_create_sampler_x(this, &d, dest);
 }
 
+/// Xbox colour formats a PC driver rejects.
+pub fn pc_color_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10, // R10G10B10_*E*_A2_FLOAT → R16G16B16A16_FLOAT
+        other => other,
+    }
+}
+
+/// Xbox depth formats. 118 is `D16_UNORM_S8_UINT`; the PC depth format with stencil is D24.
+pub fn pc_dsv_format(format: u32) -> u32 {
+    match format {
+        118 | 119 => 45, // D16_UNORM_S8_UINT / its depth read → D24_UNORM_S8_UINT
+        other => other,
+    }
+}
+
+/// A resource's format. The typeless parent of D16+S8 becomes the typeless parent of D24+S8,
+/// so a depth view of 118 still matches.
+pub fn pc_resource_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10,
+        118 => 45,
+        119 | 120 => 44, // R16_UNORM_X8 / X16_G8 → R24G8_TYPELESS
+        other => other,
+    }
+}
+
+/// A shader view of that depth family (depth plane, or the stencil plane).
+pub fn pc_srv_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10,
+        118 | 119 => 46, // R24_UNORM_X8_TYPELESS
+        120 => 47,       // X24_TYPELESS_G8_UINT
+        other => other,
+    }
+}
+
+/// A clear value in the same depth family (typed, which is what a typeless resource's clear uses).
+pub unsafe fn pc_clear_value(clear: *const c_void, storage: &mut [u8; 20]) -> *const c_void {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 20) {
+        return clear;
+    }
+    let format = (clear as *const u32).read_unaligned();
+    let mapped = if matches!(format, 118 | 119 | 120) { 45 } else { pc_color_format(format) };
+    if mapped == format {
+        return clear;
+    }
+    std::ptr::copy_nonoverlapping(clear as *const u8, storage.as_mut_ptr(), 20);
+    storage[..4].copy_from_slice(&mapped.to_le_bytes());
+    storage.as_ptr() as *const c_void
+}
+
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
@@ -661,6 +713,8 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
         flags &= !conflicts;
     }
     d[8..16].fill(0); // alignment: the driver's
+    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    d[0x20..0x24].copy_from_slice(&pc_resource_format(format).to_le_bytes());
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
     d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
@@ -789,6 +843,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
+    let mut clear_buf = [0u8; 20];
+    let clear = pc_clear_value(clear, &mut clear_buf);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
@@ -943,6 +999,11 @@ mod tests {
         assert_eq!((d[8], u32::from_le_bytes(d[0x2C..0x30].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap())), (0, 1, 0x34));
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
+        x[0x20..0x24].copy_from_slice(&118u32.to_le_bytes());
+        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 45);
+        x[0x20..0x24].copy_from_slice(&119u32.to_le_bytes());
+        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 44);
+        assert_eq!((pc_dsv_format(118), pc_srv_format(119), pc_srv_format(120)), (45, 46, 47));
     }
 
     #[test]

@@ -416,7 +416,28 @@ const PC_OM_SET_STENCIL_REF: usize = 24;
 const PC_OM_SET_RENDER_TARGETS: usize = 46;
 
 /// console #20 IASetPrimitiveTopology (PC #20)
+/// The console's rect list (AMD's DI_PT_RECTLIST, 0x11): three vertices of a rectangle, the
+/// fourth implied. The PC has no such topology; until a geometry shader expands them, each rect
+/// is drawn as the triangle of its three vertices (for example, full-screen passes).
+pub(super) const RECT_LIST: u32 = 17;
+
 pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32) {
+    // a topology the PC does not have (console ones): logged once each
+    if !matches!(t, 0..=5 | 10..=13 | 33..=64) {
+        static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let new = {
+            let mut g = SEEN.lock().unwrap();
+            let n = !g.contains(&t);
+            if n {
+                g.push(t);
+            }
+            n
+        };
+        if new {
+            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
+        }
+    }
+    let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
     with_bindings(this, |b| b.topology = Some(t));
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY)(this, t)
 }
