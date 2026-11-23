@@ -28,6 +28,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use crate::util::HRESULT;
 use super::device_x::{self, DepthBias};
 use super::real;
 
@@ -498,6 +499,14 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SubmitState {
+    #[default]
+    Open,
+    Closed,
+    CloseFailed(HRESULT),
+}
+
 #[derive(Default)]
 struct ListState {
     allocator: usize,
@@ -528,6 +537,8 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
+    /// Native command lists may only be submitted after a successful Close.
+    submit_state: SubmitState,
 }
 
 impl ListState {
@@ -591,6 +602,7 @@ static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
 static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
+static UNSAFE_SUBMIT_WARNINGS: AtomicUsize = AtomicUsize::new(0);
 /// Set once any list uses `RSSetDepthBiasX` (fast-path guard for Draw* hooks).
 static DEPTH_BIAS_USED: AtomicBool = AtomicBool::new(false);
 
@@ -796,6 +808,43 @@ pub(super) fn on_release(list: usize) {
             SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
     }
+}
+
+/// Record the native result of closing a command list. A failed Close leaves the native list
+/// unusable until it is successfully reset and closed again.
+pub(super) fn on_close(list: usize, hr: HRESULT) {
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+        s.submit_state = if hr >= 0 { SubmitState::Closed } else { SubmitState::CloseFailed(hr) };
+    }
+}
+
+/// A successful Reset opens the list, so it is not submit-safe until Close succeeds.
+pub(super) fn on_reset(list: usize) {
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+        s.submit_state = SubmitState::Open;
+    }
+}
+
+/// Keep unknown native lists compatible, but never send a tracked open or failed-close list to
+/// the driver. Submitting either is an invalid D3D12 call and can remove the device.
+pub(super) fn submit_safe_lists(lists: &[*mut c_void]) -> Vec<*mut c_void> {
+    let g = LISTS.lock().unwrap();
+    let Some(states) = g.as_ref() else { return lists.to_vec() };
+    lists.iter().copied().filter(|&list| {
+        let Some(state) = states.get(&(list as usize)).map(|s| s.submit_state) else { return true };
+        if state == SubmitState::Closed {
+            return true;
+        }
+        let n = UNSAFE_SUBMIT_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            match state {
+                SubmitState::Open => crate::xlog_warn!("D3D12.X: skipping an open command list at submission ({n} skipped)"),
+                SubmitState::CloseFailed(hr) => crate::xlog_warn!("D3D12.X: skipping a command list whose Close failed with {:#x} ({n} skipped)", hr as u32),
+                SubmitState::Closed => unreachable!(),
+            }
+        }
+        false
+    }).collect()
 }
 
 #[cfg(test)]
@@ -1835,6 +1884,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.clear_sparse_writes();
         s.clear_waits();
         s.bindings = Bindings::default();
+        s.submit_state = SubmitState::Open;
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::bind::reset(this, alloc, pso);
@@ -1951,6 +2001,7 @@ pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
     real::preserve_vtable(this, ext);
+    on_close(this as usize, hr);
     if hr < 0 {
         let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
         crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);
@@ -2260,14 +2311,121 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::{E_FAIL, S_OK};
     use std::sync::Arc;
 
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
     static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
+    static CLOSE_TEST_HR: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "system" fn reset_test_native(this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
         *(this as *mut usize) = RESET_TEST_REPLACEMENT_VT.load(Ordering::SeqCst) as usize;
         RESET_TEST_HR.load(Ordering::SeqCst) as i32
+    }
+
+    unsafe extern "system" fn close_test_native(_this: *mut c_void) -> i32 {
+        CLOSE_TEST_HR.load(Ordering::SeqCst) as i32
+    }
+
+    unsafe extern "system" fn get_type_test_native(_this: *mut c_void) -> i32 {
+        D3D12_COMMAND_LIST_TYPE_DIRECT.0
+    }
+
+    fn tracked_test_list(key: usize) -> *mut c_void {
+        let list = key as *mut c_void;
+        unsafe { on_create(list, 0, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        list
+    }
+
+    #[test]
+    fn failed_close_is_excluded_but_unknown_lists_remain_compatible() {
+        let list = tracked_test_list(0x7100_0001);
+        let unknown = 0x7100_1001usize as *mut c_void;
+        on_close(list as usize, E_FAIL);
+        assert_eq!(submit_safe_lists(&[list, unknown]), vec![unknown]);
+        on_release(list as usize);
+    }
+
+    #[test]
+    fn mixed_submit_preserves_the_order_of_valid_lists() {
+        let first = tracked_test_list(0x7100_0002);
+        let bad = tracked_test_list(0x7100_0003);
+        let last = tracked_test_list(0x7100_0004);
+        on_close(first as usize, S_OK);
+        on_close(bad as usize, E_FAIL);
+        on_close(last as usize, S_OK);
+        assert_eq!(submit_safe_lists(&[first, bad, last]), vec![first, last]);
+        for list in [first, bad, last] { on_release(list as usize); }
+    }
+
+    #[test]
+    fn all_invalid_lists_result_in_no_native_execute() {
+        let first = tracked_test_list(0x7100_0005);
+        let second = tracked_test_list(0x7100_0006);
+        on_close(first as usize, E_FAIL);
+        let mut executes = 0;
+        let safe = submit_safe_lists(&[first, second]);
+        if !safe.is_empty() { executes += 1; }
+        assert!(safe.is_empty());
+        assert_eq!(executes, 0);
+        on_release(first as usize);
+        on_release(second as usize);
+    }
+
+    #[test]
+    fn successful_close_enables_submission() {
+        let list = tracked_test_list(0x7100_0007);
+        assert!(submit_safe_lists(&[list]).is_empty());
+        on_close(list as usize, S_OK);
+        assert_eq!(submit_safe_lists(&[list]), vec![list]);
+        on_release(list as usize);
+    }
+
+    #[test]
+    fn reset_disables_submission_until_the_next_successful_close() {
+        let list = tracked_test_list(0x7100_0008);
+        on_close(list as usize, S_OK);
+        assert_eq!(submit_safe_lists(&[list]), vec![list]);
+        on_reset(list as usize);
+        assert!(submit_safe_lists(&[list]).is_empty());
+        on_close(list as usize, S_OK);
+        assert_eq!(submit_safe_lists(&[list]), vec![list]);
+        on_release(list as usize);
+    }
+
+    #[test]
+    fn release_clears_submit_state_for_pointer_reuse() {
+        let list = tracked_test_list(0x7100_0009);
+        on_close(list as usize, E_FAIL);
+        assert!(submit_safe_lists(&[list]).is_empty());
+        on_release(list as usize);
+        assert_eq!(submit_safe_lists(&[list]), vec![list]);
+        let reused = tracked_test_list(list as usize);
+        assert!(submit_safe_lists(&[reused]).is_empty());
+        on_close(reused as usize, S_OK);
+        assert_eq!(submit_safe_lists(&[reused]), vec![reused]);
+        on_release(reused as usize);
+    }
+
+    #[test]
+    fn dma_close_entrypoint_tracks_native_success_and_failure() {
+        let mut native = vec![0usize; PC_CLOSE + 1];
+        native[PC_GET_TYPE] = get_type_test_native as usize;
+        native[PC_CLOSE] = close_test_native as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        unsafe { on_create(list, 0, 0, D3D12_COMMAND_LIST_TYPE_COPY) };
+
+        CLOSE_TEST_HR.store(E_FAIL as u32, Ordering::SeqCst);
+        assert_eq!(unsafe { dma_close_x(list) }, E_FAIL);
+        assert!(submit_safe_lists(&[list]).is_empty());
+
+        CLOSE_TEST_HR.store(S_OK as u32, Ordering::SeqCst);
+        assert_eq!(unsafe { dma_close_x(list) }, S_OK);
+        assert_eq!(submit_safe_lists(&[list]), vec![list]);
+        on_release(list as usize);
     }
 
     #[test]
@@ -2444,6 +2602,8 @@ mod tests {
             s.written_ranges.push((0x6000, 0x6010));
         }
         super::super::bind::seed_reset_state_for_test(list, 0x111, 0x222, vec![0x4444]);
+        on_close(key, S_OK);
+        assert_eq!(submit_safe_lists(&[list]), vec![list]);
         RESET_TEST_REPLACEMENT_VT.store(replacement as u64, Ordering::SeqCst);
 
         RESET_TEST_HR.store(0x8000_4005, Ordering::SeqCst);
@@ -2465,6 +2625,7 @@ mod tests {
             (0x111, 0x222, vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![0x4444])
         );
         assert!(super::super::console_list::take_pending_for_test(0x111).is_empty());
+        assert_eq!(submit_safe_lists(&[list]), vec![list], "failed Reset preserves the prior closed recording");
 
         RESET_TEST_HR.store(0, Ordering::SeqCst);
         assert_eq!(unsafe { reset_x(list, 0x333, 0x555) }, 0);
@@ -2481,6 +2642,7 @@ mod tests {
             (0x333, 0x555, Vec::new(), Vec::new(), Vec::new())
         );
         assert_eq!(super::super::console_list::take_pending_for_test(0x111), vec![0x4444]);
+        assert!(submit_safe_lists(&[list]).is_empty(), "successful Reset opens the recording until Close");
 
         LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
         super::super::bind::remove_state_for_test(list);

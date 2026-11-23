@@ -2101,6 +2101,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
     preserve_vtable(this, ext);
+    super::list_x::on_close(this as usize, hr);
     if hr < 0 {
         let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
@@ -2116,6 +2117,9 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
+    if hr >= 0 {
+        super::list_x::on_reset(this as usize);
+    }
     hr
 }
 
@@ -4223,13 +4227,18 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
-    // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
         .iter()
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
+    let mapped = super::list_x::submit_safe_lists(&mapped);
+    if mapped.is_empty() {
+        stop_if_device_removed();
+        return;
+    }
+    // textures in title memory the CPU wrote since: uploaded again first
+    super::title_textures::refresh(this);
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
