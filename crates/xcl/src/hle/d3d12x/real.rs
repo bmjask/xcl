@@ -2756,6 +2756,41 @@ fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (r, missed)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AsyncPipelineRoute {
+    Compute,
+    Graphics,
+    Stream,
+}
+
+fn async_pipeline_route(enabled: bool, console_program: bool, route: AsyncPipelineRoute) -> Option<AsyncPipelineRoute> {
+    (enabled && console_program).then_some(route)
+}
+
+unsafe fn console_compute_desc(desc: *const c_void) -> bool {
+    use crate::gpu::recomp::pso::is_console;
+    crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>())
+        && shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS).is_some_and(is_console)
+}
+
+unsafe fn console_graphics_desc(desc: *const c_void) -> bool {
+    use crate::gpu::recomp::pso::is_console;
+    crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>())
+        && shader_bytes(&(*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC)).VS).is_some_and(is_console)
+}
+
+unsafe fn console_mesh_stream(desc: *const c_void) -> bool {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return false;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    crate::gpu::shader::readable(base, size)
+        && stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))
+            .and_then(|subs| subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1)))
+            .is_some_and(is_console)
+}
+
 fn note_translation_error(e: String) {
     if crate::gpu::recomp::dxc::in_cached_only() {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
@@ -3202,6 +3237,33 @@ unsafe fn go_background(
     Some(hr)
 }
 
+/// Return a non-driver token immediately and perform all native pipeline creation on a worker.
+unsafe fn go_background_deferred(
+    this: *mut c_void,
+    f: PsoFn,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+    compute: bool,
+    owned: OwnedDesc,
+    build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_INVALIDARG;
+    }
+    *ppv = std::ptr::null_mut();
+    let dev = Dev(this as usize, f as usize);
+    *ppv = super::pso_async::submit_deferred(
+        this as usize,
+        compute,
+        if riid.is_null() { None } else { Some(*riid) },
+        Box::new(move || {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() { out as usize } else { 0 }
+        }),
+    ) as *mut c_void;
+    S_OK
+}
+
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
@@ -3220,6 +3282,11 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+    if async_pipeline_route(super::pso_async::enabled(), console_graphics_desc(desc), AsyncPipelineRoute::Graphics).is_some() {
+        if let Some(owned) = own_graphics(desc) {
+            return go_background_deferred(this, f, riid, ppv, false, owned, build_graphics);
+        }
+    }
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, build_graphics)) {
@@ -3263,6 +3330,13 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    if async_pipeline_route(super::pso_async::enabled(), console_compute_desc(desc), AsyncPipelineRoute::Compute).is_some() {
+        if let Some(owned) = own_compute(desc) {
+            LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
+            LAST_COMPUTE_RS.with(|c| c.set(0));
+            return go_background_deferred(this, f, riid, ppv, true, owned, build_compute);
+        }
+    }
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
@@ -3742,6 +3816,11 @@ unsafe fn put<T>(to: &mut T, from: &[u8]) {
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+    if async_pipeline_route(super::pso_async::enabled(), console_mesh_stream(desc), AsyncPipelineRoute::Stream).is_some() {
+        if let Some(owned) = own_stream(desc) {
+            return go_background_deferred(this, f, riid, ppv, false, owned, build_stream);
+        }
+    }
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, build_stream)) {
@@ -4297,6 +4376,7 @@ mod deferred_pso_tests {
 
     static BUILD_DONE: AtomicBool = AtomicBool::new(false);
     static BUILD_GATE: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
+    static BUILD_TEST: Mutex<()> = Mutex::new(());
 
     unsafe extern "system" fn reject_standin(
         _this: *mut c_void,
@@ -4310,6 +4390,15 @@ mod deferred_pso_tests {
         E_INVALIDARG
     }
 
+    unsafe extern "system" fn caller_driver_must_not_run(
+        _this: *mut c_void,
+        _desc: *const c_void,
+        _iid: *const GUID,
+        _out: *mut *mut c_void,
+    ) -> HRESULT {
+        panic!("native pipeline creation ran on the caller")
+    }
+
     unsafe fn slow_failed_build(_dev: Dev, _desc: &OwnedDesc, _out: *mut *mut c_void) -> bool {
         let gate = BUILD_GATE.lock().unwrap().take().expect("build gate");
         let _ = gate.recv_timeout(std::time::Duration::from_secs(2));
@@ -4319,6 +4408,7 @@ mod deferred_pso_tests {
 
     #[test]
     fn rejected_driver_standin_never_builds_synchronously() {
+        let _serial = BUILD_TEST.lock().unwrap();
         BUILD_DONE.store(false, AtomicOrdering::Release);
         let (allow_build, gate) = mpsc::channel();
         *BUILD_GATE.lock().unwrap() = Some(gate);
@@ -4346,6 +4436,64 @@ mod deferred_pso_tests {
         unsafe {
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(out as *const *const usize)).add(2));
             assert_eq!(release(out), 0);
+        }
+    }
+
+    #[test]
+    fn translation_ready_pipeline_returns_before_worker_build() {
+        let _serial = BUILD_TEST.lock().unwrap();
+        BUILD_DONE.store(false, AtomicOrdering::Release);
+        let (allow_build, gate) = mpsc::channel();
+        *BUILD_GATE.lock().unwrap() = Some(gate);
+        let owned = OwnedDesc::Compute(Box::new(D3D12_COMPUTE_PIPELINE_STATE_DESC::default()), Vec::new());
+        let mut out = std::ptr::null_mut();
+        let hr = unsafe {
+            go_background_deferred(
+                std::ptr::null_mut(),
+                caller_driver_must_not_run,
+                std::ptr::null(),
+                &mut out,
+                true,
+                owned,
+                slow_failed_build,
+            )
+        };
+        assert_eq!(hr, S_OK);
+        assert!(!out.is_null());
+        assert!(super::super::pso_async::is_deferred(out as usize));
+        assert!(!BUILD_DONE.load(AtomicOrdering::Acquire));
+        allow_build.send(()).unwrap();
+        assert_eq!(super::super::pso_async::resolve_wait(out as usize), 0);
+        assert!(BUILD_DONE.load(AtomicOrdering::Acquire));
+        unsafe {
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(out as *const *const usize)).add(2));
+            assert_eq!(release(out), 0);
+        }
+    }
+
+    #[test]
+    fn async_routing_selects_each_console_entrypoint_and_respects_opt_out() {
+        for route in [AsyncPipelineRoute::Compute, AsyncPipelineRoute::Graphics, AsyncPipelineRoute::Stream] {
+            assert_eq!(async_pipeline_route(true, true, route), Some(route));
+            assert_eq!(async_pipeline_route(false, true, route), None);
+            assert_eq!(async_pipeline_route(true, false, route), None);
+        }
+
+        let console = crate::gpu::xbox::tests::container(&[(b"DXIL", b"XDAT")]);
+        let pc = [0u8; 16];
+        let compute = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: bytecode(&console), ..Default::default() };
+        let graphics = D3D12_GRAPHICS_PIPELINE_STATE_DESC { VS: bytecode(&console), ..Default::default() };
+        let pc_compute = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: bytecode(&pc), ..Default::default() };
+        let pc_graphics = D3D12_GRAPHICS_PIPELINE_STATE_DESC { VS: bytecode(&pc), ..Default::default() };
+        let mut stream = StreamOut::default();
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &console);
+        let stream_desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        unsafe {
+            assert!(console_compute_desc(&compute as *const _ as *const c_void));
+            assert!(console_graphics_desc(&graphics as *const _ as *const c_void));
+            assert!(console_mesh_stream(stream_desc.as_ptr() as *const c_void));
+            assert!(!console_compute_desc(&pc_compute as *const _ as *const c_void));
+            assert!(!console_graphics_desc(&pc_graphics as *const _ as *const c_void));
         }
     }
 }
