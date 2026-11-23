@@ -179,7 +179,7 @@ fn build(config: &Config) -> Registry {
     let g = idx(XG);
     routes.push((XG.into(), Route::Hle(g)));
     let ap = idx(ACPHAL);
-    for p in ["acphal.dll", "xapu.dll", "chad.dll"] {
+    for p in ["acphal.dll", "xapu.dll"] {
         routes.push((p.into(), Route::Hle(ap)));
     }
     let dsp = idx(CHAD);
@@ -248,7 +248,6 @@ mod tests {
         assert_eq!(name("xgameruntime.dll"), Some(XGAMERUNTIME));
         assert_eq!(name("d3d12_xs.dll"), Some(D3D12X));
         assert_eq!(name("xaudio2_9.dll"), Some(XAUDIO2));
-        assert_eq!(name("chad.dll"), Some(ACPHAL));
         assert_eq!(name("mfplat.dll"), Some(MFPLAT));
         assert_eq!(name("chad.dll"), Some(CHAD));
         assert!(r.hle_for("kernel32.dll").unwrap().aliases_are_system());
