@@ -2796,15 +2796,28 @@ unsafe fn console_graphics_desc(desc: *const c_void) -> bool {
 }
 
 unsafe fn console_mesh_stream(desc: *const c_void) -> bool {
-    use crate::gpu::recomp::pso::is_console;
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return false;
     }
     let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
     crate::gpu::shader::readable(base, size)
         && stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))
-            .and_then(|subs| subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1)))
-            .is_some_and(is_console)
+            .is_some_and(|subs| unsafe { console_mesh_subobject(&subs).is_some() })
+}
+
+/// A console mesh program in a pipeline stream.  Some console runtimes put their mesh
+/// program in the AS subobject even though its container identifies it as an NGG mesh program;
+/// that must be normalized before the PC driver sees the stream.
+unsafe fn console_mesh_subobject<'a>(subs: &[(u32, &'a [u8])]) -> Option<(&'a [u8], bool)> {
+    use crate::gpu::recomp::pso::is_console;
+    let shader = |ty| subs.iter().find(|s| s.0 == ty).and_then(|s| unsafe { payload_shader(s.1) });
+    if let Some(ms) = shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).filter(|s| is_console(s)) {
+        Some((ms, false))
+    } else {
+        shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32)
+            .filter(|s| is_console(s))
+            .map(|ms| (ms, true))
+    }
 }
 
 fn note_translation_error(e: String) {
@@ -3540,7 +3553,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_mesh, is_console};
+    use crate::gpu::recomp::pso::console_mesh;
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
     }
@@ -3549,11 +3562,8 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return None;
     }
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
-    let ms = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1))?;
-    if !is_console(ms) {
-        return None;
-    }
-    if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32 && payload_shader(s.1).is_some()) {
+    let (ms, mesh_was_as) = unsafe { console_mesh_subobject(&subs) }?;
+    if !mesh_was_as && subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32 && payload_shader(s.1).is_some()) {
         note_translation_error("mesh pipeline with AS – not supported yet".into());
         return Some(E_INVALIDARG);
     }
@@ -4529,10 +4539,16 @@ mod deferred_pso_tests {
         let mut stream = StreamOut::default();
         stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &console);
         let stream_desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        let mut legacy_stream = StreamOut::default();
+        legacy_stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, &console);
+        let legacy_desc = [legacy_stream.0.len(), legacy_stream.0.as_ptr() as usize];
         unsafe {
             assert!(console_compute_desc(&compute as *const _ as *const c_void));
             assert!(console_graphics_desc(&graphics as *const _ as *const c_void));
             assert!(console_mesh_stream(stream_desc.as_ptr() as *const c_void));
+            assert!(console_mesh_stream(legacy_desc.as_ptr() as *const c_void));
+            let legacy_subs = stream_subobjects(&legacy_stream.0).unwrap();
+            assert_eq!(console_mesh_subobject(&legacy_subs).map(|(_, was_as)| was_as), Some(true));
             assert!(!console_compute_desc(&pc_compute as *const _ as *const c_void));
             assert!(!console_graphics_desc(&pc_graphics as *const _ as *const c_void));
         }
