@@ -498,6 +498,7 @@ fn vtbl() -> &'static [usize] {
             not_implemented as usize,
             copy_into as usize,
             copy_from as usize,
+            get_subresource_layout as usize,
         ];
         for i in v.len()..12 {
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
@@ -618,6 +619,38 @@ fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usiz
     (k < s.array as usize).then_some((s, at, i, k))
 }
 
+/// Write the 0x70-byte layout of one plane subresource.  It has the same mip-record
+/// shape that [`Texture::write`] places in `XG_RESOURCE_LAYOUT`, except its byte offset
+/// includes the selected array slice.
+fn write_subresource_layout(t: &Texture, plane: u32, sub: u32, out: &mut [u8; MIP_BYTES]) -> bool {
+    let Some((surface, plane_offset, mip, slice)) = subresource(t, plane, sub) else { return false };
+    let mut whole = [0u8; LAYOUT_BYTES];
+    t.write(&mut whole);
+    let source = PLANE + plane as usize * PLANE_BYTES + MIP + mip * MIP_BYTES;
+    out.copy_from_slice(&whole[source..source + MIP_BYTES]);
+
+    let resource_offset = plane_offset + slice as u64 * surface.chain.slice_bytes as u64 + surface.mip_offset(mip);
+    out[8..16].copy_from_slice(&resource_offset.to_le_bytes());
+    true
+}
+
+/// `HRESULT GetSubresourceLayout(plane, subresource, XG_SUBRESOURCE_LAYOUT*)`.
+///
+/// The texture-address computer exposes this immediately after its copy methods.  Texture
+/// streaming uses it to locate individual mips, so returning `E_NOTIMPL` leaves callers with
+/// an empty layout even though the computer already derived the complete resource layout.
+unsafe extern "system" fn get_subresource_layout(p: *mut c_void, plane: u32, sub: u32, out: *mut u8) -> HRESULT {
+    if out.is_null() || !crate::gpu::shader::readable(out as usize, MIP_BYTES) {
+        return E_POINTER;
+    }
+    let layout = &mut *(out as *mut [u8; MIP_BYTES]);
+    if write_subresource_layout(tex(p), plane, sub, layout) {
+        S_OK
+    } else {
+        E_INVALIDARG
+    }
+}
+
 /// rows of `src` (`row_pitch` apart) → the level's place in `dst` (the whole resource)
 unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
@@ -693,6 +726,21 @@ mod tests {
         assert_eq!(offsets, [0x20000, 0x10000, 0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600, 0x500]);
         assert_eq!((mip(2, 0), mip(2, 9), mip(2, 10), mip(2, 18), mip(6, 9), mip(6, 10)), (0x8000, 0x40, 0x80, 1, 8, 8));
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+    }
+
+    #[test]
+    fn subresource_layout_uses_the_requested_array_slice_offset() {
+        let t = Texture::new(&desc(256, 128, 2, 3, 28, 0x105)).unwrap();
+        let mut layout = [0u8; MIP_BYTES];
+        assert!(write_subresource_layout(&t, 0, 4, &mut layout)); // slice 1, mip 1
+
+        let offset = u64::from_le_bytes(layout[8..16].try_into().unwrap());
+        let (surface, plane_offset, mip, slice) = subresource(&t, 0, 4).unwrap();
+        let expected = plane_offset + slice as u64 * surface.chain.slice_bytes as u64 + surface.mip_offset(mip);
+        assert_eq!(offset, expected);
+        assert_eq!(u32::from_le_bytes(layout[0x30..0x34].try_into().unwrap()), 128);
+        assert_eq!(u32::from_le_bytes(layout[0x34..0x38].try_into().unwrap()), 64);
+        assert!(!write_subresource_layout(&t, 1, 0, &mut layout));
     }
 
     #[test]
