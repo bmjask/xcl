@@ -4334,7 +4334,10 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 14] = [(72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+const NEWER_LIST_SLOTS: [(usize, usize); 21] = [
+    (61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72),
+    (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10),
+];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -4409,6 +4412,12 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
+        // Extended submissions share the regular command-list path; their extra value and
+        // flags describe console cache behavior that the PC queue already provides.
+        33 if shifted => {
+            q_execute_command_lists(this, a1 as u32, a2 as *const *mut c_void);
+            0
+        }
         _ => {
             // a console method not modelled: logged once, S_OK (as the stubs it replaces; frame
             // pacing on queue methods keeps working for titles without PresentX)
@@ -4443,7 +4452,7 @@ macro_rules! queue_slots {
         }),*];
     };
 }
-queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34);
+queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
@@ -5005,6 +5014,14 @@ mod readback_routing_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+
+    #[test]
+    fn newer_layout_routes_shifted_submission_and_memory_slots() {
+        for pair in [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (74, 72), (96, 94), (139, 10)] {
+            assert!(NEWER_LIST_SLOTS.contains(&pair), "missing newer-layout mapping {pair:?}");
+        }
+        assert_eq!(QUEUE_SLOTS.len(), 22);
+    }
 
     // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
     unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
