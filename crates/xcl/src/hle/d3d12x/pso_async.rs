@@ -33,6 +33,10 @@ struct Pending {
     deferred: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// Deferred work, held until the pipeline is first resolved.
+    job: Mutex<Option<Job>>,
+    /// The job has been handed to a worker (or rejected because no worker exists).
+    queued: std::sync::atomic::AtomicBool,
 }
 
 /// A unique pipeline-shaped token used when the driver cannot create even the dummy PSO.
@@ -282,7 +286,7 @@ pub fn worker_threads() -> usize {
 }
 
 struct PsoQueue {
-    tx: Mutex<mpsc::Sender<(Arc<Pending>, Job)>>,
+    tx: Mutex<mpsc::Sender<Arc<Pending>>>,
     /// Threads whose OS spawn actually succeeded, rather than the configured target.
     workers: usize,
 }
@@ -290,7 +294,7 @@ struct PsoQueue {
 fn queue() -> &'static PsoQueue {
     static Q: OnceLock<PsoQueue> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(Arc<Pending>, Job)>();
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = worker_threads();
@@ -299,25 +303,11 @@ fn queue() -> &'static PsoQueue {
             let rx = rx.clone();
             if std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok((p, job)) = next else { return };
+                let Ok(p) = next else { return };
+                let Some(job) = p.job.lock().unwrap().take() else { continue };
                 STAGES.start();
                 let real = job();
-                let orphan = {
-                    let mut done = p.done.lock().unwrap();
-                    let orphan = p.orphan.load(Ordering::Acquire);
-                    if !orphan {
-                        p.real.store(real, Ordering::Release);
-                    }
-                    *done = true;
-                    p.cv.notify_all();
-                    orphan
-                };
-                // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
-                if orphan {
-                    release(real);
-                }
-                // Publish completion only after the Pending state and any orphan cleanup.
-                STAGES.finish(real != 0);
+                finish(&p, real);
             }).is_ok() {
                 workers += 1;
             }
@@ -335,17 +325,31 @@ pub fn release(p: usize) {
     }
 }
 
-/// `standin` went to the title; `job` builds the real pipeline on a worker.
-fn submit_inner(standin: usize, compute: bool, deferred: bool, job: Job) {
-    let p = Arc::new(Pending { real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, deferred, orphan: Default::default() });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
-    });
+fn finish(p: &Arc<Pending>, real: usize) {
+    let orphan = {
+        let mut done = p.done.lock().unwrap();
+        let orphan = p.orphan.load(Ordering::Acquire);
+        if !orphan {
+            p.real.store(real, Ordering::Release);
+        }
+        *done = true;
+        p.cv.notify_all();
+        orphan
+    };
+    if orphan {
+        release(real);
+    }
+    STAGES.finish(real != 0);
+}
+
+/// Submit `p` exactly once. A lazy job stays in `Pending::job` until this point.
+fn enqueue(p: Arc<Pending>) {
+    if p.queued.swap(true, Ordering::AcqRel) {
+        return;
+    }
     STAGES.submit();
-    if let Err(e) = queue().tx.lock().unwrap().send((p, job)) {
-        let (p, _job) = e.0;
+    if let Err(e) = queue().tx.lock().unwrap().send(p) {
+        let p = e.0;
         STAGES.reject();
         let mut done = p.done.lock().unwrap();
         *done = true;
@@ -353,8 +357,30 @@ fn submit_inner(standin: usize, compute: bool, deferred: bool, job: Job) {
     }
 }
 
+/// `standin` went to the title; `job` builds the real pipeline on a worker.
+fn submit_inner(standin: usize, compute: bool, deferred: bool, lazy: bool, job: Job) {
+    let p = Arc::new(Pending {
+        real: AtomicUsize::new(0),
+        done: Mutex::new(false),
+        cv: Condvar::new(),
+        compute,
+        deferred,
+        orphan: Default::default(),
+        job: Mutex::new(Some(job)),
+        queued: Default::default(),
+    });
+    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
+    });
+    if !lazy {
+        enqueue(p);
+    }
+}
+
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_inner(standin, compute, false, job)
+    submit_inner(standin, compute, false, false, job)
 }
 
 /// Make a unique non-driver stand-in and build its real pipeline in the background.
@@ -366,6 +392,7 @@ pub fn submit_deferred(device: usize, compute: bool, creation_iid: Option<GUID>,
         standin,
         compute,
         true,
+        false,
         Box::new(move || {
             let _device_ref = device_ref;
             job()
@@ -374,22 +401,48 @@ pub fn submit_deferred(device: usize, compute: bool, creation_iid: Option<GUID>,
     standin
 }
 
+/// Make a unique stand-in whose native pipeline is not built until its first use.
+pub fn submit_deferred_lazy(device: usize, compute: bool, creation_iid: Option<GUID>, job: Job) -> usize {
+    let standin = deferred(device, creation_iid);
+    let device_ref = ComRef::new(device);
+    submit_inner(
+        standin,
+        compute,
+        true,
+        true,
+        Box::new(move || {
+            let _device_ref = device_ref;
+            job()
+        }),
+    );
+    standin
+}
+
+/// Lazy building is enabled by default; `XCL_LAZY_PSO=0` restores eager submission.
+pub fn lazy() -> bool {
+    std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0")
+}
+
 fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
-    match entry(pso).map(|p| (p.real.load(Ordering::Acquire), p.deferred)) {
-        Some((r, _)) if r != 0 => r,
-        Some((_, true)) => 0,
-        _ => pso,
+    let Some(p) = entry(pso) else { return pso };
+    let real = p.real.load(Ordering::Acquire);
+    if real != 0 {
+        real
+    } else {
+        enqueue(p.clone());
+        if p.deferred { 0 } else { pso }
     }
 }
 
 /// `resolve`, waiting for a pipeline still being built.
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    enqueue(p.clone());
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -550,6 +603,31 @@ mod tests {
         let real = 0x7f00_1234usize;
         let pso = submit_deferred(0, false, None, Box::new(move || real));
         assert_eq!(resolve_wait(pso), real);
+        assert_eq!(released(pso), real);
+        unsafe {
+            let release: unsafe extern "system" fn(*mut DeferredPso) -> u32 = std::mem::transmute(*(*(pso as *const *const usize)).add(2));
+            assert_eq!(release(pso as *mut DeferredPso), 0);
+        }
+    }
+
+    #[test]
+    fn lazy_deferred_pipeline_starts_only_at_first_use() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let seen = started.clone();
+        let real = 0x7f00_4321usize;
+        let pso = submit_deferred_lazy(
+            0,
+            false,
+            None,
+            Box::new(move || {
+                seen.fetch_add(1, Ordering::AcqRel);
+                real
+            }),
+        );
+        assert_eq!(started.load(Ordering::Acquire), 0, "a lazy pipeline must not start at creation");
+        assert_eq!(resolve(pso), 0, "a deferred graphics token never reaches the native API");
+        assert_eq!(resolve_wait(pso), real);
+        assert_eq!(started.load(Ordering::Acquire), 1, "first use queues exactly one build");
         assert_eq!(released(pso), real);
         unsafe {
             let release: unsafe extern "system" fn(*mut DeferredPso) -> u32 = std::mem::transmute(*(*(pso as *const *const usize)).add(2));

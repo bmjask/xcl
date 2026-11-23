@@ -3363,7 +3363,12 @@ unsafe fn go_background_deferred(
     }
     *ppv = std::ptr::null_mut();
     let dev = Dev(this as usize, f as usize);
-    *ppv = super::pso_async::submit_deferred(
+    let submit = if super::pso_async::lazy() {
+        super::pso_async::submit_deferred_lazy
+    } else {
+        super::pso_async::submit_deferred
+    };
+    *ppv = submit(
         this as usize,
         compute,
         if riid.is_null() { None } else { Some(*riid) },
