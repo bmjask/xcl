@@ -457,8 +457,8 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     let lanes: u32 = if lw.wave64 { 64 } else { 32 };
     let total: u32 = cs.threads.iter().product();
     if cs.tg_size {
-        // (threads / lanes) | (gi / lanes) << 6
-        let w = lw.c(total / lanes);
+        // the group's wave count (a partial last wave counts) | (gi / lanes) << 6
+        let w = lw.c(total.div_ceil(lanes));
         let l = lw.c(lanes);
         let i = lw.bin(super::module::BinOp::UDiv, tid, l);
         let i = lw.shlc(i, 6);
