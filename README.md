@@ -124,6 +124,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- `XCL_DIRECT_DXIL=1` translates supported compute shaders and the compute pass of mesh shaders
+  directly to DXIL. `XCL_DIRECT_DXIL=all` also enables vertex and pixel shaders. The direct
+  backend includes the producer metadata needed by the Radeon RX 580 driver.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime

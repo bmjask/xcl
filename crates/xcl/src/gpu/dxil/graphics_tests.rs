@@ -336,6 +336,20 @@ fn ms_basic_parts_match_dxc() {
     assert_valid(&c);
 }
 
+#[test]
+fn direct_shaders_identify_their_producer() {
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return crate::gpu::recomp::runner::skip_test("no DXC");
+    }
+    let cs = Shader::new(Stage::Compute, (6, 6)).finish([1, 1, 1], None);
+    for (stage, shader) in [("CS", cs), ("VS", vs_basic()), ("PS", ps_basic()), ("MS", ms_basic())] {
+        let ir = validate::disassemble(&shader).unwrap();
+        let ident = ir.lines().find_map(|line| line.strip_prefix("!llvm.ident = !{")?.strip_suffix('}'))
+            .unwrap_or_else(|| panic!("{stage} has no llvm.ident"));
+        assert!(ir.lines().any(|line| line.strip_prefix(ident) == Some(" = !{!\"XCL\"}")), "{stage}: {ident}");
+    }
+}
+
 // ---- GPU draws
 
 /// The draw test's pixel shader: `SV_Target = float4(COLOR.rgb * mem[0..3], float(ID) + mem[3])`

@@ -148,6 +148,10 @@ pub struct RawUav {
 impl Shader {
     pub fn new(stage: Stage, sm: (u32, u32)) -> Shader {
         let mut m = Module::new();
+        // The Radeon RX 580 driver needs the LLVM producer when creating a pipeline.
+        let producer = m.md_str("XCL");
+        let ident = m.md_node(&[Some(producer)]);
+        m.named_md("llvm.ident", &[ident]);
         let entry = m.define_entry("main");
         let i8 = m.i8();
         let p8 = m.ptr(i8, 0);
