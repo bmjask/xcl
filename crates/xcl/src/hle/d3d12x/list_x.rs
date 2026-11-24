@@ -1264,6 +1264,30 @@ pub(super) unsafe fn note_title_queue_signal(queue: usize, fence: usize, value: 
     tf.signals.push(SubmittedSignal { val: value, queue, seq });
 }
 
+/// Publish a cycle-broken `Write64` value into title memory (`fetch_max`) so CPU polling and
+/// subsequent `Wait64BitValueX` checks observe the counter advancing. Sparse UMA windows are
+/// skipped: CPU writes there dirty write-watched pages and would upload stale sibling bytes into
+/// tiled VRAM. Committed coherent UMA takes the O(1) fast path; non-UMA title memory reuses
+/// `cpu_writes::max_u64_now` (off the hot path: cycle breaks only).
+unsafe fn publish_cpu_cycle_break(va: u64, val: u64) {
+    publish_cpu_cycle_break_with(va, val, crate::gpu::uma::get());
+}
+
+unsafe fn publish_cpu_cycle_break_with(va: u64, val: u64, uma: Option<&crate::gpu::uma::Uma>) {
+    if val == 0 || va == 0 || !va.is_multiple_of(8) {
+        return;
+    }
+    let addr = va as usize;
+    if uma.is_some_and(|u| u.is_sparse(addr)) {
+        return;
+    }
+    if uma.is_some_and(|u| u.in_committed_window(addr, 8)) {
+        (*(addr as *const AtomicU64)).fetch_max(val, Ordering::AcqRel);
+    } else {
+        super::cpu_writes::max_u64_now(addr, val);
+    }
+}
+
 /// Before a title `ID3D12CommandQueue::Signal(title_fence, value)` is submitted, check if it would
 /// close a mixed cycle passing through any `Wait64BitValueX` `SyncCell`. If so, release that
 /// `SyncCell` on CPU BEFORE the title signal executes so Vulkan never enters a semaphore cycle.
@@ -1336,6 +1360,9 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         let mut out = Vec::new();
         for (va, val) in break_cells {
             if let Some(cell) = graph.cells.get_mut(&va) {
+                if cell.non_monotonic {
+                    continue;
+                }
                 cell.cpu_signaled_max = cell.cpu_signaled_max.max(val);
                 let before = cell.armed_waits.len();
                 cell.armed_waits.retain(|aw| aw.val > val);
@@ -1352,6 +1379,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         out
     };
     for (va, val, fence) in to_release {
+        publish_cpu_cycle_break(va, val);
         let _ = fence.Signal(val);
         static MIXED_WARN: AtomicU64 = AtomicU64::new(0);
         if once(&MIXED_WARN, 16) {
@@ -1657,6 +1685,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
             SignalAction::CpuCycleBreak(waiters) => {
+                publish_cpu_cycle_break(va, val);
                 let _ = fence.Signal(val);
                 static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
                 if once(&BREAK_WARN, 32) {
@@ -5695,6 +5724,261 @@ mod tests {
             if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
                 gr.cells.remove(&va_a);
                 gr.cells.remove(&va_b);
+            }
+        }
+    }
+
+    /// `publish_cpu_cycle_break_with` advances writable 8-byte-aligned memory monotonically via
+    /// `fetch_max` (both plain title memory and committed coherent UMA), while safely skipping
+    /// sparse UMA windows, zero/unaligned targets, and read-only / inaccessible / guard pages.
+    #[test]
+    fn publish_cpu_cycle_break_uses_fetch_max_and_skips_sparse_or_unwritable() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD,
+            PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        };
+
+        unsafe {
+            // Plain title memory: monotonic fetch_max, never rewinds.
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as u64;
+            publish_cpu_cycle_break_with(va, 0, None);
+            assert_eq!(cell.load(Ordering::Acquire), 0);
+            publish_cpu_cycle_break_with(va, 0x702, None);
+            assert_eq!(cell.load(Ordering::Acquire), 0x702);
+            publish_cpu_cycle_break_with(va, 0x500, None);
+            assert_eq!(cell.load(Ordering::Acquire), 0x702, "must not rewind below current value");
+            publish_cpu_cycle_break_with(va, 0x900, None);
+            assert_eq!(cell.load(Ordering::Acquire), 0x900);
+
+            // Misaligned and null addresses are ignored safely.
+            let buf = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
+            let base = buf.as_ptr() as u64;
+            publish_cpu_cycle_break_with(base + 4, 0x1234, None);
+            assert_eq!(buf[0].load(Ordering::Acquire), 0);
+            assert_eq!(buf[1].load(Ordering::Acquire), 0);
+            publish_cpu_cycle_break_with(0, 0x1234, None);
+
+            // Non-writable and guard pages are skipped without faulting.
+            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            assert!(!page.is_null());
+            let page_va = page as u64;
+            (*(page as *const AtomicU64)).store(0x11, Ordering::Release);
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(page, 0x1000, PAGE_READONLY, &mut old), 0);
+            publish_cpu_cycle_break_with(page_va, 0x22, None);
+            assert_eq!((*(page as *const AtomicU64)).load(Ordering::Acquire), 0x11, "PAGE_READONLY must be skipped");
+
+            // Surviving PAGE_NOACCESS / PAGE_GUARD without faulting and still reading 0x11 once
+            // PAGE_READWRITE is restored verifies both protections were skipped.
+            assert_ne!(VirtualProtect(page, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            publish_cpu_cycle_break_with(page_va, 0x33, None);
+
+            assert_ne!(VirtualProtect(page, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            publish_cpu_cycle_break_with(page_va, 0x44, None);
+
+            assert_ne!(VirtualProtect(page, 0x1000, PAGE_READWRITE, &mut old), 0);
+            assert_eq!((*(page as *const AtomicU64)).load(Ordering::Acquire), 0x11, "NOACCESS/GUARD must not write");
+            VirtualFree(page, 0, MEM_RELEASE);
+
+            // Real runtime UMA layout: committed coherent window gets updated; sparse window is
+            // skipped even when its CPU page is committed and writable.
+            let uma = crate::gpu::uma::Uma::for_runtime(16 << 20).expect("runtime UMA");
+            let coherent = uma.alloc(0x1000, 8).expect("coherent UMA slot") as usize;
+            assert!(uma.in_committed_window(coherent, 8) && !uma.is_sparse(coherent));
+            (*(coherent as *const AtomicU64)).store(0, Ordering::Release);
+            publish_cpu_cycle_break_with(coherent as u64, 0xabc, Some(&uma));
+            assert_eq!((*(coherent as *const AtomicU64)).load(Ordering::Acquire), 0xabc);
+            assert!(uma.free(coherent));
+
+            let (sparse_va, _) = uma.sparse_alloc(0x1_0000, 0x1_0000).expect("sparse UMA slot");
+            assert!(uma.is_sparse(sparse_va));
+            let committed = VirtualAlloc(sparse_va as *const c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+            assert_eq!(committed as usize, sparse_va);
+            (*(sparse_va as *const AtomicU64)).store(0, Ordering::Release);
+            publish_cpu_cycle_break_with(sparse_va as u64, 0xdef, Some(&uma));
+            assert_eq!(
+                (*(sparse_va as *const AtomicU64)).load(Ordering::Acquire),
+                0,
+                "sparse UMA window must not be written on CPU cycle break"
+            );
+            VirtualFree(sparse_va as *mut c_void, 0x1000, MEM_DECOMMIT);
+            assert!(uma.sparse_release(sparse_va).is_some());
+        }
+    }
+
+    /// A CPU cycle-break (`SignalAction::CpuCycleBreak` and `break_cycles_before_title_signal`)
+    /// must publish the released value into title memory with `fetch_max` so CPU polls and
+    /// subsequent `Wait64BitValueX` checks observe it without re-arming or rewinding.
+    #[test]
+    fn cpu_cycle_break_publishes_value_to_title_memory_and_keeps_it_monotonic() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let dl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
+            let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca, None).unwrap();
+            let done_d: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done_c: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            // 1. 2-queue cycle broken by `SignalAction::CpuCycleBreak` publishes 0x702 to `cell_a`.
+            let cell_a = Box::new(AtomicU64::new(0));
+            let cell_b = Box::new(AtomicU64::new(0));
+            let va_a = &*cell_a as *const AtomicU64 as u64;
+            let va_b = &*cell_b as *const AtomicU64 as u64;
+            let (dl_ptr, cl_ptr) = (dl.as_raw(), cl.as_raw());
+            on_create(dl_ptr, da.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            on_create(cl_ptr, ca.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            note_write64_recorded(dl_ptr, va_a, 0x702);
+            wait64_x(dl_ptr, va_b, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x702, 1, 0);
+            wait64_x(cl_ptr, va_a, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x702, 1, 0);
+            note_write64_recorded(cl_ptr, va_b, 0x702);
+            dl.Close().unwrap();
+            cl.Close().unwrap();
+
+            let ccl: ID3D12CommandList = cl.cast().unwrap();
+            execute_with_waits_on(cq.as_raw(), &[cl_ptr], |chunk| {
+                cq.ExecuteCommandLists(&[Some(ccl.clone())]);
+                signal_write64_fences(cq.as_raw(), chunk);
+            });
+            cq.Signal(&done_c, 1).unwrap();
+            assert_eq!(cell_a.load(Ordering::Acquire), 0);
+
+            let dcl: ID3D12CommandList = dl.cast().unwrap();
+            execute_with_waits_on(dq.as_raw(), &[dl_ptr], |chunk| {
+                dq.ExecuteCommandLists(&[Some(dcl.clone())]);
+                signal_write64_fences(dq.as_raw(), chunk);
+            });
+            dq.Signal(&done_d, 1).unwrap();
+
+            assert_eq!(cell_a.load(Ordering::Acquire), 0x702, "CpuCycleBreak must publish released value to title memory");
+            let follow_up = PendingWait {
+                va: va_a,
+                width: 8,
+                comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+                value: 0x702,
+                mask: u64::MAX,
+                after_write64: false,
+            };
+            assert!(follow_up.is_satisfied(), "subsequent CPU/memory wait must see the published value");
+            assert!(try_gpu_wait(cq.as_raw(), &follow_up, &[]) == GpuWaitOutcome::Handled);
+            {
+                let g = SYNC_GRAPH.lock().unwrap();
+                let c = g.as_ref().unwrap().cells.get(&va_a).unwrap();
+                assert_eq!(c.cpu_signaled_max, 0x702);
+                assert!(c.armed_waits.is_empty(), "released wait must not be re-armed");
+            }
+
+            crate::gpu::fence::wait(&done_d, 1, &dev, None, 2000).expect("DIRECT must finish after cycle break");
+            crate::gpu::fence::wait(&done_c, 1, &dev, None, 2000).expect("COMPUTE must finish after cycle break");
+
+            // 2. Same-queue self-deadlock cycle-break must NOT rewind memory already holding a higher value.
+            let cell_hi = Box::new(AtomicU64::new(0));
+            let va_hi = &*cell_hi as *const AtomicU64 as u64;
+            let a_w: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let a_s: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let l_w: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_w, None).unwrap();
+            let l_s: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_s, None).unwrap();
+            let done_hi: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (lw_ptr, ls_ptr) = (l_w.as_raw(), l_s.as_raw());
+            on_create(lw_ptr, a_w.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            on_create(ls_ptr, a_s.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            note_write64_recorded(ls_ptr, va_hi, 0x800);
+            wait64_x(lw_ptr, va_hi, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x800, 1, 0);
+            l_w.Close().unwrap();
+            l_s.Close().unwrap();
+
+            let cl_w: ID3D12CommandList = l_w.cast().unwrap();
+            execute_with_waits_on(cq.as_raw(), &[lw_ptr], |chunk| {
+                cq.ExecuteCommandLists(&[Some(cl_w.clone())]);
+                signal_write64_fences(cq.as_raw(), chunk);
+            });
+            // Simulate a newer write already advancing memory past 0x800 before the cycle-break fires.
+            cell_hi.store(0x900, Ordering::Release);
+            let cl_s: ID3D12CommandList = l_s.cast().unwrap();
+            execute_with_waits_on(cq.as_raw(), &[ls_ptr], |chunk| {
+                cq.ExecuteCommandLists(&[Some(cl_s.clone())]);
+                signal_write64_fences(cq.as_raw(), chunk);
+            });
+            cq.Signal(&done_hi, 1).unwrap();
+            {
+                let g = SYNC_GRAPH.lock().unwrap();
+                assert_eq!(g.as_ref().unwrap().cells[&va_hi].cpu_signaled_max, 0x800, "self-deadlock must trigger CpuCycleBreak");
+            }
+            assert_eq!(cell_hi.load(Ordering::Acquire), 0x900, "CpuCycleBreak must not rewind memory");
+            crate::gpu::fence::wait(&done_hi, 1, &dev, None, 2000).expect("self-deadlock must complete");
+
+            // 3. Mixed title-fence + Wait64 cycle broken by `break_cycles_before_title_signal`
+            //    also publishes the released value into title memory.
+            let cell_m = Box::new(AtomicU64::new(0));
+            let va_m = &*cell_m as *const AtomicU64 as u64;
+            let cell_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let title_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let qa = dq.as_raw() as usize;
+            let qb = cq.as_raw() as usize;
+            let tf_raw = title_fence.as_raw() as usize;
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(SyncGraph::default);
+                gr.cells.insert(
+                    va_m,
+                    SyncCell {
+                        fence: Some(cell_fence.clone()),
+                        device: dev.as_raw() as usize,
+                        recorded_max: 0x50,
+                        submitted_max: 0x50,
+                        submitted_queue: Some(qb),
+                        armed_waits: vec![ArmedGpuWait {
+                            val: 0x50,
+                            waiting_queue: qa,
+                            waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                            wait_seq: 1,
+                            armed_at: Instant::now(),
+                            after_write64: false,
+                        }],
+                        submitted_signals: vec![SubmittedSignal { val: 0x50, queue: qb, seq: 2 }],
+                        ..Default::default()
+                    },
+                );
+                // Matches the `fetch_sub(removed)` performed by `break_cycles_before_title_signal`.
+                ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+                gr.title_fences.insert(tf_raw, TitleFenceSync { waits: vec![(1, qb, 1)], signals: Vec::new() });
+            }
+            break_cycles_before_title_signal(qa, tf_raw, 1);
+            assert_eq!(cell_m.load(Ordering::Acquire), 0x50, "mixed cycle break must publish released value to title memory");
+            crate::gpu::fence::wait(&cell_fence, 0x50, &dev, None, 2000).expect("mixed cycle break must signal cell fence");
+
+            for p in [dl_ptr, cl_ptr, lw_ptr, ls_ptr] {
+                on_release(p as usize);
+            }
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&va_a);
+                gr.cells.remove(&va_b);
+                gr.cells.remove(&va_hi);
+                gr.cells.remove(&va_m);
+                gr.title_fences.remove(&tf_raw);
             }
         }
     }
