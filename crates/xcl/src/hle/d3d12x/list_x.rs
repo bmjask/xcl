@@ -3454,7 +3454,7 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
 /// Translated shaders with heap windows (`pso::heap_windows`) read the memory windows from the
 /// shared heap: a list that set no heaps (a dispatch with no views) gets it before the bind.
 pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
-    if !crate::gpu::recomp::pso::heap_windows() {
+    if !crate::gpu::recomp::pso::bind_shared_heap() {
         return;
     }
     let Some(g) = super::console_heap::global_heap() else { return };
@@ -4789,7 +4789,7 @@ mod tests {
             ensure_view_heap(list);
             with_bindings(list, |b| bound = b.heaps.clone());
             match super::super::console_heap::global_heap() {
-                Some(g) if crate::gpu::recomp::pso::heap_windows() => {
+                Some(g) if crate::gpu::recomp::pso::bind_shared_heap() => {
                     assert_eq!(bound, vec![g.as_raw() as usize], "the shared heap is bound again");
                     assert_eq!(fake.calls.lock().unwrap().last(), Some(&vec![g.as_raw() as usize]));
                 }

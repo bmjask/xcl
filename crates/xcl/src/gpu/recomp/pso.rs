@@ -77,11 +77,28 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+    if n > 1 && heap_windows() && !all_switch_form() && !SWITCH_FORM.with(|s| s.get()) {
         n | super::HEAP_WINDOWS
     } else {
         n
     }
+}
+
+/// Debugging (`XCL_HEAP_WINDOWS_FORM=switch`): every program in the switch form over root UAVs
+/// while the heap-window infrastructure stays on (the window views in the shared heap, the
+/// shared heap bound to lists that set none) – tells a hang of that infrastructure from one of
+/// the shaders' heap form.
+pub fn all_switch_form() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS_FORM").is_ok_and(|v| v.trim() == "switch"))
+}
+
+/// Debugging (`XCL_HEAP_WINDOWS_BIND=0`): lists that set no descriptor heaps are not given the
+/// shared heap before translated work. Only sound with `XCL_HEAP_WINDOWS_FORM=switch` (shaders in
+/// the heap form need it).
+pub fn bind_shared_heap() -> bool {
+    static B: OnceLock<bool> = OnceLock::new();
+    heap_windows() && *B.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS_BIND").map_or(true, |v| v.trim() != "0"))
 }
 
 thread_local! {

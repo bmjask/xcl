@@ -840,7 +840,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
-                        if !heaps_set && crate::gpu::recomp::pso::heap_windows() {
+                        if !heaps_set && crate::gpu::recomp::pso::bind_shared_heap() {
                             if let Some(g) = super::console_heap::global_heap() {
                                 list.SetDescriptorHeaps(&[Some(g)]);
                                 heaps_set = true;
