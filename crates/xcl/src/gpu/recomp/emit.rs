@@ -5150,7 +5150,9 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     if let Some(coherent) = heap {
         // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
         // does what the switch's `default` does
-        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
+        // (the index clamped into the windows: see `dxil::lower_mem::with_mem_many_tys`)
+        let w = if super::pso::clamp_heap_window_index() { format!("min(xcl_w, {}u)", windows - 1) } else { "xcl_w".to_string() };
+        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + {w})]", super::MEM_HEAP_BASE);
         let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
         for (ret, name, params, args, def) in sigs {
             let r = if ret == "void" { "" } else { "return " };

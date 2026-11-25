@@ -183,6 +183,16 @@ impl Lw {
             if self.s.m.const_u64(cond) == Some(0) {
                 return out_tys.iter().map(|&t| self.s.m.const_int(t, 0)).collect();
             }
+            // the heap index clamped into the windows: the driver may compute the handle for
+            // lanes the guard leaves out (createHandleFromHeap is ReadNone, so it can be
+            // speculated, and a non-uniform index is waterfalled per distinct value), and those
+            // lanes' `w` is anything – an index past the heap's start
+            let w = if crate::gpu::recomp::pso::clamp_heap_window_index() && self.s.m.const_u64(w).is_none() {
+                let top = self.c(windows - 1);
+                self.umin(w, top)
+            } else {
+                w
+            };
             if self.s.m.const_u64(cond) == Some(1) {
                 let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
                 let m = self.s.heap_raw_buffer_uav(i, coherent);

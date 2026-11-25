@@ -101,6 +101,31 @@ pub fn bind_shared_heap() -> bool {
     heap_windows() && *B.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS_BIND").map_or(true, |v| v.trim() != "0"))
 }
 
+/// Debugging: how translated shaders reach a window in the heap form, given whether the switch
+/// form's root UAV would be globallycoherent – (globallycoherent, NonUniformResourceIndex).
+/// `XCL_HEAP_WINDOWS_COHERENT=0`: never globallycoherent; `XCL_HEAP_WINDOWS_UNIFORM=1`: the
+/// window index taken as wave-uniform. Both change the translated DXIL (own cache identity).
+pub fn heap_window_access(coherent: bool) -> (bool, bool) {
+    let (c, u) = heap_window_knobs();
+    (coherent && c, !u)
+}
+
+/// The heap form clamps the window index into the windows before the descriptor heap lookup
+/// (`dxil::lower_mem::with_mem_many_tys`, `emit::mem_accessors`). Kill switch
+/// `XCL_HEAP_WINDOWS_CLAMP=0` (own cache identity).
+pub fn clamp_heap_window_index() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS_CLAMP").map_or(true, |v| v.trim() != "0"))
+}
+
+fn heap_window_knobs() -> (bool, bool) {
+    static K: OnceLock<(bool, bool)> = OnceLock::new();
+    *K.get_or_init(|| {
+        let on = |k: &str, v: &str| std::env::var(k).is_ok_and(|x| x.trim() == v);
+        (!on("XCL_HEAP_WINDOWS_COHERENT", "0"), on("XCL_HEAP_WINDOWS_UNIFORM", "1"))
+    })
+}
+
 thread_local! {
     /// this thread translates in the switch form (`in_switch_form`)
     static SWITCH_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -259,6 +284,10 @@ mod translated {
                 crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
             );
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
+            let id = match (super::heap_window_knobs(), super::clamp_heap_window_index()) {
+                ((true, false), true) => id,
+                ((c, u), k) => identity_for(&id.to_string(), &format!("xcl-heap-window-knobs-{c}-{u}-{k}")),
+            };
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
             } else {
