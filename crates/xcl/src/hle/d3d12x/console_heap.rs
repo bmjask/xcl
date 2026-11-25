@@ -174,6 +174,12 @@ pub fn window_views_failed() -> bool {
     WINDOW_VIEWS_FAILED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Debugging (`XCL_HEAP_WINDOW_VIEW_FULL=1`): the window views reach the window's top but its
+/// last dword, as root UAVs do, instead of stopping 32 bytes short of 4 GiB.
+fn full_window_views() -> bool {
+    std::env::var("XCL_HEAP_WINDOW_VIEW_FULL").is_ok_and(|v| v.trim() == "1")
+}
+
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
 /// A window without a buffer gets window 0's. False (and the shaders keep the switch): no
@@ -191,7 +197,13 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
             let raw = raw as *mut std::ffi::c_void;
             let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
             let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * inc as u64) as usize };
-            device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at);
+            let mut view = crate::gpu::recomp::runner::raw_window_uav(bytes as u64);
+            if full_window_views() {
+                // (`XCL_HEAP_WINDOW_VIEW_FULL=1`) up to 2^30 - 1 dwords, as the switch form's root
+                // UAVs reach: a newer D3D12 runtime only (see `raw_window_uav`)
+                view.Anonymous.Buffer.NumElements = (bytes as u64 / 4).min((1 << 30) - 1) as u32;
+            }
+            device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&view), at);
         }
         true
     };
