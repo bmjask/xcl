@@ -300,6 +300,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
+            super::submit_diag::note(this, super::submit_diag::Kind::ExecuteIndirect(max, count_buf != 0), pso);
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
@@ -444,6 +445,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
+        super::submit_diag::note(this, super::submit_diag::Kind::Draw, with(this, |s| s.pso));
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             return;
         }
@@ -460,6 +462,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        super::submit_diag::note(this, super::submit_diag::Kind::Draw, with(this, |s| s.pso));
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
@@ -817,6 +820,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         Ok(()) => {
             count(DISPATCHES);
             super::real::note_dispatch_record(pso);
+            super::submit_diag::note(this, super::submit_diag::Kind::Dispatch, pso);
         }
         Err(e) => {
             count(DISPATCHES_SKIPPED);

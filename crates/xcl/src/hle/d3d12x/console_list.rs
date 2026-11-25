@@ -855,6 +855,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
                         list.Dispatch(x, y, z);
+                        super::submit_diag::note(list.as_raw(), super::submit_diag::Kind::Dispatch, real as usize);
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,

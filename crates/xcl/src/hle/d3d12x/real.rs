@@ -3843,6 +3843,11 @@ fn skip_kind(kind: &str) -> bool {
 /// record hash of the console CS of each translated compute pipeline (`note_dispatch_record`)
 static PSO_RECORD: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
+/// The record hash of the console CS of a translated compute pipeline (`submit_diag`).
+pub fn pso_record_of(pso: usize) -> Option<u64> {
+    PSO_RECORD.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
 /// Debugging (`XCL_LOG_DISPATCH_PSOS=1`): per 2 s, the record hashes of the dispatched compute
 /// programs with their counts.
 pub fn note_dispatch_record(pso: usize) {
@@ -5716,6 +5721,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
+        super::submit_diag::submitted(this, chunk, super::list_x::write64_signals_of);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
@@ -5835,6 +5841,7 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    super::submit_diag::dump("device removed");
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {

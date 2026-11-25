@@ -61,6 +61,10 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
 /// cleanly without prematurely breaking synchronization.
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
+/// (#1123 on this branch: the fixed timeout)
+fn gpu_wait_watchdog_timeout() -> Duration {
+    GPU_WAIT_WATCHDOG_TIMEOUT
+}
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -1100,6 +1104,16 @@ static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
 /// Cells the watchdog released on the CPU so far.
 static WATCHDOG_RELEASES: AtomicU64 = AtomicU64::new(0);
 
+/// `queue_id` for `submit_diag`.
+pub(super) fn queue_id_of(q: usize) -> usize {
+    queue_id(q)
+}
+
+/// The `Write64` (address, value) pairs `list` signals (`submit_diag`).
+pub(super) fn write64_signals_of(list: *mut c_void) -> Vec<(u64, u64)> {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map(|s| s.write64_signals.clone()).unwrap_or_default()
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
@@ -1598,6 +1612,7 @@ fn wake_sync_watchdog() {
                 );
             }
             if had_expired {
+                super::submit_diag::dump("a GPU wait timed out");
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
             }
             if let Some(chain) = in_flight.and_then(|(waits, signals)| wait_chain_line(&waits, &signals, &waiters)) {
