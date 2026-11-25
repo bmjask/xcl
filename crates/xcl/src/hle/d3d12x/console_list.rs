@@ -856,6 +856,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         list.SetPipelineState(pc);
                         list.Dispatch(x, y, z);
                         super::bind::dispatch_barrier(&list);
+                        super::submit_diag::note(list.as_raw(), super::submit_diag::Kind::Dispatch, real as usize);
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,

@@ -1096,6 +1096,16 @@ static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// `queue_id` for `submit_diag`.
+pub(super) fn queue_id_of(q: usize) -> usize {
+    queue_id(q)
+}
+
+/// The `Write64` (address, value) pairs `list` signals (`submit_diag`).
+pub(super) fn write64_signals_of(list: *mut c_void) -> Vec<(u64, u64)> {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map(|s| s.write64_signals.clone()).unwrap_or_default()
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
@@ -1269,6 +1279,32 @@ pub(super) unsafe fn note_title_queue_signal(queue: usize, fence: usize, value: 
 /// skipped: CPU writes there dirty write-watched pages and would upload stale sibling bytes into
 /// tiled VRAM. Committed coherent UMA takes the O(1) fast path; non-UMA title memory reuses
 /// `cpu_writes::max_u64_now` (off the hot path: cycle breaks only).
+/// A watchdog-expired GPU wait's released value into the title's memory (`fetch_max`, never
+/// back): as `publish_cpu_cycle_break`, which leaves sparse windows alone; with
+/// `XCL_GPU_WAIT_RELEASE_PUBLISH_SPARSE=1` a cell in a sparse window gets it too (its CPU copy –
+/// the chunk is uploaded with the next submit). Kill switch `XCL_GPU_WAIT_RELEASE_PUBLISH=0`.
+unsafe fn publish_watchdog_release(va: u64, val: u64) {
+    let env = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string());
+    static ON: OnceLock<(bool, bool)> = OnceLock::new();
+    let (on, sparse) = *ON.get_or_init(|| (env("XCL_GPU_WAIT_RELEASE_PUBLISH").as_deref() != Some("0"), env("XCL_GPU_WAIT_RELEASE_PUBLISH_SPARSE").as_deref() == Some("1")));
+    if !on {
+        return;
+    }
+    let uma = crate::gpu::uma::get();
+    let in_sparse = uma.is_some_and(|u| u.is_sparse(va as usize));
+    static N: AtomicU64 = AtomicU64::new(0);
+    if once(&N, 8) {
+        crate::xlog_info!("D3D12.X: watchdog release of {va:#x} = {val:#x} published to the title's memory: {}", if !in_sparse { "yes" } else if sparse { "yes (sparse window)" } else { "no (sparse window; XCL_GPU_WAIT_RELEASE_PUBLISH_SPARSE=1)" });
+    }
+    if in_sparse {
+        if sparse && va != 0 && va.is_multiple_of(8) && crate::gpu::shader::readable(va as usize, 8) {
+            (*(va as usize as *const AtomicU64)).fetch_max(val, Ordering::AcqRel);
+        }
+        return;
+    }
+    publish_cpu_cycle_break_with(va, val, uma);
+}
+
 unsafe fn publish_cpu_cycle_break(va: u64, val: u64) {
     publish_cpu_cycle_break_with(va, val, crate::gpu::uma::get());
 }
@@ -1474,6 +1510,9 @@ fn wake_sync_watchdog() {
             let had_expired = !expired.is_empty();
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
                 unsafe {
+                    // the title's memory holds the released value too (as a CPU cycle break's,
+                    // `publish_cpu_cycle_break`): its polls of the counter see it move
+                    publish_watchdog_release(va, val);
                     let _ = fence.Signal(val);
                 }
                 let wq = queue_id(waiter_q);
@@ -1484,6 +1523,8 @@ fn wake_sync_watchdog() {
                 );
             }
             if had_expired {
+                super::submit_diag::dump("a GPU wait timed out");
+                super::real::flush_dispatch_records();
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
             }
         });
@@ -5731,6 +5772,18 @@ mod tests {
     /// `publish_cpu_cycle_break_with` advances writable 8-byte-aligned memory monotonically via
     /// `fetch_max` (both plain title memory and committed coherent UMA), while safely skipping
     /// sparse UMA windows, zero/unaligned targets, and read-only / inaccessible / guard pages.
+    #[test]
+    fn a_watchdog_release_publishes_its_value_and_never_rewinds() {
+        let cell = Box::new(std::sync::atomic::AtomicU64::new(5));
+        let va = &*cell as *const _ as u64;
+        unsafe {
+            publish_watchdog_release(va, 9);
+            assert_eq!(cell.load(Ordering::Acquire), 9, "the released value reaches the title's memory");
+            publish_watchdog_release(va, 7);
+            assert_eq!(cell.load(Ordering::Acquire), 9, "a lower release does not rewind it");
+        }
+    }
+
     #[test]
     fn publish_cpu_cycle_break_uses_fetch_max_and_skips_sparse_or_unwritable() {
         use windows_sys::Win32::System::Memory::{

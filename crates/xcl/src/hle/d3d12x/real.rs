@@ -3843,6 +3843,29 @@ fn skip_kind(kind: &str) -> bool {
 /// record hash of the console CS of each translated compute pipeline (`note_dispatch_record`)
 static PSO_RECORD: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
+/// `note_dispatch_record`'s 2 s window: (window, record → dispatches)
+static WIN: Mutex<Option<(u64, HashMap<u64, u32>)>> = Mutex::new(None);
+static T0: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// The record hash of the console CS of a translated compute pipeline (`submit_diag`).
+pub fn pso_record_of(pso: usize) -> Option<u64> {
+    PSO_RECORD.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+/// `XCL_LOG_DISPATCH_PSOS=1`: log the window being counted now (on a GPU wait timeout or a
+/// device removal) instead of when the next one begins.
+pub fn flush_dispatch_records() {
+    let mut g = WIN.lock().unwrap();
+    let Some((cur, m)) = g.as_mut() else { return };
+    if m.is_empty() {
+        return;
+    }
+    let mut v: Vec<_> = m.drain().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let list: Vec<String> = v.iter().map(|(r, n)| format!("{r:016x}x{n}")).collect();
+    crate::xlog_info!("D3D12.X: dispatched compute programs (window {}, flushed): {}", *cur, list.join(" "));
+}
+
 /// Debugging (`XCL_LOG_DISPATCH_PSOS=1`): per 2 s, the record hashes of the dispatched compute
 /// programs with their counts.
 pub fn note_dispatch_record(pso: usize) {
@@ -3850,8 +3873,6 @@ pub fn note_dispatch_record(pso: usize) {
     if !*ON.get_or_init(|| std::env::var("XCL_LOG_DISPATCH_PSOS").is_ok_and(|v| v.trim() == "1")) {
         return;
     }
-    static WIN: Mutex<Option<(u64, HashMap<u64, u32>)>> = Mutex::new(None);
-    static T0: OnceLock<std::time::Instant> = OnceLock::new();
     let rec = PSO_RECORD.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied()).unwrap_or(0);
     let w = T0.get_or_init(std::time::Instant::now).elapsed().as_secs() / 2;
     let mut g = WIN.lock().unwrap();
@@ -5716,6 +5737,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
+        super::submit_diag::submitted(this, chunk, super::list_x::write64_signals_of);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
@@ -5835,6 +5857,8 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    flush_dispatch_records();
+    super::submit_diag::dump("device removed");
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
