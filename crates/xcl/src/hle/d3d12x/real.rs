@@ -3799,7 +3799,65 @@ mod big_compile_tests {
 }
 
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
+    let skip = crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>())
+        && shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS).is_some_and(|cs| heap_windows_skipped(crate::gpu::shader::fnv64(cs)));
+    if skip {
+        return crate::gpu::recomp::pso::in_switch_form(|| with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv)));
+    }
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
+}
+
+/// Debugging (`XCL_HEAP_WINDOWS_SKIP`): compute programs translated in the switch form while the
+/// rest take the windows from the heap. A comma list of record hashes (hex) and `lo-hi` ranges.
+fn heap_windows_skipped(record: u64) -> bool {
+    static SPEC: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        let v = std::env::var("XCL_HEAP_WINDOWS_SKIP").unwrap_or_default();
+        let hex = |t: &str| u64::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok();
+        let r: Vec<(u64, u64)> = v
+            .split(',')
+            .filter(|t| !t.trim().is_empty())
+            .filter_map(|t| match t.split_once('-') {
+                Some((a, b)) => Some((hex(a)?, hex(b)?)),
+                None => hex(t).map(|h| (h, h)),
+            })
+            .collect();
+        if !r.is_empty() {
+            crate::xlog_info!("D3D12.X: XCL_HEAP_WINDOWS_SKIP: {} entries", r.len());
+        }
+        r
+    });
+    let hit = spec.iter().any(|&(a, b)| (a..=b).contains(&record));
+    if hit {
+        crate::xlog_info!("D3D12.X: compute program {record:016x} in the switch form (XCL_HEAP_WINDOWS_SKIP)");
+    }
+    hit
+}
+
+/// record hash of the console CS of each translated compute pipeline (`note_dispatch_record`)
+static PSO_RECORD: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// Debugging (`XCL_LOG_DISPATCH_PSOS=1`): per 2 s, the record hashes of the dispatched compute
+/// programs with their counts.
+pub fn note_dispatch_record(pso: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_LOG_DISPATCH_PSOS").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    static WIN: Mutex<Option<(u64, HashMap<u64, u32>)>> = Mutex::new(None);
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    let rec = PSO_RECORD.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied()).unwrap_or(0);
+    let w = T0.get_or_init(std::time::Instant::now).elapsed().as_secs() / 2;
+    let mut g = WIN.lock().unwrap();
+    let (cur, m) = g.get_or_insert_with(|| (w, HashMap::new()));
+    if *cur != w {
+        let mut v: Vec<_> = m.drain().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        let list: Vec<String> = v.iter().map(|(r, n)| format!("{r:016x}x{n}")).collect();
+        crate::xlog_info!("D3D12.X: dispatched compute programs (window {}): {}", *cur, list.join(" "));
+        *cur = w;
+    }
+    *m.entry(rec).or_insert(0) += 1;
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
@@ -3894,6 +3952,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
+    PSO_RECORD.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, record);
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
