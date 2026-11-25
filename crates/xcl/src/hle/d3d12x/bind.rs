@@ -939,7 +939,23 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
+    dispatch_barrier(list);
     Ok(())
+}
+
+/// Debugging (`XCL_HEAP_WINDOWS_DISPATCH_BARRIER=1`, with heap windows): a global UAV barrier
+/// after every translated dispatch – whether the driver orders dispatches whose window accesses
+/// go through the heap as it does those through root UAVs.
+pub(super) unsafe fn dispatch_barrier(list: &ID3D12GraphicsCommandList) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::gpu::recomp::pso::heap_windows() && std::env::var("XCL_HEAP_WINDOWS_DISPATCH_BARRIER").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
+    }]);
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
