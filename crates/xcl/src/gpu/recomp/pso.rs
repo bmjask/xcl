@@ -284,9 +284,10 @@ mod translated {
                 crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
             );
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
-            let id = match (super::heap_window_knobs(), super::clamp_heap_window_index()) {
-                ((true, false), true) => id,
-                ((c, u), k) => identity_for(&id.to_string(), &format!("xcl-heap-window-knobs-{c}-{u}-{k}")),
+            let budget = crate::gpu::dxil::lower::loop_budget();
+            let id = match (super::heap_window_knobs(), super::clamp_heap_window_index(), budget == crate::gpu::dxil::lower::LOOP_BUDGET) {
+                ((true, false), true, true) => id,
+                ((c, u), k, _) => identity_for(&id.to_string(), &format!("xcl-heap-window-knobs-{c}-{u}-{k}-{budget}")),
             };
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))

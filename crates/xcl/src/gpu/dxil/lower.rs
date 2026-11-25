@@ -32,6 +32,13 @@ pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
+/// `LOOP_BUDGET`, or `XCL_LOOP_BUDGET=<n>` (debugging: how long a lane may spin on memory
+/// another wave or dispatch writes; part of the translation cache identity, `pso::identity`).
+pub fn loop_budget() -> u32 {
+    static B: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("XCL_LOOP_BUDGET").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(LOOP_BUDGET))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dst {
     V(u64),
@@ -77,7 +84,7 @@ pub struct Init {
 impl Init {
     pub fn load(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
-            return s.m.i32c(LOOP_BUDGET);
+            return s.m.i32c(loop_budget());
         }
         if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
             return s.m.i32c(0);
