@@ -3834,6 +3834,12 @@ fn heap_windows_skipped(record: u64) -> bool {
     hit
 }
 
+/// Debugging (`XCL_HEAP_WINDOWS_SKIP_KINDS=graphics,mesh`): those pipelines in the switch form.
+fn skip_kind(kind: &str) -> bool {
+    static K: OnceLock<String> = OnceLock::new();
+    K.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS_SKIP_KINDS").unwrap_or_default()).split(',').any(|k| k.trim() == kind)
+}
+
 /// record hash of the console CS of each translated compute pipeline (`note_dispatch_record`)
 static PSO_RECORD: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
@@ -4213,6 +4219,9 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    if skip_kind("graphics") {
+        return crate::gpu::recomp::pso::in_switch_form(|| with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv)));
+    }
     with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
 }
 
@@ -4863,6 +4872,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    if skip_kind("mesh") {
+        return crate::gpu::recomp::pso::in_switch_form(|| with_switch_fallback(|| translated_mesh_stream_once(this, desc, riid, ppv)));
+    }
     with_switch_fallback(|| translated_mesh_stream_once(this, desc, riid, ppv))
 }
 
