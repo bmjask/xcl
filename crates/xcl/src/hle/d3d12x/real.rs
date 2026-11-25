@@ -5733,14 +5733,27 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+    let submit = |chunk: &[*mut c_void]| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::list_x::dispatches_submitted(chunk);
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::submit_diag::submitted(this, chunk, super::list_x::write64_signals_of);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
+    };
+    super::list_x::execute_with_waits_on(this, &mapped, |batch| {
+        // (`XCL_DISPATCH_BUDGET_SEPARATE=1`: one ExecuteCommandLists a list, each with its own
+        // bookkeeping and Write64 fences right after it)
+        if super::list_x::submit_separately() && batch.len() > 1 {
+            super::list_x::note_separate_submit(batch.len());
+            for one in batch.chunks(1) {
+                submit(one);
+            }
+        } else {
+            submit(batch);
+        }
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);

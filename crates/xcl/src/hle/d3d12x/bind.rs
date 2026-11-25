@@ -103,6 +103,16 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
+#[cfg(test)]
+pub(super) fn bound_pso_for_test(list: *mut c_void) -> usize {
+    with(list, |s| s.pso)
+}
+
+#[cfg(test)]
+pub(super) fn set_pso_for_test(list: *mut c_void, pso: usize) {
+    with(list, |s| s.pso = pso);
+}
+
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
@@ -821,6 +831,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             count(DISPATCHES);
             super::real::note_dispatch_record(pso);
             super::submit_diag::note(this, super::submit_diag::Kind::Dispatch, pso);
+            let _ = super::list_x::after_dispatch(this);
         }
         Err(e) => {
             count(DISPATCHES_SKIPPED);

@@ -2491,11 +2491,120 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
 /// and `execute_with_waits_on` submits `seg_0` + emits `queue.Signal` for its `Write64`s BEFORE
 /// emitting `queue.Wait` for `seg_1`'s `Wait64`, preserving exact Xbox chronological order with
 /// zero artificial GPU cycles.
+/// Experimental (`XCL_DISPATCH_BUDGET=<n>`, default off): after every `n` translated dispatches
+/// a title list goes on in a new PC segment (`split_segment`, as the mid-list Wait split), with
+/// a global UAV barrier first, so no single PC list holds thousands of dispatches. A `Write64`
+/// stays with the segment it was recorded in (its fence is signalled right after that segment).
+/// Separate `ExecuteCommandLists` calls are a knob of their own (`submit_separately`).
+pub(super) fn dispatch_budget() -> usize {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let n = std::env::var("XCL_DISPATCH_BUDGET").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        DISPATCH_BUDGET.store(n, Ordering::Relaxed);
+    });
+    DISPATCH_BUDGET.load(Ordering::Relaxed)
+}
+
+static DISPATCH_BUDGET: AtomicUsize = AtomicUsize::new(0);
+
+/// Experimental (`XCL_DISPATCH_BUDGET_SEPARATE=1`, its own knob): the lists of a batch are
+/// submitted one `ExecuteCommandLists` each.
+pub(super) fn submit_separately() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DISPATCH_BUDGET_SEPARATE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A batch of `n` lists went to the queue one `ExecuteCommandLists` each.
+pub(super) fn note_separate_submit(n: usize) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 4 || k.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: {n} lists submitted one ExecuteCommandLists each (XCL_DISPATCH_BUDGET_SEPARATE, #{k})");
+    }
+}
+
+static DISPATCHES_IN_SEGMENT: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// Whether `list`'s segment reached `budget` with one more dispatch (its count then restarts).
+fn dispatch_budget_due(list: *mut c_void, budget: usize) -> bool {
+    let mut g = DISPATCHES_IN_SEGMENT.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    let c = m.entry(list as usize).or_insert(0);
+    *c += 1;
+    if *c >= budget {
+        m.remove(&(list as usize));
+        return true;
+    }
+    false
+}
+
+/// A translated dispatch was recorded into `list`: at `dispatch_budget` of them the next
+/// commands go to a new segment, returned (None: no split).
+pub(super) unsafe fn after_dispatch(list: *mut c_void) -> Option<*mut c_void> {
+    after_dispatch_with_budget(list, dispatch_budget())
+}
+
+/// `after_dispatch` with the budget `n` (0: off).
+unsafe fn after_dispatch_with_budget(list: *mut c_void, n: usize) -> Option<*mut c_void> {
+    if n == 0 || !dispatch_budget_due(list, n) {
+        return None;
+    }
+    let Some(next) = split_segment(list) else {
+        static FULL: AtomicU64 = AtomicU64::new(0);
+        if once(&FULL, 8) {
+            crate::xlog_warn!("D3D12.X: XCL_DISPATCH_BUDGET: no further split of list {:#x} (segments exhausted or not a title list) - it goes on in this segment", list as usize);
+        }
+        return None;
+    };
+    if list_type(next) != D3D12_COMMAND_LIST_TYPE_COPY {
+        let b = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }) },
+        };
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(next, PC_RESOURCE_BARRIER)(next, 1, &b);
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 4 || k.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: command list split after {n} dispatches (XCL_DISPATCH_BUDGET, #{k})");
+    }
+    Some(next)
+}
+
+/// The lists were submitted: their dispatch counts start again.
+pub(super) fn dispatches_submitted(lists: &[*mut c_void]) {
+    if dispatch_budget() == 0 {
+        return;
+    }
+    if let Some(m) = DISPATCHES_IN_SEGMENT.lock().unwrap().as_mut() {
+        for l in lists {
+            m.remove(&(*l as usize));
+        }
+    }
+}
+
 unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var("XCL_SPLIT_MIDLIST_WAIT").map_or(true, |v| v.trim() != "0")) {
         return None;
     }
+    let next = split_segment(list)?;
+    let ty = list_type(next);
+    static SPLITS: AtomicU64 = AtomicU64::new(0);
+    let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || (n.is_power_of_two() && n <= 256) {
+        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", ty.0);
+    }
+    Some(next)
+}
+
+/// Close `list`'s current PC segment and go on recording in a new one of its `title_list`
+/// wrapper - allocator, ABI state (`bind::inherit_for_split`), bindings, PSO, depth state,
+/// predication, written ranges carried over - the segments submitted in order
+/// (`title_list::push_segments`). None: not a title list, a bundle, or no segment left
+/// (`title_list::MAX_EXTRA_SEGMENTS`). The mid-list Wait split and `XCL_DISPATCH_BUDGET` use it.
+unsafe fn split_segment(list: *mut c_void) -> Option<*mut c_void> {
     let wrapper = super::title_list::wrapper_of(list)?;
     if !super::title_list::can_split(wrapper) {
         return None;
@@ -2672,11 +2781,6 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     }
 
     super::title_list::activate_segment(wrapper, list, next_pc);
-    static SPLITS: AtomicU64 = AtomicU64::new(0);
-    let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 4 || (n.is_power_of_two() && n <= 256) {
-        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", ty.0);
-    }
     Some(next_pc)
 }
 
@@ -6380,6 +6484,75 @@ mod tests {
     /// Without deferred mid-list splitting, hoisting Wait64(cell_B) ahead of Write64(cell_A) creates
     /// a 2-queue deadlock cycle every frame. With deferred splitting, O_c expands into `[pc_c0, pc_c1]`,
     /// completes on GPU with ZERO CPU cycle breaks, and reuses `pc_c1` from the spare pool on Reset.
+    #[test]
+    fn dispatch_budget_counts_per_list_and_restarts() {
+        let (a, b) = (0x5150_0001usize as *mut c_void, 0x5150_0002usize as *mut c_void);
+        assert!(!dispatch_budget_due(a, 3));
+        assert!(!dispatch_budget_due(a, 3));
+        assert!(!dispatch_budget_due(b, 3), "another list counts on its own");
+        assert!(dispatch_budget_due(a, 3), "the third dispatch reaches the budget");
+        assert!(!dispatch_budget_due(a, 3), "the count restarts after it");
+        if let Some(m) = DISPATCHES_IN_SEGMENT.lock().unwrap().as_mut() {
+            m.remove(&(a as usize));
+            m.remove(&(b as usize));
+        }
+    }
+
+    /// `XCL_DISPATCH_BUDGET`: a title list splits into a new segment at the budget (not before,
+    /// not when off), the continuation inherits the ABI state, and each Write64 signal stays with
+    /// the segment it was recorded in.
+    #[test]
+    fn dispatch_budget_splits_at_the_boundary_and_keeps_signals_with_their_segment() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            super::super::bind::reset(pc0, alloc.as_raw() as usize, 0);
+            let wrap = super::super::title_list::wrap(pc0);
+            let segs = || {
+                let mut v = Vec::new();
+                assert!(super::super::title_list::push_segments(wrap, &mut v));
+                v
+            };
+            for _ in 0..10 {
+                assert!(after_dispatch_with_budget(pc0, 0).is_none());
+            }
+            assert_eq!(segs().len(), 1, "no split with the budget off");
+            if let Some(m) = DISPATCHES_IN_SEGMENT.lock().unwrap().as_mut() {
+                m.remove(&(pc0 as usize));
+            }
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as u64;
+            note_write64_recorded(pc0, va, 7);
+            super::super::bind::set_pso_for_test(pc0, 0x7E57_0042);
+            for k in 1..4 {
+                assert!(after_dispatch_with_budget(pc0, 4).is_none(), "dispatch {k} of 4: under the budget");
+            }
+            assert_eq!(segs().len(), 1);
+            let next = after_dispatch_with_budget(pc0, 4).expect("the 4th dispatch splits");
+            assert_eq!(segs(), vec![pc0, next], "the continuation is the second segment, in order");
+            assert_eq!(write64_signals_of(pc0), vec![(va, 7)], "a Write64 before the split stays on its segment");
+            assert!(write64_signals_of(next).is_empty(), "the continuation starts with none");
+            note_write64_recorded(next, va, 8);
+            assert_eq!(write64_signals_of(next), vec![(va, 8)], "a Write64 after the split lands on the continuation");
+            assert_eq!(write64_signals_of(pc0), vec![(va, 7)]);
+            assert_eq!(super::super::bind::bound_pso_for_test(next), 0x7E57_0042, "the continuation inherits the bound pipeline");
+            super::super::bind::set_pso_for_test(next, 0);
+            super::super::bind::set_pso_for_test(pc0, 0);
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+        }
+    }
+
     #[test]
     fn mid_list_write64_wait64_split_avoids_cycle_and_reuses_spares() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;

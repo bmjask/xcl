@@ -613,6 +613,18 @@ pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> 
 }
 
 /// The PC list behind a console list (for ExecuteCommandLists).
+/// `f` with the console lists' lock held (as `close` holds it during a replay).
+#[cfg(test)]
+pub fn with_lists_locked_for_test<R>(f: impl FnOnce() -> R) -> R {
+    let _g = LISTS.lock().unwrap();
+    f()
+}
+
+/// Whether `pc` is the PC list a console list is replayed into (`submit_diag`).
+pub fn is_replay_list(pc: *mut c_void) -> bool {
+    LISTS.lock().unwrap().as_ref().is_some_and(|m| m.values().any(|st| st.pc == pc as usize))
+}
+
 pub fn pc_list(obj: *mut c_void) -> Option<*mut c_void> {
     if obj.is_null() || unsafe { *(obj as *const usize) } != list_vtable() {
         return None;
