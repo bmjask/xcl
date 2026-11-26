@@ -446,12 +446,32 @@ fn mark_queue_done(state: &AtomicU8) -> bool {
 
 impl Pending {
     fn note_use(&self) {
-        if super::memory_report::enabled() {
+        self.note_use_at(super::present::presents());
+    }
+
+    fn note_use_at(&self, frame: u64) {
+        if super::memory_report::enabled() || self.build.recipe.is_some() {
             let _writer = self.build.eviction_timestamp_writer();
-            self.build.last_use_frame.fetch_max(super::present::presents(), Ordering::Relaxed);
+            self.build.last_use_frame.fetch_max(frame, Ordering::Relaxed);
         }
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
+        }
+    }
+
+    /// Record use of an exactly owned resident generation. The timestamp is published before
+    /// its weak eviction identity, so a concurrent policy turn either observes the new age or
+    /// is forced to abort by final timestamp validation.
+    fn note_resident_use(&self) {
+        self.note_resident_use_on(super::present::presents(), eviction_candidates());
+    }
+
+    fn note_resident_use_on<const N: usize>(
+        &self, frame: u64, candidates: &CandidateQueue<Build, N>,
+    ) {
+        self.note_use_at(frame);
+        if self.build.recipe.is_some() {
+            note_eviction_candidate_identity_on(&self.build, candidates);
         }
     }
 }
@@ -764,6 +784,7 @@ impl HeldEvictionCandidate {
 /// Recipe-enabled binds append at most one weak identity per build. This path is reached only after
 /// the existing `XCL_PSO_REBUILD_RECIPES` gate selected generation-aware resolution; ordinary
 /// binds pay no candidate check, queue operation, registry scan, or allocation.
+#[allow(dead_code)] // exercised by policy tests; production use resumes with pressure activation
 fn note_eviction_candidate_on<const N: usize>(build: &Arc<Build>, frame: u64, candidates: &CandidateQueue<Build, N>) {
     if !build.is_evictable() {
         build.last_use_frame.fetch_max(frame, Ordering::Relaxed);
@@ -771,6 +792,18 @@ fn note_eviction_candidate_on<const N: usize>(build: &Arc<Build>, frame: u64, ca
     }
     let _writer = build.eviction_timestamp_writer();
     build.last_use_frame.fetch_max(frame, Ordering::Relaxed);
+    note_eviction_candidate_identity_on(build, candidates);
+}
+
+fn note_eviction_candidate_identity_on<const N: usize>(
+    build: &Arc<Build>, candidates: &CandidateQueue<Build, N>,
+) {
+    if !build.is_evictable() {
+        return;
+    }
+    if build.candidate_queued.load(Ordering::Acquire) {
+        return;
+    }
     if build.candidate_queued.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return;
     }
@@ -779,8 +812,8 @@ fn note_eviction_candidate_on<const N: usize>(build: &Arc<Build>, frame: u64, ca
     }
 }
 
-fn note_eviction_candidate(build: &Arc<Build>) {
-    note_eviction_candidate_on(build, super::present::presents(), eviction_candidates());
+fn note_eviction_candidate_identity(build: &Arc<Build>) {
+    note_eviction_candidate_identity_on(build, eviction_candidates());
 }
 
 fn resident_candidate(build: &Arc<Build>) -> Option<EvictionCandidate> {
@@ -6485,6 +6518,55 @@ mod used_tests {
     }
 
     #[test]
+    fn retained_ready_use_refreshes_and_journals_its_exact_old_build_once() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = completed_recipe_build(&recipe);
+        let pending = structured_pending(build.clone(), true);
+        let resolution = PipelineResolution(
+            classify_retained(0x7E57_D02A, &pending), true, UnavailableSet::Omit,
+        );
+        let replacement = structured_pending(
+            Arc::new(Build::new_keyed_kind(
+                Box::new(|| 0), false, None, None, PipelineKind::Compute,
+            )),
+            true,
+        );
+        let StructuredResolve::Ready { pending: retained, .. } = &resolution.0 else {
+            panic!("completed recipe did not retain a Ready identity")
+        };
+        assert!(Arc::ptr_eq(retained, &pending));
+        assert!(!Arc::ptr_eq(retained, &replacement));
+
+        let queue = CandidateQueue::<Build, 2>::new();
+        build.last_use_frame.store(1, Ordering::Relaxed);
+        replacement.build.last_use_frame.store(3, Ordering::Relaxed);
+        retained.note_resident_use_on(17, &queue);
+        assert_eq!(build.last_use_frame.load(Ordering::Relaxed), 17);
+        assert_eq!(replacement.build.last_use_frame.load(Ordering::Relaxed), 3,
+            "retained Ready use was redirected to a replacement identity");
+        retained.note_resident_use_on(29, &queue);
+        assert_eq!(build.last_use_frame.load(Ordering::Relaxed), 29);
+        let queued = queue.pop().unwrap().upgrade().unwrap();
+        assert!(Arc::ptr_eq(&queued, &build));
+        assert!(queue.pop().is_none(), "repeated exact use duplicated the journal identity");
+        build.candidate_queued.store(false, Ordering::Release);
+
+        let PipelineChoice::Available { raw: selected, generation } =
+            resolution.resolve_for_emission() else { panic!("retained Ready use was unavailable") };
+        assert_eq!(selected, raw);
+        assert!(build.candidate_queued.load(Ordering::Acquire),
+            "the production Ready emission path did not journal its retained build");
+
+        drop(generation); drop(queued); drop(resolution); drop(replacement); drop(pending);
+        release(build.real.swap(0, Ordering::AcqRel));
+        drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn injected_console_compute_cannot_prepare_or_commit_exact_eviction() {
         let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
         let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
@@ -9120,6 +9202,7 @@ enum ResolveMode { Lazy, Wait, ForBind }
 enum StructuredResolve<const R: usize> {
     Ready {
         original: usize,
+        pending: Arc<Pending>,
         raw: usize,
         pin: Option<NativeGeneration>,
     },
@@ -9327,6 +9410,7 @@ impl PipelineResolution {
     ) -> NativePipelineChoice {
         if let StructuredResolve::Initial { original, pending, promoted, .. } = &self.0 {
             if let Some(generation) = promoted.get() {
+                pending.note_resident_use();
                 return native_exact(generation.clone());
             }
             if pending.build.owners.load(Ordering::Acquire) == 0
@@ -9358,7 +9442,8 @@ impl PipelineResolution {
             };
         }
         match (&self.0, mode) {
-            (StructuredResolve::Ready { pin: Some(generation), .. }, _) => {
+            (StructuredResolve::Ready { pending, pin: Some(generation), .. }, _) => {
+                pending.note_resident_use();
                 native_exact(generation.clone())
             }
             (StructuredResolve::Deferred { pending, .. }, _) => {
@@ -9367,8 +9452,13 @@ impl PipelineResolution {
                 {
                     NativePipelineChoice::Unavailable
                 } else {
-                    RestorationDemand::resident(pending)
-                        .map_or(NativePipelineChoice::Unavailable, native_exact)
+                    RestorationDemand::resident(pending).map_or(
+                        NativePipelineChoice::Unavailable,
+                        |generation| {
+                            pending.note_resident_use();
+                            native_exact(generation)
+                        },
+                    )
                 }
             }
             _ => NativePipelineChoice::Unavailable,
@@ -9385,6 +9475,7 @@ impl PipelineResolution {
     ) -> IndirectPipelineChoice {
         if let StructuredResolve::Initial { original, pending, promoted, .. } = &self.0 {
             if let Some(generation) = promoted.get() {
+                pending.note_resident_use();
                 return IndirectPipelineChoice::Exact {
                     raw: generation.raw(), generation: generation.clone(),
                 };
@@ -9464,9 +9555,15 @@ impl PipelineResolution {
     /// or unavailable retained identity returns None instead of consulting its reusable address.
     pub(super) fn ready_for_reset(&self) -> Option<(usize, NativeGeneration)> {
         match &self.0 {
-            StructuredResolve::Ready { raw, pin: Some(generation), .. } => Some((*raw, generation.clone())),
-            StructuredResolve::Initial { promoted, .. } => {
-                promoted.get().map(|generation| (generation.raw(), generation.clone()))
+            StructuredResolve::Ready { pending, raw, pin: Some(generation), .. } => {
+                pending.note_resident_use();
+                Some((*raw, generation.clone()))
+            }
+            StructuredResolve::Initial { pending, promoted, .. } => {
+                promoted.get().map(|generation| {
+                    pending.note_resident_use();
+                    (generation.raw(), generation.clone())
+                })
             }
             _ => None,
         }
@@ -9478,11 +9575,13 @@ impl PipelineResolution {
     #[allow(dead_code)] // consumed by the later command-list integration stage
     pub(super) fn resolve_for_emission(&self) -> PipelineChoice {
         match &self.0 {
-            StructuredResolve::Ready { raw, pin: Some(generation), .. } => {
+            StructuredResolve::Ready { pending, raw, pin: Some(generation), .. } => {
+                pending.note_resident_use();
                 PipelineChoice::Available { raw: *raw, generation: generation.clone() }
             }
             StructuredResolve::Initial { original, pending, promoted, .. } => {
                 if let Some(generation) = promoted.get() {
+                    pending.note_resident_use();
                     return PipelineChoice::Available { raw: generation.raw(), generation: generation.clone() };
                 }
                 promote_initial_choice(promoted, resolve_retained_for_emission(*original, pending))
@@ -9497,6 +9596,7 @@ impl PipelineResolution {
                 // the coordinator's attempt owner.
                 reconcile_pipeline_restorations();
                 generation.map_or(PipelineChoice::Unavailable, |generation| {
+                    pending.note_resident_use();
                     PipelineChoice::Available { raw: generation.raw(), generation }
                 })
             }
@@ -9973,14 +10073,18 @@ fn classify_retained<const R: usize>(original: usize, pending: &Arc<Pending>) ->
     }
     let Some(recipe) = pending.build.recipe.as_ref() else {
         return match pending.build.pin_one_shot(raw) {
-            Some(pin) => StructuredResolve::Ready { original, raw, pin: Some(pin) },
+            Some(pin) => StructuredResolve::Ready {
+                original, pending: pending.clone(), raw, pin: Some(pin),
+            },
             None => StructuredResolve::initial(original, pending.clone(), fallback, false),
         };
     };
     let (pin, residency) = recipe.pin_with_residency(raw);
     match (pin, residency) {
         (Some(pin), Residency::Resident | Residency::Rebuilding) => {
-            StructuredResolve::Ready { original, raw, pin: Some(pin) }
+            StructuredResolve::Ready {
+                original, pending: pending.clone(), raw, pin: Some(pin),
+            }
         }
         (_, Residency::Failed) => match pending.build.eviction_token() {
             Some(evicted) => StructuredResolve::Deferred {
@@ -10042,7 +10146,9 @@ fn classify_structured_on<const E: usize, const R: usize>(
         }
     };
     let fallback = match snapshot() {
-        Snapshot::Ready(raw, pin) => return StructuredResolve::Ready { original, raw, pin },
+        Snapshot::Ready(raw, pin) => return StructuredResolve::Ready {
+            original, pending: pending.clone(), raw, pin,
+        },
         Snapshot::Initial(fallback, bound_unbuilt) => {
             return StructuredResolve::initial(original, pending.clone(), fallback, bound_unbuilt);
         }
@@ -10056,7 +10162,9 @@ fn classify_structured_on<const E: usize, const R: usize>(
         // Terminal reconciliation clears the token after publication. Reclassify once so that
         // race returns the new exact resident pin instead of a false missing-record failure.
         return match snapshot() {
-            Snapshot::Ready(raw, pin) => StructuredResolve::Ready { original, raw, pin },
+            Snapshot::Ready(raw, pin) => StructuredResolve::Ready {
+                original, pending: pending.clone(), raw, pin,
+            },
             Snapshot::Initial(fallback, bound_unbuilt) => {
                 StructuredResolve::initial(original, pending.clone(), fallback, bound_unbuilt)
             }
@@ -10079,7 +10187,9 @@ fn classify_structured_on<const E: usize, const R: usize>(
     // Success may publish and reconcile after the token snapshot but before this request. Its
     // exact current pin wins over the stale request's Cancelled terminal state.
     if let Snapshot::Ready(raw, pin) = snapshot() {
-        return StructuredResolve::Ready { original, raw, pin };
+        return StructuredResolve::Ready {
+            original, pending: pending.clone(), raw, pin,
+        };
     }
     match requested {
         Some(ticket) => StructuredResolve::Restoring {
@@ -10120,7 +10230,9 @@ fn resolve_and_pin_pending(pso: usize, p: &Arc<Pending>, mode: ResolveMode) -> (
 fn pin_resolved(pso: usize, p: &Pending, resolved: usize, bound_unbuilt: bool) -> (usize, Option<NativeGeneration>, bool) {
     let recipe = p.build.recipe.as_ref();
     if recipe.is_some() {
-        note_eviction_candidate(&p.build);
+        // The resolver already published this use's timestamp. Queue only the weak identity here
+        // so exact pinning does not perform a second timestamp writer round trip.
+        note_eviction_candidate_identity(&p.build);
     }
     let _done = p.build.done.lock().unwrap();
     let current = p.build.real.load(Ordering::Acquire);
