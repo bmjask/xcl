@@ -5404,7 +5404,8 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
-    let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(pso);
+    let prepared = super::bind::PreparedNativePipeline::new(pso);
+    let resolved = prepared.raw();
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
@@ -5447,8 +5448,11 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         (s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE), old_generations)
     };
     drop(old_generations);
-    record_native_generation(this as usize, generation);
-    super::bind::reset(this, alloc, pso);
+    prepared.commit(this, alloc);
+    super::dred::reset(this);
+    if pso != 0 && resolved != 0 {
+        super::dred::mark_pipeline(this, pso, resolved);
+    }
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
