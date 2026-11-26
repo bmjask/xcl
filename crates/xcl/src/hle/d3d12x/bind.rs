@@ -680,9 +680,6 @@ fn resolve_graphics_pipeline(
             super::list_x::record_native_generation(list, Some(generation));
             Some(raw)
         }
-        // One-shot pipelines have no generation pin yet. Their address-based resolver retains
-        // the legacy ABA exposure explicitly as transitional/default behavior.
-        Some(super::pso_async::PipelineChoice::Legacy) => Some(super::list_x::resolve_and_record_pipeline_wait(list, pso)),
         Some(super::pso_async::PipelineChoice::Unavailable) => None,
         None => Some(pso),
     }
@@ -1713,11 +1710,11 @@ void main(uint t : SV_GroupIndex) {
         let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
         let standin = 0x7100_4880usize;
         let list = 0x7100_4890usize;
-        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || old_raw), false, 0, None);
+        pso_async::submit_lazy(standin, false, Box::new(move || old_raw), 0);
         assert_eq!(pso_async::resolve_wait(standin), old_raw);
         let retained = pso_async::begin_pipeline_resolution(standin).unwrap();
         assert_eq!(pso_async::released(standin), old_raw);
-        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || replacement_raw), false, 0, None);
+        pso_async::submit_lazy(standin, false, Box::new(move || replacement_raw), 0);
 
         assert_eq!(resolve_graphics_pipeline(list, standin, Some(retained)), Some(old_raw));
         assert_eq!(list_x::native_generation_count_for_test(list), 1);
@@ -1739,12 +1736,12 @@ void main(uint t : SV_GroupIndex) {
         let old_raw = &mut old as *mut ResolutionPso as usize;
         let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
         let standin = 0x7100_4898usize;
-        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || old_raw), false, 0, None);
+        pso_async::submit_lazy(standin, false, Box::new(move || old_raw), 0);
         assert_eq!(pso_async::resolve_wait(standin), old_raw);
         real::register_translated_graphics_for_test(old_raw);
         set_tracked_pipeline_state(list, standin);
         assert_eq!(pso_async::released(standin), old_raw);
-        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || replacement_raw), false, 0, None);
+        pso_async::submit_lazy(standin, false, Box::new(move || replacement_raw), 0);
         STOP_ABI_LIST.store(list as usize, Ordering::Release);
 
         LAST_ABI_PSO.store(0, Ordering::Release);
@@ -1792,19 +1789,33 @@ void main(uint t : SV_GroupIndex) {
     }
 
     #[test]
-    fn graphics_resolution_preserves_legacy_and_fails_closed_when_unavailable() {
-        let legacy = 0x7100_48C0usize;
-        let legacy_real = 0x7100_48D0usize;
+    fn graphics_resolution_pins_one_shot_and_fails_closed_when_unavailable() {
+        let one_shot = 0x7100_48C0usize;
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut real = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let one_shot_real = &mut real as *mut ResolutionPso as usize;
         let calls = Arc::new(AtomicUsize::new(0));
         let build_calls = calls.clone();
-        pso_async::submit_lazy(legacy, false, Box::new(move || {
+        pso_async::submit_lazy(one_shot, false, Box::new(move || {
             build_calls.fetch_add(1, Ordering::Relaxed);
-            legacy_real
+            one_shot_real
         }), 0);
-        let retained = pso_async::begin_pipeline_resolution(legacy).unwrap();
-        assert_eq!(resolve_graphics_pipeline(0x7100_48E0, legacy, Some(retained)), Some(legacy_real));
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "Legacy must use the existing resolver once");
-        assert_eq!(pso_async::released(legacy), legacy_real);
+        let retained = pso_async::begin_pipeline_resolution(one_shot).unwrap();
+        let list = 0x7100_48E0;
+        assert_eq!(resolve_graphics_pipeline(list, one_shot, Some(retained.clone())), Some(one_shot_real));
+        assert_eq!(resolve_graphics_pipeline(list, one_shot, Some(retained)), Some(one_shot_real));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one-shot build must be consumed once");
+        assert_eq!(list_x::native_generation_count_for_test(list), 1);
+        assert_eq!(real.refs.load(Ordering::Relaxed), 2, "repeated draws retained more than one COM owner");
+        assert_eq!(pso_async::released(one_shot), one_shot_real);
+        list_x::clear_segment_state(list);
+        assert_eq!(unsafe { resolution_release(one_shot_real as *mut c_void) }, 0);
+
+        let failed = 0x7100_48E8usize;
+        pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
+        let retained = pso_async::begin_pipeline_resolution(failed).unwrap();
+        assert_eq!(resolve_graphics_pipeline(0x7100_48E9, failed, Some(retained)), None);
+        assert_eq!(pso_async::released(failed), 0);
 
         let unavailable = 0x7100_48F0usize;
         pso_async::submit_recipe_keyed(unavailable, false, pso_async::Recipe::new(|| panic!("orphan recipe ran")), false, 0, None);
@@ -2054,7 +2065,9 @@ void main(uint t : SV_GroupIndex) {
         // 1. Background compute build SUCCEEDS: real PSO R is registered in TRANSLATED_COMPUTE,
         // stand-in S is NOT. ExecuteIndirect resolves S -> R and treats it as translated.
         let standin_ok = 0x7200_0001usize;
-        let real_ok = 0x7200_0002usize;
+        let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut real_ok_pso = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let real_ok = &mut real_ok_pso as *mut ResolutionPso as usize;
         let sig_root_changing = 0x7200_00F0usize;
         note_root_changing_signature(sig_root_changing);
 
@@ -2147,10 +2160,12 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 3);
 
         forget(list_ptr);
-        let _ = pso_async::released(standin_ok);
+        let real_ok_owner = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
         real::forget_pso_for_test(standin_fail);
+        assert_eq!(real_ok_owner, real_ok);
+        assert_eq!(unsafe { resolution_release(real_ok_owner as *mut c_void) }, 0);
         assert!(!real::is_console_compute(standin_fail), "a released pipeline's address does not stay a console one");
     }
 
@@ -2309,7 +2324,9 @@ void main(uint t : SV_GroupIndex) {
         // Register a finished two-pass GS/MS PSO behind an async stand-in (registered in TWO_PASS,
         // not TRANSLATED_GRAPHICS).
         let standin_tp = 0x7250_0001usize;
-        let real_tp = 0x7250_0002usize;
+        let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut real_tp_pso = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let real_tp = &mut real_tp_pso as *mut ResolutionPso as usize;
         pso_async::submit(
             standin_tp,
             false,
@@ -2348,8 +2365,11 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
 
         forget(list_ptr);
-        let _ = pso_async::released(standin_tp);
+        list_x::clear_segment_state(list_ptr as usize);
+        let real_tp_owner = pso_async::released(standin_tp);
         real::forget_pso_for_test(real_tp);
+        assert_eq!(real_tp_owner, real_tp);
+        assert_eq!(unsafe { resolution_release(real_tp_owner as *mut c_void) }, 0);
         assert!(real::two_pass_of(real_tp).is_none());
     }
 
