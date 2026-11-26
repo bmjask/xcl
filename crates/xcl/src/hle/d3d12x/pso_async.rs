@@ -2481,7 +2481,7 @@ impl NativeGeneration {
     pub(super) fn raw(&self) -> usize { self.generation.raw }
     pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.generation, &other.generation) }
     // The owner allocation, rather than `raw`, distinguishes ABA reuse by a later generation.
-    fn identity(&self) -> usize { Arc::as_ptr(&self.generation) as usize }
+    pub(super) fn identity(&self) -> usize { Arc::as_ptr(&self.generation) as usize }
     #[allow(dead_code)]
     fn ledger_identity(&self) -> LedgerNativeGeneration {
         LedgerNativeGeneration { id: self.id(), identity: self.identity() }
