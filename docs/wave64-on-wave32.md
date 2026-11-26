@@ -224,8 +224,9 @@ wave64 VS / PS (13 210 programs; 749 – 748 PS, 1 VS – were flagged by the ol
 
 ### The form
 
-For a wave64 VS / PS with `split_wave64`, `upper_lanes.rs` follows what the console's lanes
-32..63 hold through the program, a forward data-flow pass over its control flow:
+For a wave64 VS / PS, `upper_lanes.rs` follows what the console's lanes 32..63 hold through the
+program, a forward data-flow pass over its control flow. Constants are used only in the
+`split_wave64` form; spill shadows are also used in native partial waves:
 - EXEC's upper word, with the SGPRs as words known to be 0, all ones, or anything: 0 at the
   start, 0 in every mask a VALU instruction writes while it is 0, combined by the bitwise SALU
   and saveexec forms. While it is 0 no VALU instruction writes lanes 32..63.
@@ -240,28 +241,30 @@ Each read then gets:
   which no program can depend on;
 - a constant: that constant (`uint t = c; if (!xcl_hw32) t = rla(…);`);
 - a slot: its shadow `xcl_sh<vgpr>_<lane>`, a scalar every `v_writelane` of that slot also
-  writes;
+  writes. A read uses the native lane when it was physically launched and the shadow otherwise
+  (pixel helper lanes are present as members of a live quad);
 - unknown: stays a hazard – `wave_hazards` reports only these.
 
-Spill slots < 32 are read from their shadows as well, whatever the wave size, as long as no
-other instruction has written the VGPR since the slot's `v_writelane`: in a partial wave (a
-primitive's edge) a lane that was not launched loses what `v_writelane` put there. 287 pixel
-shaders of the pack (3 540 reads) spill to lanes < 32.
+Spill slots < 32 are read directly from their shadows, as long as no other instruction has
+written the VGPR since the slot's `v_writelane`. For slots ≥ 32 the entry physical-presence mask
+selects the native lane when it exists and the shadow when it did not launch. 287 pixel shaders
+of the pack (3 540 reads) spill to lanes < 32.
 
-The wave size is checked at run time (`xcl_hw32 = WaveGetLaneCount() < 64`), so a driver that
-picks 64 lanes runs the program as before.
+The wave size is checked at run time (`xcl_hw32 = WaveGetLaneCount() < 64`) for constants. Spill
+slots additionally capture the physical lanes at entry (`ballot(true)`, or helper-inclusive
+`ballot_px(true)` for pixels).
 
-Which GPUs get the form: every GPU whose wave range includes 32 (`pso::graphics_wave32`), not
-only those without 64-lane waves. D3D12 has no `WaveSize` for graphics shaders, so the driver
+Which GPUs get the constant form: every GPU whose wave range includes 32 (`pso::graphics_wave32`),
+not only those without 64-lane waves. Spill shadows are emitted at every wave size. D3D12 has no
+`WaveSize` for graphics shaders, so the driver
 picks, and an RDNA2 driver (RX 6600 XT, issue #42) runs a wave64 PS in waves of 32 although it
 reports 32–64: without the form, `v_readlane` 32 wrapped to lane 0 there
 (`gpu_wave64_ps_whole_wave_reductions` summed twice). Compute, mesh and geometry programs set
 `[WaveSize(64)]` and still get the split form only on GPUs without 64-lane waves.
 
-On a GPU with 64-lane waves only, nothing changes: the HLSL of every program of the pack is
-identical to the one before
-(`retail_wave64_graphics_lane_forms` prints digests of the native form, and of the other modes'
-32-lane form, to compare builds).
+On a GPU with 64-lane waves only, programs with spill slots gain their shadows; other programs'
+native HLSL is unchanged (`retail_wave64_graphics_lane_forms` prints digests of the forms to
+compare builds).
 
 In the pack every read resolves: 1 082 constants, 355 unwritten, 3 740 slot reads; none is
 left unsafe. Only a program with a constant or a slot to read gets the form: the HLSL changes
@@ -280,10 +283,6 @@ operation's identity, so omitting console lanes the PC did not launch does not c
 The three-quad case that previously made min return 0 is covered by
 `gpu_wave64_ps_whole_wave_reductions`. Other whole-wave sequences that do not match this exact
 pattern can still read undefined values from lanes the PC did not launch.
-
-Spill slots of lanes that were not launched are also still lost in the native form (GPUs with
-64-lane waves, which keep the HLSL as it was), and in the 32-lane form for slots ≥ 32 when the
-driver picks 64 lanes.
 
 ## Relation to earlier work
 
