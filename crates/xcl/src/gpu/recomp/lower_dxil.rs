@@ -352,10 +352,18 @@ pub fn kernel(insts: &[Decoded], wave64: bool) -> Result<(Vec<u8>, Vec<u8>), Str
     Ok((ir.finish([lanes, 1, 1], lanes)?.dxil, stale))
 }
 
+fn refuse_split_real_lds(insts: &[Decoded]) -> Result<(), String> {
+    if insts.iter().any(crate::gpu::dxil::kernel::real_lds_access) {
+        return Err("split wave64 LDS access needs the HLSL path".into());
+    }
+    Ok(())
+}
+
 /// `kernel` in the split form: a wave64 program as two hardware wave32s (`DxilIr::split`).
 /// EXEC at launch must be the whole console wave, as the CPU interpreter and the HLSL path
 /// start it.
 pub fn kernel_split(insts: &[Decoded]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    refuse_split_real_lds(insts)?;
     let (ir, stale) = lower::lower_kernel(insts, true, DxilIr::split(insts, &Entry::Kernel))?;
     Ok((ir.finish([64, 1, 1], 32)?.dxil, stale))
 }
@@ -363,6 +371,7 @@ pub fn kernel_split(insts: &[Decoded]) -> Result<(Vec<u8>, Vec<u8>), String> {
 /// `compute` in the split form: each console wave64 as two hardware wave32s, threads numbered
 /// by arrival (`Lw::setup_lanes_compute`).
 pub fn compute_split(insts: &[Decoded], cs: &super::CsInterface) -> Result<Vec<u8>, String> {
+    refuse_split_real_lds(insts)?;
     let ir = lower::lower_compute(insts, cs, true, DxilIr::split(insts, &Entry::Compute(cs.clone())))?;
     Ok(ir.finish(cs.threads, 32)?.dxil)
 }
@@ -421,6 +430,9 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
         insts.push(d);
     }
     crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    if o.wave64 && o.split {
+        refuse_split_real_lds(&insts)?;
+    }
     // as `kernel::translate_entry`: a thread with a large stack, a panic is a refusal
     let cs = cs.clone();
     std::thread::Builder::new()
@@ -797,6 +809,31 @@ mod tests {
             let cpu = run_compute_waves(&lines, &cs, true, 2, &[100, 0], &mem);
             assert_eq!(&gpu[..128], &cpu[..128], "{threads:?}");
         }
+    }
+
+    #[test]
+    fn the_runtime_path_leaves_split_wave64_lds_to_hlsl() {
+        let bytes = crate::gpu::rdna2::encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None).unwrap();
+        let cs = compute_cs();
+        let o = |wave64, split| super::KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+
+        let e = super::compute_with(&bytes, &cs, o(true, true)).err().expect("split LDS translated");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        let insts = [crate::gpu::rdna2::decode(&bytes, 0).unwrap()];
+        let e = super::kernel_split(&insts).err().expect("split kernel LDS translated");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        let e = super::compute_split(&insts, &cs).err().expect("split compute LDS translated");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        super::compute_with(&bytes, &cs, o(true, false)).expect("native wave64 LDS");
+        super::compute_with(&bytes, &cs, o(false, false)).expect("native wave32 LDS");
+
+        let swizzle = crate::gpu::rdna2::encode(
+            "DS_SWIZZLE_B32",
+            "ENC_DS",
+            &[("VDST", 1), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 4)],
+            None,
+        ).unwrap();
+        super::compute_with(&swizzle, &cs, o(true, true)).expect("split cross-lane DS");
     }
 
     /// The f64 program of `lower`'s tests, as `f32_programs_on_the_gpu`.
