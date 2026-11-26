@@ -4281,6 +4281,131 @@ mod used_tests {
     }
 
     #[test]
+    fn initial_resolution_promotes_one_exact_generation_across_release_and_reuse() {
+        let original = 0x7E57_D019usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let build = Arc::new(Build::new(Box::new(move || raw), false));
+        let pending = structured_pending(build.clone(), false);
+        assert!(PENDING.insert(original, pending.clone()).is_none());
+        let resolution = begin_pipeline_resolution(original).expect("unfinished pipeline");
+        assert!(resolution.initial_build_pending());
+
+        let job = build.job.lock().unwrap().take().unwrap();
+        complete(&build, job());
+        let PipelineChoice::Available { generation: first, .. } = resolution.resolve_for_emission()
+            else { panic!("completed initial pipeline was unavailable") };
+        let PipelineChoice::Available { generation: second, .. } = resolution.resolve_for_emission()
+            else { panic!("promoted initial pipeline was unavailable") };
+        assert!(first.same(&second));
+        assert!(!resolution.initial_build_pending());
+        let (reset_raw, reset) = resolution.ready_for_reset().expect("promoted reset generation");
+        assert_eq!(reset_raw, raw);
+        assert!(first.same(&reset));
+        let nonblocking = resolution.0.nonblocking();
+        assert_eq!((nonblocking.raw, nonblocking.bound_unbuilt), (raw, false));
+        assert!(first.same(nonblocking.pin.as_ref().unwrap()));
+        let exact = resolution.0.wait_exact().unwrap().expect("promoted exact choice");
+        assert_eq!((exact.raw, exact.bound_unbuilt), (raw, false));
+        assert!(first.same(exact.pin.as_ref().unwrap()));
+
+        let raw_owner = released(original);
+        assert_eq!(raw_owner, raw);
+        let replacement = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), false);
+        assert!(PENDING.insert(original, replacement.clone()).is_none());
+        let PipelineChoice::Available { raw: retained_raw, generation: retained } = resolution.resolve_for_emission()
+            else { panic!("release lost the promoted exact generation") };
+        assert_eq!(retained_raw, raw);
+        assert!(first.same(&retained));
+
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement));
+        release(raw_owner);
+        drop(exact); drop(nonblocking); drop(retained); drop(reset); drop(second); drop(first);
+        drop(resolution); drop(pending); drop(build);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unavailable_initial_resolution_remains_retryable_until_exact_publication() {
+        let original = 0x7E57_D01Ausize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), true, None, Some(recipe.clone())));
+        drop(build.job.lock().unwrap().take());
+        complete(&build, 0);
+        let pending = structured_pending(build.clone(), false);
+        let resolution = PipelineResolution(classify_retained(original, &pending));
+        assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Unavailable));
+
+        let (published, replaced) = recipe.publish(raw);
+        assert!(replaced.is_none());
+        build.real.store(raw, Ordering::Release);
+        let PipelineChoice::Available { generation, .. } = resolution.resolve_for_emission()
+            else { panic!("later exact publication was hidden by an unavailable attempt") };
+        assert_eq!(generation.id(), published.id());
+        let PipelineChoice::Available { generation: cached, .. } = resolution.resolve_for_emission()
+            else { panic!("published generation was not promoted") };
+        assert!(generation.same(&cached));
+
+        drop(cached); drop(generation); drop(published); drop(resolution); drop(pending); drop(build); drop(recipe);
+        release(raw);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_initial_promotions_return_the_single_cell_winner() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first_native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut second_native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first_native as *mut RebuildFakePso as usize;
+        let second_raw = &mut second_native as *mut RebuildFakePso as usize;
+        let owner = |raw| unsafe {
+            ID3D12PipelineState::from_raw((raw as *mut RebuildFakePso).cast::<std::ffi::c_void>())
+        };
+        let first = NativeGeneration {
+            generation: Arc::new(Generation { id: 1, raw: first_raw, _owner: owner(first_raw) }),
+            recipe: Weak::new(),
+        };
+        let second = NativeGeneration {
+            generation: Arc::new(Generation { id: 2, raw: second_raw, _owner: owner(second_raw) }),
+            recipe: Weak::new(),
+        };
+        let promoted = Arc::new(OnceLock::new());
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let choices = std::thread::scope(|scope| {
+            let first_thread = {
+                let (promoted, start) = (promoted.clone(), start.clone());
+                scope.spawn(move || {
+                    start.wait();
+                    promote_initial_choice(&promoted, PipelineChoice::Available { raw: first_raw, generation: first })
+                })
+            };
+            let second_thread = {
+                let (promoted, start) = (promoted.clone(), start.clone());
+                scope.spawn(move || {
+                    start.wait();
+                    promote_initial_choice(&promoted, PipelineChoice::Available { raw: second_raw, generation: second })
+                })
+            };
+            start.wait();
+            [first_thread.join().unwrap(), second_thread.join().unwrap()]
+        });
+        let [PipelineChoice::Available { generation: first, .. }, PipelineChoice::Available { generation: second, .. }] = choices
+            else { panic!("a concurrent available choice became unavailable") };
+        assert!(first.same(&second));
+        assert!(first.same(promoted.get().unwrap()));
+        let PipelineChoice::Available { generation: after_local_failure, .. } =
+            promote_initial_choice(&promoted, PipelineChoice::Unavailable)
+            else { panic!("a local failure hid the concurrently promoted winner") };
+        assert!(first.same(&after_local_failure));
+        drop(after_local_failure); drop(second); drop(first); drop(promoted);
+        assert_eq!((first_native.refs.load(Ordering::Relaxed), second_native.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
     fn coalesced_one_shot_owners_share_one_generation_until_final_release() {
         let first_address = 0x7E57_D017usize;
         let second_address = 0x7E57_D018usize;
@@ -4484,7 +4609,7 @@ mod used_tests {
         PENDING.insert(original, replacement.clone());
 
         match outcome {
-            StructuredResolve::Initial { original: retained_original, pending, fallback, bound_unbuilt } => {
+            StructuredResolve::Initial { original: retained_original, pending, fallback, bound_unbuilt, .. } => {
                 assert_eq!((retained_original, fallback, bound_unbuilt), (original, original, true));
                 assert!(Arc::ptr_eq(&pending, &old), "address reuse redirected a retained decision");
                 assert!(!Arc::ptr_eq(&pending, &replacement));
@@ -7266,6 +7391,9 @@ enum StructuredResolve<const R: usize> {
         pending: Arc<Pending>,
         fallback: usize,
         bound_unbuilt: bool,
+        /// First exact generation successfully consumed from this retained bind. Every clone
+        /// shares the winner; unavailable attempts remain retryable.
+        promoted: Arc<OnceLock<NativeGeneration>>,
     },
     /// Exact identity retained, but no restoration was requested by this snapshot.
     Deferred {
@@ -7340,8 +7468,9 @@ impl PipelineResolution {
     /// Whether this retained bind still has an unfinished initial build. Completed and
     /// restoration states are consumed directly instead of creating another deferred segment.
     pub(super) fn initial_build_pending(&self) -> bool {
-        matches!(&self.0, StructuredResolve::Initial { pending, bound_unbuilt: true, .. }
-            if pending.build.owners.load(Ordering::Acquire) != 0
+        matches!(&self.0, StructuredResolve::Initial { pending, bound_unbuilt: true, promoted, .. }
+            if promoted.get().is_none()
+                && pending.build.owners.load(Ordering::Acquire) != 0
                 && !pending.build.orphan.load(Ordering::Acquire)
                 && !*pending.build.done.lock().unwrap())
     }
@@ -7349,8 +7478,9 @@ impl PipelineResolution {
     /// Promote this retained bind's exact initial build for a deferred submit without looking up
     /// the title address, which may already name a different pipeline generation.
     pub(super) fn need_initial_by_submit(&self) {
-        if let StructuredResolve::Initial { pending, bound_unbuilt: true, .. } = &self.0 {
-            if pending.build.owners.load(Ordering::Acquire) != 0
+        if let StructuredResolve::Initial { pending, bound_unbuilt: true, promoted, .. } = &self.0 {
+            if promoted.get().is_none()
+                && pending.build.owners.load(Ordering::Acquire) != 0
                 && !pending.build.orphan.load(Ordering::Acquire)
             {
                 need_pending_by_submit(pending);
@@ -7363,6 +7493,9 @@ impl PipelineResolution {
     pub(super) fn ready_for_reset(&self) -> Option<(usize, NativeGeneration)> {
         match &self.0 {
             StructuredResolve::Ready { raw, pin: Some(generation), .. } => Some((*raw, generation.clone())),
+            StructuredResolve::Initial { promoted, .. } => {
+                promoted.get().map(|generation| (generation.raw(), generation.clone()))
+            }
             _ => None,
         }
     }
@@ -7376,8 +7509,11 @@ impl PipelineResolution {
             StructuredResolve::Ready { raw, pin: Some(generation), .. } => {
                 PipelineChoice::Available { raw: *raw, generation: generation.clone() }
             }
-            StructuredResolve::Initial { original, pending, .. } => {
-                resolve_retained_for_emission(*original, pending)
+            StructuredResolve::Initial { original, pending, promoted, .. } => {
+                if let Some(generation) = promoted.get() {
+                    return PipelineChoice::Available { raw: generation.raw(), generation: generation.clone() };
+                }
+                promote_initial_choice(promoted, resolve_retained_for_emission(*original, pending))
             }
             StructuredResolve::Ready { pin: None, .. }
             | StructuredResolve::Deferred { .. }
@@ -7385,6 +7521,20 @@ impl PipelineResolution {
             | StructuredResolve::Terminal { .. } => PipelineChoice::Unavailable,
         }
     }
+}
+
+fn promote_initial_choice(
+    promoted: &OnceLock<NativeGeneration>,
+    choice: PipelineChoice,
+) -> PipelineChoice {
+    let PipelineChoice::Available { generation, .. } = choice else {
+        return promoted.get().map_or(PipelineChoice::Unavailable, |generation| {
+            PipelineChoice::Available { raw: generation.raw(), generation: generation.clone() }
+        });
+    };
+    let _ = promoted.set(generation);
+    let generation = promoted.get().expect("an available initial generation was not promoted").clone();
+    PipelineChoice::Available { raw: generation.raw(), generation }
 }
 
 /// Opaque fixture for the feature-gated pipeline-resolution microbenchmark. It uses the real
@@ -7555,12 +7705,7 @@ pub(super) fn pipeline_resolution_for_test(
         late: AtomicBool::new(false),
         spared: AtomicBool::new(false),
     });
-    PipelineResolution(StructuredResolve::Initial {
-        original,
-        pending,
-        fallback: original,
-        bound_unbuilt: true,
-    })
+    PipelineResolution(StructuredResolve::initial(original, pending, original, true))
 }
 
 #[cfg(test)]
@@ -7599,14 +7744,29 @@ struct StructuredResolvedPipeline {
 
 #[allow(dead_code)]
 impl<const R: usize> StructuredResolve<R> {
-    /// Never waits. An initial build or restoration returns only the retained Pending's fallback.
+    fn initial(original: usize, pending: Arc<Pending>, fallback: usize, bound_unbuilt: bool) -> Self {
+        Self::Initial {
+            original,
+            pending,
+            fallback,
+            bound_unbuilt,
+            promoted: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Never waits. An unpromoted initial build or restoration returns only its retained fallback.
     fn nonblocking(&self) -> StructuredResolvedPipeline {
         match self {
             Self::Ready { raw, pin, .. } => StructuredResolvedPipeline {
                 raw: *raw, pin: pin.clone(), bound_unbuilt: false,
             },
-            Self::Initial { fallback, bound_unbuilt, .. } => StructuredResolvedPipeline {
-                raw: *fallback, pin: None, bound_unbuilt: *bound_unbuilt,
+            Self::Initial { fallback, bound_unbuilt, promoted, .. } => match promoted.get() {
+                Some(generation) => StructuredResolvedPipeline {
+                    raw: generation.raw(), pin: Some(generation.clone()), bound_unbuilt: false,
+                },
+                None => StructuredResolvedPipeline {
+                    raw: *fallback, pin: None, bound_unbuilt: *bound_unbuilt,
+                },
             },
             Self::Deferred { fallback, .. } | Self::Restoring { fallback, .. }
             | Self::Terminal { fallback, .. } => {
@@ -7615,14 +7775,17 @@ impl<const R: usize> StructuredResolve<R> {
         }
     }
 
-    /// Wait only for an already-classified exact restoration. Initial cold-build policy remains
-    /// with the existing resolver until the later call-site integration stage.
+    /// Wait only for an already-classified exact restoration. A successfully promoted initial
+    /// choice is already exact; other initial cold-build policy remains with the existing resolver.
     fn wait_exact(&self) -> Result<Option<StructuredResolvedPipeline>, StructuredResolveFailure> {
         match self {
             Self::Ready { raw, pin, .. } => Ok(Some(StructuredResolvedPipeline {
                 raw: *raw, pin: pin.clone(), bound_unbuilt: false,
             })),
-            Self::Initial { .. } | Self::Deferred { .. } => Ok(None),
+            Self::Initial { promoted, .. } => Ok(promoted.get().map(|generation| StructuredResolvedPipeline {
+                raw: generation.raw(), pin: Some(generation.clone()), bound_unbuilt: false,
+            })),
+            Self::Deferred { .. } => Ok(None),
             Self::Restoring { ticket, .. } => ticket.wait_and_take_pin()
                 .map(|pin| Some(StructuredResolvedPipeline { raw: pin.raw(), pin: Some(pin), bound_unbuilt: false }))
                 .map_err(StructuredResolveFailure::from),
@@ -7652,16 +7815,12 @@ fn classify_retained<const R: usize>(original: usize, pending: &Arc<Pending>) ->
     let raw = pending.build.real.load(Ordering::Acquire);
     let fallback = pending.stand(original);
     if !*done {
-        return StructuredResolve::Initial {
-            original, pending: pending.clone(), fallback, bound_unbuilt: true,
-        };
+        return StructuredResolve::initial(original, pending.clone(), fallback, true);
     }
     let Some(recipe) = pending.build.recipe.as_ref() else {
         return match pending.build.pin_one_shot(raw) {
             Some(pin) => StructuredResolve::Ready { original, raw, pin: Some(pin) },
-            None => StructuredResolve::Initial {
-                original, pending: pending.clone(), fallback, bound_unbuilt: false,
-            },
+            None => StructuredResolve::initial(original, pending.clone(), fallback, false),
         };
     };
     let (pin, residency) = recipe.pin_with_residency(raw);
@@ -7669,9 +7828,7 @@ fn classify_retained<const R: usize>(original: usize, pending: &Arc<Pending>) ->
         (Some(pin), Residency::Resident | Residency::Rebuilding) => {
             StructuredResolve::Ready { original, raw, pin: Some(pin) }
         }
-        (_, Residency::Failed) => StructuredResolve::Initial {
-            original, pending: pending.clone(), fallback, bound_unbuilt: false,
-        },
+        (_, Residency::Failed) => StructuredResolve::initial(original, pending.clone(), fallback, false),
         _ => StructuredResolve::Deferred { original, pending: pending.clone(), fallback },
     }
 }
@@ -7716,9 +7873,9 @@ fn classify_structured_on<const E: usize, const R: usize>(
     };
     let fallback = match snapshot() {
         Snapshot::Ready(raw, pin) => return StructuredResolve::Ready { original, raw, pin },
-        Snapshot::Initial(fallback, bound_unbuilt) => return StructuredResolve::Initial {
-            original, pending: pending.clone(), fallback, bound_unbuilt,
-        },
+        Snapshot::Initial(fallback, bound_unbuilt) => {
+            return StructuredResolve::initial(original, pending.clone(), fallback, bound_unbuilt);
+        }
         Snapshot::Restore(fallback) => fallback,
     };
     let Some(evicted) = pending.build.eviction_token() else {
@@ -7726,9 +7883,9 @@ fn classify_structured_on<const E: usize, const R: usize>(
         // race returns the new exact resident pin instead of a false missing-record failure.
         return match snapshot() {
             Snapshot::Ready(raw, pin) => StructuredResolve::Ready { original, raw, pin },
-            Snapshot::Initial(fallback, bound_unbuilt) => StructuredResolve::Initial {
-                original, pending: pending.clone(), fallback, bound_unbuilt,
-            },
+            Snapshot::Initial(fallback, bound_unbuilt) => {
+                StructuredResolve::initial(original, pending.clone(), fallback, bound_unbuilt)
+            }
             Snapshot::Restore(fallback) => StructuredResolve::Terminal {
                 original, pending: pending.clone(), fallback,
                 failure: StructuredResolveFailure::MissingEvictionRecord,
