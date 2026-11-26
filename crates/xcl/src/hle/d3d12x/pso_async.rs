@@ -7386,6 +7386,143 @@ impl PipelineResolution {
     }
 }
 
+/// Opaque fixture for the feature-gated pipeline-resolution microbenchmark. It uses the real
+/// retained resolver with prewarmed fake COM owners, but starts no workers and calls no driver.
+#[cfg(feature = "pipeline-resolution-bench")]
+#[doc(hidden)]
+pub struct PipelineResolutionBench {
+    retained_ready: PipelineResolution,
+    initial_completed: PipelineResolution,
+    registry_original: usize,
+    registry_pending: Arc<Pending>,
+    _raw_owners: Vec<ID3D12PipelineState>,
+    _natives: Vec<Box<PipelineResolutionBenchPso>>,
+    _vtable: Box<[usize; 3]>,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+#[repr(C)]
+struct PipelineResolutionBenchPso {
+    vtable: *const usize,
+    refs: AtomicUsize,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+unsafe extern "system" fn pipeline_resolution_bench_add_ref(this: *mut std::ffi::c_void) -> u32 {
+    (*(this as *mut PipelineResolutionBenchPso)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+unsafe extern "system" fn pipeline_resolution_bench_release(this: *mut std::ffi::c_void) -> u32 {
+    (*(this as *mut PipelineResolutionBenchPso)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl PipelineResolutionBench {
+    pub fn new() -> Self {
+        let vtable = Box::new([
+            0,
+            pipeline_resolution_bench_add_ref as usize,
+            pipeline_resolution_bench_release as usize,
+        ]);
+        let mut natives = Vec::new();
+        let mut raw_owners = Vec::new();
+        let mut raws = Vec::new();
+        for _ in 0..3 {
+            let mut native = Box::new(PipelineResolutionBenchPso {
+                vtable: vtable.as_ptr(),
+                refs: AtomicUsize::new(1),
+            });
+            let raw = (&mut *native as *mut PipelineResolutionBenchPso).cast::<std::ffi::c_void>();
+            raw_owners.push(unsafe { ID3D12PipelineState::from_raw(raw) });
+            raws.push(raw as usize);
+            natives.push(native);
+        }
+
+        let make_pending = || Arc::new(Pending {
+            build: Arc::new(Build::new(Box::new(|| 0), false)),
+            driver: AtomicUsize::new(0),
+            compute: false,
+            key: 0,
+            used: AtomicBool::new(false),
+            late: AtomicBool::new(false),
+            spared: AtomicBool::new(false),
+        });
+        let finish = |pending: &Pending, raw| {
+            drop(pending.build.job.lock().unwrap().take());
+            pending.build.real.store(raw, Ordering::Release);
+            *pending.build.done.lock().unwrap() = true;
+        };
+
+        let ready_pending = make_pending();
+        finish(&ready_pending, raws[0]);
+        let retained_ready = PipelineResolution(classify_retained(raws[0] ^ 0x101, &ready_pending));
+        assert!(matches!(&retained_ready.0, StructuredResolve::Ready { .. }));
+
+        let initial_pending = make_pending();
+        let initial_completed = PipelineResolution(classify_retained(raws[1] ^ 0x202, &initial_pending));
+        assert!(matches!(&initial_completed.0, StructuredResolve::Initial { .. }));
+        finish(&initial_pending, raws[1]);
+        let _ = Self::consume(initial_completed.resolve_for_emission());
+
+        let registry_pending = make_pending();
+        finish(&registry_pending, raws[2]);
+        let registry_original = raws[2] ^ 0x404;
+        assert!(PENDING.insert(registry_original, registry_pending.clone()).is_none());
+        let registry_warm = begin_pipeline_resolution(registry_original).expect("benchmark registry fixture");
+        let _ = Self::consume(registry_warm.resolve_for_emission());
+
+        Self {
+            retained_ready,
+            initial_completed,
+            registry_original,
+            registry_pending,
+            _raw_owners: raw_owners,
+            _natives: natives,
+            _vtable: vtable,
+        }
+    }
+
+    #[inline(never)]
+    pub fn retained_ready(&self) -> usize {
+        Self::consume(self.retained_ready.resolve_for_emission())
+    }
+
+    #[inline(never)]
+    pub fn registry_ready(&self) -> usize {
+        let resolution = begin_pipeline_resolution(self.registry_original).expect("benchmark registry fixture disappeared");
+        Self::consume(resolution.resolve_for_emission())
+    }
+
+    #[inline(never)]
+    pub fn initial_completed(&self) -> usize {
+        Self::consume(self.initial_completed.resolve_for_emission())
+    }
+
+    #[inline(never)]
+    pub fn initial_completed_dispatch(&self) -> usize {
+        if self.initial_completed.initial_build_pending() {
+            return 0;
+        }
+        Self::consume(self.initial_completed.resolve_for_emission())
+    }
+
+    fn consume(choice: PipelineChoice) -> usize {
+        match choice {
+            PipelineChoice::Available { raw, generation } => raw.rotate_left(13) ^ generation.id() as usize,
+            PipelineChoice::Unavailable => panic!("benchmark pipeline became unavailable"),
+        }
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl Drop for PipelineResolutionBench {
+    fn drop(&mut self) {
+        let removed = PENDING.remove(self.registry_original).expect("benchmark registry fixture disappeared");
+        assert!(Arc::ptr_eq(&removed, &self.registry_pending));
+    }
+}
+
 #[cfg(test)]
 struct PipelineResolutionDropProbe(Option<Box<dyn FnOnce() + Send>>);
 
