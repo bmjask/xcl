@@ -9529,6 +9529,22 @@ impl PipelineResolution {
             StructuredResolve::Ready { original, .. } => (*original, 0),
         }
     }
+
+    pub(super) fn unavailable_for_test(&self) -> Self {
+        let (original, pending, fallback) = match &self.0 {
+            StructuredResolve::Initial { original, pending, fallback, .. }
+            | StructuredResolve::Deferred { original, pending, fallback, .. }
+            | StructuredResolve::Restoring { original, pending, fallback, .. }
+            | StructuredResolve::Terminal { original, pending, fallback, .. } => {
+                (*original, pending.clone(), *fallback)
+            }
+            StructuredResolve::Ready { .. } => panic!("ready resolution cannot be made unavailable"),
+        };
+        Self(StructuredResolve::Terminal {
+            original, pending, fallback,
+            failure: StructuredResolveFailure::RestorationUnavailable,
+        }, self.1)
+    }
 }
 
 #[allow(dead_code)]
@@ -9832,13 +9848,7 @@ pub(super) fn resolve_and_pin_if_enabled_identity(pso: usize) -> (usize, Option<
     (pso, None)
 }
 
-pub(super) fn resolve_wait_bound_and_pin_if_enabled(pso: usize) -> ((usize, bool), Option<NativeGeneration>) {
-    if !rebuild_recipes_enabled() {
-        return (resolve_wait_bound(pso), None);
-    }
-    resolve_wait_bound_and_pin(pso)
-}
-
+#[cfg(test)]
 fn resolve_wait_bound_and_pin(pso: usize) -> ((usize, bool), Option<NativeGeneration>) {
     let Some(p) = entry(pso) else { return ((pso, false), None) };
     p.note_use();
