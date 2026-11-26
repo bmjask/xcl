@@ -238,6 +238,9 @@ fn translate_on_this_thread(
         return Err("split wave64 LDS access needs the HLSL path".into());
     }
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    if gfx && !crate::gpu::recomp::graphics_reductions(&cfg.insts, &leaders, o.wave64).reads.is_empty() {
+        return Err("graphics whole-wave reduction needs the HLSL path".into());
+    }
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
     let uses_lds = lw.lds.is_some();
     let res = lw.res;

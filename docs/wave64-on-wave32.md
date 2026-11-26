@@ -268,24 +268,18 @@ left unsafe. Only a program with a constant or a slot to read gets the form: the
 for 613 programs (the 436 reductions and the 287 with spill slots, which overlap), all of
 which DXC compiles. Tests on the GPU: `gpu_wave64_ps_whole_wave_reductions`
 (the pack's reduction as min and as a sum, and the waterfall read, checked per hardware wave
-against a console wave of the same lanes), `gpu_wave64_ps_spill_slots` (whole target and a
+against a console wave of the same lanes and for min in a partial three-quad wave),
+`gpu_wave64_ps_spill_slots` (whole target and a
 6-pixel triangle), `gpu_wave64_vs_spill_slots_and_identity` (a wave of 3 vertices).
 
 ### What is still not exact
 
-**Lanes the PC did not launch, inside a wave** – on every GPU and wave size, and before this
-change too. The console runs whole-wave code in all 64 lanes, inactive ones included; the
-translation runs it only in the lanes the PC GPU launched. In a partial wave, the reduction's
-DPP / `v_permlanex16` steps read lanes that were never launched (undefined) instead of the
-identity the console put there – not only lanes 32..63. The lanes ≥ 32 of a 32-lane wave are
-handled above because they are all missing and all hold the identity; a lane missing among
-launched ones holds a partial result that the translation does not have. Making that exact
-needs the reduction recognised as a whole (`WaveActiveMin` / `Max` / `BitOr` over the
-launched lanes, with the identity for the lanes outside the mask) – not done. Measured on an
-RTX 5070 Ti (the reduction of `gpu_wave64_ps_whole_wave_reductions` drawn as a 3-quad
-triangle, lanes 12..31 not launched): those lanes read 0, so a min reduction (identity -1)
-gives 0, while max / or / sum (identity 0) and the waterfall read are right. 325 of the 436
-reduction programs have a min reduction (322 a max, 433 an or).
+The compiler's exact min/max/and/or whole-wave reduction pattern is recognised as a whole and
+rebuilt with a wave operation over the launched lanes. Lanes outside its saved mask hold the
+operation's identity, so omitting console lanes the PC did not launch does not change the result.
+The three-quad case that previously made min return 0 is covered by
+`gpu_wave64_ps_whole_wave_reductions`. Other whole-wave sequences that do not match this exact
+pattern can still read undefined values from lanes the PC did not launch.
 
 Spill slots of lanes that were not launched are also still lost in the native form (GPUs with
 64-lane waves, which keep the HLSL as it was), and in the 32-lane form for slots ≥ 32 when the
