@@ -909,6 +909,11 @@ pub(super) fn record_native_generation(list: usize, generation: Option<super::ps
     }
 }
 
+#[cfg(test)]
+pub(super) fn native_generation_count_for_test(list: usize) -> usize {
+    LISTS.lock().unwrap().as_ref().and_then(|lists| lists.get(&list)).map_or(0, |state| state.native_generations.len())
+}
+
 pub(super) fn resolve_and_record_pipeline(list: usize, pso: usize) -> usize {
     let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(pso);
     record_native_generation(list, generation);
