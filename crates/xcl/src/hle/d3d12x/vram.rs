@@ -1477,6 +1477,63 @@ fn wait_gates() -> &'static Mutex<HashMap<usize, Arc<Mutex<()>>>> {
     GATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// CPU time inside the residency work one `XCL_ACTIVITY` look caused. The look owns this
+/// thread-local accumulator; internal uploads on the same thread join the same sample without
+/// adding shared counters to the submission path.
+#[derive(Default)]
+pub(super) struct BeforeExecuteTiming {
+    pub gate_wait: std::time::Duration,
+    pub device: std::time::Duration,
+    pub unmap_poll: std::time::Duration,
+    pub state: std::time::Duration,
+    pub queue_wait: std::time::Duration,
+    pub retirement: std::time::Duration,
+    pub calls: usize,
+    pub mapping_waits: usize,
+    pub reclaim_passes: usize,
+    pub retirement_passes: usize,
+}
+
+thread_local! {
+    static BEFORE_EXECUTE_TIMING: std::cell::RefCell<Option<BeforeExecuteTiming>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Begin an activity look's residency measurement. Retried sparse preparation reaches this more
+/// than once, so an already-active accumulator is preserved until `take_before_execute_timing`.
+pub(super) fn begin_before_execute_timing() {
+    BEFORE_EXECUTE_TIMING.with(|timing| {
+        let mut timing = timing.borrow_mut();
+        if timing.is_none() {
+            *timing = Some(BeforeExecuteTiming::default());
+        }
+    });
+}
+
+pub(super) fn take_before_execute_timing() -> Option<BeforeExecuteTiming> {
+    BEFORE_EXECUTE_TIMING.with(|timing| timing.borrow_mut().take())
+}
+
+fn before_execute_timing_active() -> bool {
+    BEFORE_EXECUTE_TIMING.with(|timing| timing.borrow().is_some())
+}
+
+fn record_before_execute_timing(measured: BeforeExecuteTiming) {
+    BEFORE_EXECUTE_TIMING.with(|timing| {
+        let mut timing = timing.borrow_mut();
+        let Some(total) = timing.as_mut() else { return };
+        total.gate_wait += measured.gate_wait;
+        total.device += measured.device;
+        total.unmap_poll += measured.unmap_poll;
+        total.state += measured.state;
+        total.queue_wait += measured.queue_wait;
+        total.retirement += measured.retirement;
+        total.calls = total.calls.saturating_add(measured.calls);
+        total.mapping_waits = total.mapping_waits.saturating_add(measured.mapping_waits);
+        total.reclaim_passes = total.reclaim_passes.saturating_add(measured.reclaim_passes);
+        total.retirement_passes = total.retirement_passes.saturating_add(measured.retirement_passes);
+    });
+}
+
 fn reserve_page_wait(waited: &mut HashMap<usize, u64>, queue: usize, value: u64) -> bool {
     if value == 0 || waited.get(&queue).copied().unwrap_or(0) >= value {
         return false;
@@ -2306,22 +2363,51 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
 /// per second per device) retire completely empty 64 MiB VRAM pool heaps and idle arenas behind
 /// per-queue GPU fence signals across all live queues on the device.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+    let measure = before_execute_timing_active();
+    let mut measured = BeforeExecuteTiming { calls: measure as usize, ..Default::default() };
+    let gate_started = measure.then(std::time::Instant::now);
     let queue_key = queue.as_raw() as usize;
     let wait_gate = wait_gates().lock().unwrap().entry(queue_key).or_default().clone();
     let _queue_serial = wait_gate.lock().unwrap();
+    if let Some(started) = gate_started {
+        measured.gate_wait = started.elapsed();
+    }
+    let device_started = measure.then(std::time::Instant::now);
     let mut dev: Option<ID3D12Device> = None;
     if queue.GetDevice(&mut dev).is_err() {
+        if let Some(started) = device_started {
+            measured.device = started.elapsed();
+        }
+        if measure {
+            record_before_execute_timing(measured);
+        }
         return;
     }
-    let Some(dev) = dev else { return };
+    let Some(dev) = dev else {
+        if let Some(started) = device_started {
+            measured.device = started.elapsed();
+        }
+        if measure {
+            record_before_execute_timing(measured);
+        }
+        return;
+    };
+    if let Some(started) = device_started {
+        measured.device = started.elapsed();
+    }
     let dev_key = dev.as_raw() as usize;
     let now = std::time::Instant::now();
+    let poll_started = measure.then(std::time::Instant::now);
     let unmap_completions = held_unmap_completions(dev_key);
+    if let Some(started) = poll_started {
+        measured.unmap_poll = started.elapsed();
+    }
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
     let mut completed_unmaps = Vec::new();
     let mut wait = None;
+    let state_started = measure.then(std::time::Instant::now);
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -2342,17 +2428,35 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             }
         }
     }
+    if let Some(started) = state_started {
+        measured.state = started.elapsed();
+        measured.mapping_waits = wait.is_some() as usize;
+        measured.reclaim_passes = do_reclaim as usize;
+    }
+    let queue_wait_started = measure.then(std::time::Instant::now);
     if let Some((fence, value)) = wait {
         let _ = super::real::native_queue_wait(queue, &fence, value);
         super::list_x::note_internal_wait(queue_key, "texture page mappings", &fence, value);
     }
+    if let Some(started) = queue_wait_started {
+        measured.queue_wait = started.elapsed();
+    }
+    let retirement_started = measure.then(std::time::Instant::now);
     if do_reclaim {
         newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
     }
-    if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
+    let retire = do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0;
+    if retire {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
     }
     drop(completed_unmaps);
+    if let Some(started) = retirement_started {
+        measured.retirement = started.elapsed();
+        measured.retirement_passes = retire as usize;
+    }
+    if measure {
+        record_before_execute_timing(measured);
+    }
 }
 
 #[cfg(test)]
@@ -2631,6 +2735,31 @@ mod tests {
 
     fn fake_complete(receipt: &FakeReceipt) -> bool {
         receipt.fence.load(std::sync::atomic::Ordering::Relaxed) >= receipt.value
+    }
+
+    #[test]
+    fn before_execute_timing_is_one_thread_local_activity_sample() {
+        drop(take_before_execute_timing());
+        assert!(!before_execute_timing_active());
+        begin_before_execute_timing();
+        begin_before_execute_timing();
+        record_before_execute_timing(BeforeExecuteTiming {
+            gate_wait: std::time::Duration::from_micros(3),
+            calls: 1,
+            mapping_waits: 1,
+            ..Default::default()
+        });
+        record_before_execute_timing(BeforeExecuteTiming {
+            state: std::time::Duration::from_micros(7),
+            calls: 1,
+            reclaim_passes: 1,
+            ..Default::default()
+        });
+        let timing = take_before_execute_timing().unwrap();
+        assert_eq!(timing.gate_wait, std::time::Duration::from_micros(3));
+        assert_eq!(timing.state, std::time::Duration::from_micros(7));
+        assert_eq!((timing.calls, timing.mapping_waits, timing.reclaim_passes), (2, 1, 1));
+        assert!(!before_execute_timing_active());
     }
 
     #[test]

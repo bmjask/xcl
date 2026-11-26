@@ -3711,7 +3711,7 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-const LOOK_FIELDS: usize = 25;
+const LOOK_FIELDS: usize = 35;
 const ACTIVE_US: usize = 0;
 const REFRESH_WAIT_US: usize = 1;
 const WATCH_US: usize = 2;
@@ -3737,11 +3737,26 @@ const TEXTURES_VISITED: usize = 21;
 const TEXTURE_DIRTY_TESTS: usize = 22;
 const TEXTURE_MATCHES: usize = 23;
 const TEXTURES_RETAINED: usize = 24;
+const VRAM_GATE_WAIT_US: usize = 25;
+const VRAM_DEVICE_US: usize = 26;
+const VRAM_UNMAP_POLL_US: usize = 27;
+const VRAM_STATE_US: usize = 28;
+const VRAM_QUEUE_WAIT_US: usize = 29;
+const VRAM_RETIREMENT_US: usize = 30;
+const VRAM_CALLS: usize = 31;
+const VRAM_MAPPING_WAITS: usize = 32;
+const VRAM_RECLAIM_PASSES: usize = 33;
+const VRAM_RETIREMENT_PASSES: usize = 34;
 
 /// One complete `XCL_ACTIVITY` look. It is built without shared updates, then published once so
 /// the reporting thread cannot split one look across adjacent intervals.
-#[derive(Default)]
 pub(super) struct LookSample([u64; LOOK_FIELDS]);
+
+impl Default for LookSample {
+    fn default() -> Self {
+        Self([0; LOOK_FIELDS])
+    }
+}
 
 impl LookSample {
     pub(super) fn add(&mut self, field: usize, value: u64) {
@@ -3801,7 +3816,23 @@ pub(super) fn note_texture_selection(
     sample.add(TEXTURES_RETAINED, retained as u64);
 }
 
+fn note_vram_before_execute(sample: &mut LookSample, timing: super::vram::BeforeExecuteTiming) {
+    sample.add_time(VRAM_GATE_WAIT_US, timing.gate_wait);
+    sample.add_time(VRAM_DEVICE_US, timing.device);
+    sample.add_time(VRAM_UNMAP_POLL_US, timing.unmap_poll);
+    sample.add_time(VRAM_STATE_US, timing.state);
+    sample.add_time(VRAM_QUEUE_WAIT_US, timing.queue_wait);
+    sample.add_time(VRAM_RETIREMENT_US, timing.retirement);
+    sample.add(VRAM_CALLS, timing.calls as u64);
+    sample.add(VRAM_MAPPING_WAITS, timing.mapping_waits as u64);
+    sample.add(VRAM_RECLAIM_PASSES, timing.reclaim_passes as u64);
+    sample.add(VRAM_RETIREMENT_PASSES, timing.retirement_passes as u64);
+}
+
 pub(super) fn note_look(mut sample: LookSample, active: std::time::Duration, refresh_wait: std::time::Duration) {
+    if let Some(timing) = super::vram::take_before_execute_timing() {
+        note_vram_before_execute(&mut sample, timing);
+    }
     sample.add_time(ACTIVE_US, active);
     sample.add_time(REFRESH_WAIT_US, refresh_wait);
     sample.add(LOOKS, 1);
@@ -3824,12 +3855,20 @@ pub fn look_line(d: [u64; LOOK_FIELDS], secs: u64) -> String {
         runs, transfer_bytes, upload_wait, submit_gate_wait, submit_gate_hold, readback_gate_wait,
         readback_gate_hold, readback_gate_released, texture_select_wait, texture_select_hold,
         textures_visited, texture_dirty_tests, texture_matches, textures_retained,
+        vram_gate_wait, vram_device, vram_unmap_poll, vram_state, vram_queue_wait, vram_retirement,
+        vram_calls, vram_mapping_waits, vram_reclaim_passes, vram_retirement_passes,
     ] = d;
     let ms = |us: u64| us / 1000;
     let sparse = queue_wait.saturating_add(maintenance).saturating_add(scan).saturating_add(upload).saturating_add(upload_wait);
     let texture_select = texture_select_wait.saturating_add(texture_select_hold);
+    let vram = vram_gate_wait
+        .saturating_add(vram_device)
+        .saturating_add(vram_unmap_poll)
+        .saturating_add(vram_state)
+        .saturating_add(vram_queue_wait)
+        .saturating_add(vram_retirement);
     format!(
-        "looks before submits ({secs} s): {looks} looks did {} ms active work ({:.1} % of the time) after {} ms waiting for the refresh turn: write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); texture select wait/hold {}/{} ms ({textures_visited} visited, {texture_dirty_tests} dirty-tested, {texture_matches} matched, {textures_retained} retained); sparse queue wait/fence+state/scan/upload/ownership wait {}/{}/{}/{}/{} ms ({runs} runs, {:.1} MB zero/dirty bytes); upload gate submit wait/hold {}/{} ms, readback wait/hold/released wait+reacquire {}/{}/{} ms; other active work {} ms",
+        "looks before submits ({secs} s): {looks} looks did {} ms active work ({:.1} % of the time) after {} ms waiting for the refresh turn: write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); texture select wait/hold {}/{} ms ({textures_visited} visited, {texture_dirty_tests} dirty-tested, {texture_matches} matched, {textures_retained} retained); sparse queue wait/fence+state/scan/upload/ownership wait {}/{}/{}/{}/{} ms ({runs} runs, {:.1} MB zero/dirty bytes); VRAM gate/device/unmap poll/state/queue wait/retire {}/{}/{}/{}/{}/{} ms ({vram_calls} calls, {vram_mapping_waits} mapping waits, {vram_reclaim_passes} reclaim passes, {vram_retirement_passes} retirement passes); upload gate submit wait/hold {}/{} ms, readback wait/hold/released wait+reacquire {}/{}/{} ms; other active work {} ms",
         ms(active),
         active as f64 / (secs.max(1) * 10_000) as f64,
         ms(refresh_wait),
@@ -3844,12 +3883,18 @@ pub fn look_line(d: [u64; LOOK_FIELDS], secs: u64) -> String {
         ms(upload),
         ms(upload_wait),
         transfer_bytes as f64 / (1 << 20) as f64,
+        ms(vram_gate_wait),
+        ms(vram_device),
+        ms(vram_unmap_poll),
+        ms(vram_state),
+        ms(vram_queue_wait),
+        ms(vram_retirement),
         ms(submit_gate_wait),
         ms(submit_gate_hold),
         ms(readback_gate_wait),
         ms(readback_gate_hold),
         ms(readback_gate_released),
-        ms(active.saturating_sub(watch.saturating_add(sparse).saturating_add(texture_select)))
+        ms(active.saturating_sub(watch.saturating_add(sparse).saturating_add(texture_select).saturating_add(vram)))
     )
 }
 
@@ -3974,6 +4019,9 @@ unsafe fn poll_retirement_fences() -> Vec<(ID3D12Fence, u64)> {
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize, mut look: Option<&mut LookSample>) -> PreparationOutcome {
+    if look.is_some() {
+        super::vram::begin_before_execute_timing();
+    }
     let q = queue.as_raw() as usize;
     let t0 = look.is_some().then(std::time::Instant::now);
     let queue_gate = WAIT_GATES.lock().unwrap().entry(q).or_default().clone();
@@ -4342,12 +4390,23 @@ mod tests {
             8_000,
             1_200,
             1_190,
+            1_000,
+            2_000,
+            3_000,
+            4_000,
+            5_000,
+            6_000,
+            240,
+            8,
+            2,
+            1,
         ], 2);
         assert!(line.contains("240 looks did 830 ms active work (41.5 % of the time) after 120 ms waiting"), "{line}");
         assert!(line.contains("write-watch 610 ms (1641.0 MB in 69.0 ranges/look, 4800 pages written)"), "{line}");
         assert!(line.contains("texture select wait/hold 7/13 ms (24000 visited, 8000 dirty-tested, 1200 matched, 1190 retained)"), "{line}");
         assert!(line.contains("sparse queue wait/fence+state/scan/upload/ownership wait 10/30/40/40/20 ms (90 runs, 96.0 MB zero/dirty bytes)"), "{line}");
-        assert!(line.contains("upload gate submit wait/hold 5/105 ms, readback wait/hold/released wait+reacquire 3/70/12 ms; other active work 60 ms"), "{line}");
+        assert!(line.contains("VRAM gate/device/unmap poll/state/queue wait/retire 1/2/3/4/5/6 ms (240 calls, 8 mapping waits, 2 reclaim passes, 1 retirement passes)"), "{line}");
+        assert!(line.contains("upload gate submit wait/hold 5/105 ms, readback wait/hold/released wait+reacquire 3/70/12 ms; other active work 39 ms"), "{line}");
         let idle = look_line([0; LOOK_FIELDS], 2);
         assert!(idle.contains("0 looks did 0 ms active work (0.0 % of the time) after 0 ms waiting"), "{idle}");
         assert!(idle.contains("0.0 MB in 0.0 ranges/look"), "{idle}");
@@ -4371,6 +4430,24 @@ mod tests {
             10,
         );
         assert_eq!(sample.0[TEXTURE_SELECT_WAIT_US..=TEXTURES_RETAINED], [7, 13, 101, 79, 11, 10]);
+    }
+
+    #[test]
+    fn vram_metrics_keep_phases_and_counts_distinct() {
+        let mut sample = LookSample::default();
+        note_vram_before_execute(&mut sample, super::super::vram::BeforeExecuteTiming {
+            gate_wait: std::time::Duration::from_micros(1),
+            device: std::time::Duration::from_micros(2),
+            unmap_poll: std::time::Duration::from_micros(3),
+            state: std::time::Duration::from_micros(4),
+            queue_wait: std::time::Duration::from_micros(5),
+            retirement: std::time::Duration::from_micros(6),
+            calls: 7,
+            mapping_waits: 8,
+            reclaim_passes: 9,
+            retirement_passes: 10,
+        });
+        assert_eq!(sample.0[VRAM_GATE_WAIT_US..=VRAM_RETIREMENT_PASSES], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
