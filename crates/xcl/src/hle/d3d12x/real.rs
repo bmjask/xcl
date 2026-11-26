@@ -5686,6 +5686,7 @@ const COMPUTE_BLOBS_MAX: usize = 512 << 20;
 /// smaller programs compile in milliseconds: not kept
 const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
     compute_blob_key_for(dxil, rs, flags, 0)
 }
@@ -7041,6 +7042,13 @@ fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
     known_subobjects_checked(buf).0
 }
 
+fn stream_node_mask(subobjects: &[(u32, &[u8])]) -> u32 {
+    subobjects
+        .iter()
+        .find(|(ty, payload)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK.0 as u32 && payload.len() >= 4)
+        .map_or(0, |(_, payload)| u32::from_le_bytes(payload[..4].try_into().unwrap()))
+}
+
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     let b = D3D12_SHADER_BYTECODE { pShaderBytecode: u64::from_le_bytes(p[0..8].try_into().ok()?) as usize as *const c_void, BytecodeLength: u64::from_le_bytes(p[8..16].try_into().ok()?) as usize };
     shader_bytes(&b)
@@ -7149,7 +7157,7 @@ fn two_pass_driver_id(device: *mut c_void) -> Option<u64> {
 
 /// Create the mesh pipeline (RS and shaders already in the stream) and its compute pass.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], node_mask: u32, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
         return E_INVALIDARG;
     }
@@ -7239,13 +7247,14 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    cdesc.NodeMask = node_mask;
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
-    let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
+    let ckey = compute_blob_key_for(&tp.cs, rs as usize, 0, node_mask);
     let mut ccached = compute_blob(ckey);
-    let cdisk = driver_cache::path_for_root(&tp.cs, 0, false, &tp.samplers);
+    let cdisk = driver_cache::path_for_root_node(&tp.cs, 0, false, &tp.samplers, node_mask);
     let cfrom_disk = ccached.is_none();
     let mut cloaded = None;
     if cfrom_disk {
@@ -7401,7 +7410,8 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
+    let node_mask = stream_node_mask(&subs);
+    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, node_mask, "MS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
     }
@@ -7476,7 +7486,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv);
+    let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, d.NodeMask, "GS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
     }
@@ -9967,6 +9977,14 @@ mod map_tests {
     }
 
     #[test]
+    fn pipeline_stream_node_mask_defaults_and_round_trips() {
+        assert_eq!(stream_node_mask(&[]), 0);
+        let mut stream = StreamOut::default();
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &4u32);
+        assert_eq!(stream_node_mask(&stream_subobjects(&stream.0).unwrap()), 4);
+    }
+
+    #[test]
     fn stream_pipeline_projects_legacy_rasterizer_fields() {
         let console_vs = crate::gpu::xbox::tests::sample(
             1,
@@ -10391,12 +10409,12 @@ mod mesh_stream_tests {
         unsafe {
             // Case 1: driver returns S_OK but leaves *ppv == null
             let mut out: *mut c_void = std::ptr::null_mut();
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, &mut out);
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], 0, "MS", &iid, &mut out);
             assert_eq!(hr, E_INVALIDARG);
             assert!(out.is_null());
 
             // Case 2: caller passes ppv == null
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, std::ptr::null_mut());
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], 0, "MS", &iid, std::ptr::null_mut());
             assert_eq!(hr, E_INVALIDARG);
         }
     }
