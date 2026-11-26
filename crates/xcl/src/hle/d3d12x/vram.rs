@@ -1519,6 +1519,8 @@ pub(super) struct BeforeExecuteTiming {
     pub queue_wait: std::time::Duration,
     pub retirement: std::time::Duration,
     pub calls: usize,
+    pub device_cache_hits: usize,
+    pub device_queries: usize,
     pub mapping_waits: usize,
     pub reclaim_passes: usize,
     pub retirement_passes: usize,
@@ -1558,6 +1560,8 @@ fn record_before_execute_timing(measured: BeforeExecuteTiming) {
         total.queue_wait += measured.queue_wait;
         total.retirement += measured.retirement;
         total.calls = total.calls.saturating_add(measured.calls);
+        total.device_cache_hits = total.device_cache_hits.saturating_add(measured.device_cache_hits);
+        total.device_queries = total.device_queries.saturating_add(measured.device_queries);
         total.mapping_waits = total.mapping_waits.saturating_add(measured.mapping_waits);
         total.reclaim_passes = total.reclaim_passes.saturating_add(measured.reclaim_passes);
         total.retirement_passes = total.retirement_passes.saturating_add(measured.retirement_passes);
@@ -2402,6 +2406,11 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     if let Some(started) = gate_started {
         measured.gate_wait = started.elapsed();
     }
+    if measure {
+        let cached = wait_gate.device.get().is_some();
+        measured.device_cache_hits = cached as usize;
+        measured.device_queries = (!cached) as usize;
+    }
     let device_started = measure.then(std::time::Instant::now);
     let dev = wait_gate.cached_or_try_device(|| {
         let mut dev: Option<ID3D12Device> = None;
@@ -2897,19 +2906,22 @@ mod tests {
         record_before_execute_timing(BeforeExecuteTiming {
             gate_wait: std::time::Duration::from_micros(3),
             calls: 1,
+            device_cache_hits: 1,
             mapping_waits: 1,
             ..Default::default()
         });
         record_before_execute_timing(BeforeExecuteTiming {
             state: std::time::Duration::from_micros(7),
             calls: 1,
+            device_queries: 1,
             reclaim_passes: 1,
             ..Default::default()
         });
         let timing = take_before_execute_timing().unwrap();
         assert_eq!(timing.gate_wait, std::time::Duration::from_micros(3));
         assert_eq!(timing.state, std::time::Duration::from_micros(7));
-        assert_eq!((timing.calls, timing.mapping_waits, timing.reclaim_passes), (2, 1, 1));
+        assert_eq!((timing.calls, timing.device_cache_hits, timing.device_queries), (2, 1, 1));
+        assert_eq!((timing.mapping_waits, timing.reclaim_passes), (1, 1));
         assert!(!before_execute_timing_active());
     }
 
