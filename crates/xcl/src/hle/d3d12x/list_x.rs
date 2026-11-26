@@ -17,7 +17,7 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -730,6 +730,8 @@ struct ListState {
     bound_pso: usize,
     /// Recipe-backed native generations referenced by this physical recording.
     native_generations: Vec<super::pso_async::NativeGeneration>,
+    /// Allocation identities parallel to `native_generations`, for constant-time deduplication.
+    native_generation_identities: HashSet<usize>,
     /// Active `RSSetDepthBiasX` override (None = zero / disabled)
     depth_bias: Option<DepthBias>,
     /// Last depth bias sent to `ID3D12GraphicsCommandList9::RSSetDepthBias` on this PC list
@@ -813,8 +815,25 @@ enum WaitPlacement {
 }
 
 impl ListState {
-    fn pin_native_generation(&mut self, generation: super::pso_async::NativeGeneration) {
-        push_unique(&mut self.native_generations, generation, super::pso_async::NativeGeneration::same);
+    /// Keep one owner of an exact native generation in this recording. Returns a redundant
+    /// owner so callers holding `LISTS` can destroy it after releasing the registry lock.
+    fn pin_native_generation(
+        &mut self,
+        generation: super::pso_async::NativeGeneration,
+    ) -> Option<super::pso_async::NativeGeneration> {
+        if self.native_generations.last().is_some_and(|last| last.same(&generation)) {
+            return Some(generation);
+        }
+        if !self.native_generation_identities.insert(generation.identity()) {
+            return Some(generation);
+        }
+        self.native_generations.push(generation);
+        None
+    }
+
+    fn take_native_generations(&mut self) -> Vec<super::pso_async::NativeGeneration> {
+        self.native_generation_identities.clear();
+        std::mem::take(&mut self.native_generations)
     }
 
     fn note_write(&mut self, producer: WriteProducer, va: u64, size: u64) {
@@ -891,12 +910,6 @@ pub(super) fn note_shared_view_heap_use(list: *mut c_void) {
     }
 }
 
-fn push_unique<T>(items: &mut Vec<T>, item: T, same: impl Fn(&T, &T) -> bool) {
-    if !items.iter().any(|old| same(old, &item)) {
-        items.push(item);
-    }
-}
-
 fn propagate_bundle_shared_view_use(states: &mut HashMap<usize, ListState>, parent: usize, bundle: usize) {
     if states.get(&bundle).is_some_and(|state| state.uses_shared_view_heap) {
         states.entry(parent).or_default().uses_shared_view_heap = true;
@@ -905,7 +918,14 @@ fn propagate_bundle_shared_view_use(states: &mut HashMap<usize, ListState>, pare
 
 pub(super) fn record_native_generation(list: usize, generation: Option<super::pso_async::NativeGeneration>) {
     if let Some(generation) = generation {
-        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().pin_native_generation(generation);
+        let redundant = LISTS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(list)
+            .or_default()
+            .pin_native_generation(generation);
+        drop(redundant);
     }
 }
 
@@ -948,9 +968,9 @@ pub(super) fn on_execute_bundle(parent: usize, bundle: usize) {
         propagate_bundle_shared_view_use(m, parent, bundle);
     }
     let parent = m.entry(parent).or_default();
-    for pin in pins {
-        parent.pin_native_generation(pin);
-    }
+    let redundant = pins.into_iter().filter_map(|pin| parent.pin_native_generation(pin)).collect::<Vec<_>>();
+    drop(g);
+    drop(redundant);
 }
 
 pub(super) unsafe extern "system" fn execute_bundle(this: *mut c_void, bundle: *mut c_void) {
@@ -996,7 +1016,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
         uses_shared_view_heap: std::mem::take(&mut state.uses_shared_view_heap),
         write64_signals: state.clear_write64_signals(),
         cpu_writes: std::mem::take(&mut state.cpu_writes),
-        native_generations: std::mem::take(&mut state.native_generations),
+        native_generations: state.take_native_generations(),
     };
     state.written_ranges.clear();
     state.segment_write_producers.clear();
@@ -1007,27 +1027,19 @@ fn take_kickoff_effects_before_close(state: &mut ListState, has_fail_closed_stan
     (!has_fail_closed_standby).then(|| take_kickoff_effects(state))
 }
 
-fn restore_unique<T>(destination: Option<&mut Vec<T>>, pins: Vec<T>, same: impl Fn(&T, &T) -> bool) -> Result<(), Vec<T>> {
-    let Some(destination) = destination else { return Err(pins) };
-    for pin in pins {
-        push_unique(destination, pin, &same);
-    }
-    Ok(())
-}
-
 fn restore_kickoff_native_generations(list: usize, pins: Vec<super::pso_async::NativeGeneration>) {
     if pins.is_empty() {
         return;
     }
     let mut lists = LISTS.lock().unwrap();
-    let restored = restore_unique(
-        lists.as_mut().and_then(|lists| lists.get_mut(&list)).map(|state| &mut state.native_generations),
-        pins,
-        super::pso_async::NativeGeneration::same,
-    );
+    let restored = match lists.as_mut().and_then(|lists| lists.get_mut(&list)) {
+        Some(state) => Ok(pins.into_iter().filter_map(|pin| state.pin_native_generation(pin)).collect::<Vec<_>>()),
+        None => Err(pins),
+    };
     drop(lists);
-    if let Err(pins) = restored {
-        super::pso_async::poison_native_generations(pins.iter());
+    match restored {
+        Ok(redundant) => drop(redundant),
+        Err(stranded) => super::pso_async::poison_native_generations(stranded.iter()),
     }
 }
 
@@ -1566,7 +1578,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.deferred = None;
-        std::mem::take(&mut s.native_generations)
+        s.take_native_generations()
     };
     drop(old_generations);
 }
@@ -3804,7 +3816,7 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
         next_bindings.initial_pipeline()
     };
     if let Some(generation) = init_generation {
-        continuation_state.pin_native_generation(generation);
+        drop(continuation_state.pin_native_generation(generation));
     }
     let deferred_bindings = deferred.as_ref().map(|(seg, _)| super::bind::prepare_split(list, *seg, alloc));
 
@@ -4223,7 +4235,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
             s.predication = None;
             s.pred_in_state = false;
         }
-        std::mem::take(&mut s.native_generations)
+        s.take_native_generations()
     };
     drop(old_generations);
 }
@@ -4541,7 +4553,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 s.texture_writes.clear();
                 s.cpu_writes.clear();
                 s.bindings = bindings_copy;
-                std::mem::take(&mut s.native_generations)
+                s.take_native_generations()
             } else {
                 Vec::new()
             }
@@ -5298,7 +5310,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.texture_transitions.clear();
         s.uses_shared_view_heap = false;
         s.cpu_writes.clear();
-        let old_generations = std::mem::take(&mut s.native_generations);
+        let old_generations = s.take_native_generations();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -5820,7 +5832,6 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[repr(C)]
     struct ReentrantGenerationPso {
@@ -5842,6 +5853,22 @@ mod tests {
         n as u32
     }
 
+    fn test_generation(
+        standin: usize,
+    ) -> (super::super::pso_async::NativeGeneration, &'static ReentrantGenerationPso) {
+        let vtable = Box::leak(Box::new([0usize, generation_add_ref as usize, generation_release as usize]));
+        let native = Box::leak(Box::new(ReentrantGenerationPso {
+            vtable: vtable.as_ptr(), refs: AtomicUsize::new(1), release_outside_lists: std::ptr::null(),
+        }));
+        let raw = native as *mut ReentrantGenerationPso as usize;
+        super::super::pso_async::submit_lazy(standin, false, Box::new(move || raw), 0);
+        assert_eq!(super::super::pso_async::resolve_wait(standin), raw);
+        let resolution = super::super::pso_async::begin_pipeline_resolution(standin).unwrap();
+        let super::super::pso_async::PipelineChoice::Available { generation, .. } = resolution.resolve_for_emission()
+            else { panic!("completed one-shot generation unavailable") };
+        (generation, native)
+    }
+
     #[test]
     fn bundle_generations_propagate_and_final_release_runs_outside_lists() {
         let release_outside_lists = Box::leak(Box::new(AtomicBool::new(false)));
@@ -5858,9 +5885,16 @@ mod tests {
         let resolution = super::super::pso_async::begin_pipeline_resolution(standin).unwrap();
         let super::super::pso_async::PipelineChoice::Available { generation, .. } = resolution.resolve_for_emission()
             else { panic!("completed one-shot generation unavailable") };
+        record_native_generation(bundle, Some(generation.clone()));
         record_native_generation(bundle, Some(generation));
+        {
+            let g = LISTS.lock().unwrap();
+            let state = &g.as_ref().unwrap()[&bundle];
+            assert_eq!((state.native_generations.len(), state.native_generation_identities.len()), (1, 1));
+        }
         drop(resolution);
 
+        on_execute_bundle(parent, bundle);
         on_execute_bundle(parent, bundle);
         assert_eq!(native_generation_count_for_test(parent), 1, "bundle generation did not reach its parent");
         let raw_owner = super::super::pso_async::released(standin);
@@ -5929,43 +5963,39 @@ mod tests {
 
     #[test]
     fn generation_capture_deduplicates_and_survives_recording_reset() {
-        let generation = Arc::new(());
-        let mut recording = Vec::new();
-        push_unique(&mut recording, generation.clone(), Arc::ptr_eq);
-        push_unique(&mut recording, generation.clone(), Arc::ptr_eq);
-        assert_eq!(recording.len(), 1);
+        let (first, first_native) = test_generation(0x7E57_B037);
+        let (second, second_native) = test_generation(0x7E57_B038);
+        let mut state = ListState::default();
+        assert!(state.pin_native_generation(first.clone()).is_none());
+        assert!(state.pin_native_generation(first.clone()).is_some(), "last-generation fast path missed");
+        assert!(state.pin_native_generation(second.clone()).is_none());
+        assert!(state.pin_native_generation(first.clone()).is_some(), "identity index missed A/B/A duplicate");
+        assert_eq!((state.native_generations.len(), state.native_generation_identities.len()), (2, 2));
 
-        let submission_plan = recording.clone();
-        recording.clear();
-        drop(generation);
-        assert_eq!(Arc::strong_count(&submission_plan[0]), 1, "the immutable plan must own the submitted generation");
-    }
+        let submitted = state.take_native_generations();
+        assert!(state.native_generations.is_empty());
+        assert!(state.native_generation_identities.is_empty());
+        assert!(state.pin_native_generation(first.clone()).is_none(), "new recording did not accept prior identity");
+        assert_eq!((submitted.len(), state.native_generations.len()), (2, 1));
 
-    #[test]
-    fn close_failure_restores_exact_generation_carriers_or_returns_them_fail_closed() {
-        let generation = Arc::new(());
-        let mut recording = vec![generation.clone()];
-        restore_unique(
-            Some(&mut recording),
-            vec![generation.clone(), generation.clone()],
-            Arc::ptr_eq,
-        ).unwrap();
-        assert_eq!(recording.len(), 1, "restoring a retryable recording duplicated its exact generation");
-
-        let stranded = restore_unique::<Arc<()>>(None, vec![generation.clone()], Arc::ptr_eq).unwrap_err();
-        assert_eq!(stranded.len(), 1, "a missing list state dropped its fail-closed carrier");
-        assert!(Arc::ptr_eq(&stranded[0], &generation));
-    }
-
-    #[test]
-    fn bundle_snapshot_deduplicates_into_parent_recording() {
-        let generation = Arc::new(());
-        let bundle = vec![generation.clone()];
-        let mut parent = vec![generation];
-        for pin in bundle {
-            push_unique(&mut parent, pin, Arc::ptr_eq);
+        let retry = 0x7E57_B039;
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(retry, ListState::default());
+        restore_kickoff_native_generations(retry, vec![first.clone(), second.clone(), first.clone()]);
+        {
+            let g = LISTS.lock().unwrap();
+            let restored = &g.as_ref().unwrap()[&retry];
+            assert_eq!((restored.native_generations.len(), restored.native_generation_identities.len()), (2, 2));
         }
-        assert_eq!(parent.len(), 1);
+        clear_segment_state(retry);
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&retry);
+
+        drop(state);
+        drop(submitted);
+        drop(first);
+        drop(second);
+        super::super::pso_async::release(super::super::pso_async::released(0x7E57_B037));
+        super::super::pso_async::release(super::super::pso_async::released(0x7E57_B038));
+        assert_eq!((first_native.refs.load(Ordering::Relaxed), second_native.refs.load(Ordering::Relaxed)), (0, 0));
     }
 
     #[test]
