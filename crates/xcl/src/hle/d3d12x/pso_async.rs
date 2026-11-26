@@ -9847,11 +9847,13 @@ fn promote_initial_choice(
 #[doc(hidden)]
 pub struct PipelineResolutionBench {
     retained_ready: PipelineResolution,
+    retained_ready_recipe_tracked: PipelineResolution,
     initial_completed: PipelineResolution,
     initial_unpromoted_shared: PipelineResolution,
     initial_unpromoted_distinct: Vec<PipelineResolution>,
     registry_original: usize,
     registry_pending: Arc<Pending>,
+    tracked_build: Arc<Build>,
     _raw_owners: Vec<ID3D12PipelineState>,
     _natives: Vec<Box<PipelineResolutionBenchPso>>,
     _vtable: Box<[usize; 3]>,
@@ -9934,13 +9936,15 @@ impl PipelineResolutionBench {
         let mut natives = Vec::new();
         let mut raw_owners = Vec::new();
         let mut raws = Vec::new();
-        for _ in 0..3 {
+        for index in 0..4 {
             let mut native = Box::new(PipelineResolutionBenchPso {
                 vtable: vtable.as_ptr(),
                 refs: AtomicUsize::new(1),
             });
             let raw = (&mut *native as *mut PipelineResolutionBenchPso).cast::<std::ffi::c_void>();
-            raw_owners.push(unsafe { ID3D12PipelineState::from_raw(raw) });
+            if index < 3 {
+                raw_owners.push(unsafe { ID3D12PipelineState::from_raw(raw) });
+            }
             raws.push(raw as usize);
             natives.push(native);
         }
@@ -9966,6 +9970,31 @@ impl PipelineResolutionBench {
         let retained_ready = PipelineResolution(classify_retained(raws[0] ^ 0x101, &ready_pending), ready_pending.compute, UnavailableSet::Poison);
         assert!(matches!(&retained_ready.0, StructuredResolve::Ready { .. }));
 
+        let tracked_raw = raws[3];
+        let tracked_recipe = Recipe::new(move || tracked_raw);
+        let tracked_build = Arc::new(Build::new_keyed_kind(
+            tracked_recipe.initial_job(), false, None, Some(tracked_recipe), PipelineKind::Compute,
+        ));
+        let tracked_job = tracked_build.job.lock().unwrap().take().unwrap();
+        complete(&tracked_build, tracked_job());
+        let tracked_pending = Arc::new(Pending {
+            build: tracked_build.clone(),
+            driver: AtomicUsize::new(0),
+            compute: true,
+            key: 0,
+            used: AtomicBool::new(false),
+            late: AtomicBool::new(false),
+            spared: AtomicBool::new(false),
+        });
+        let retained_ready_recipe_tracked = PipelineResolution(
+            classify_retained(tracked_raw ^ 0x505, &tracked_pending),
+            tracked_pending.compute,
+            UnavailableSet::Omit,
+        );
+        assert!(matches!(&retained_ready_recipe_tracked.0, StructuredResolve::Ready { .. }));
+        let _ = Self::consume(retained_ready_recipe_tracked.resolve_for_emission());
+        assert!(tracked_build.candidate_queued.load(Ordering::Acquire));
+
         let initial_pending = make_pending();
         let initial_completed = PipelineResolution(classify_retained(raws[1] ^ 0x202, &initial_pending), initial_pending.compute, UnavailableSet::Poison);
         assert!(matches!(&initial_completed.0, StructuredResolve::Initial { .. }));
@@ -9990,11 +10019,13 @@ impl PipelineResolutionBench {
 
         Self {
             retained_ready,
+            retained_ready_recipe_tracked,
             initial_completed,
             initial_unpromoted_shared,
             initial_unpromoted_distinct,
             registry_original,
             registry_pending,
+            tracked_build,
             _raw_owners: raw_owners,
             _natives: natives,
             _vtable: vtable,
@@ -10004,6 +10035,11 @@ impl PipelineResolutionBench {
     #[inline(never)]
     pub fn retained_ready(&self) -> usize {
         Self::consume(self.retained_ready.resolve_for_emission())
+    }
+
+    #[inline(never)]
+    pub fn retained_ready_recipe_tracked(&self) -> usize {
+        Self::consume(self.retained_ready_recipe_tracked.resolve_for_emission())
     }
 
     pub(super) fn retained_resolution(&self) -> PipelineResolution {
@@ -10057,6 +10093,7 @@ impl Drop for PipelineResolutionBench {
     fn drop(&mut self) {
         let removed = PENDING.remove(self.registry_original).expect("benchmark registry fixture disappeared");
         assert!(Arc::ptr_eq(&removed, &self.registry_pending));
+        release(self.tracked_build.real.swap(0, Ordering::AcqRel));
     }
 }
 
