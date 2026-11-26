@@ -346,8 +346,15 @@ static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CPU_TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct WatchRanges {
+    ranges: Vec<(usize, usize)>,
+    wanted_bytes: usize,
+    excess_bytes: usize,
+}
+
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<WatchRanges>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -827,7 +834,16 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
+fn watched_texture_span(src: usize, bytes: u64) -> Option<(usize, usize)> {
+    let bytes = usize::try_from(bytes).ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    let end = src.checked_add(bytes)?.checked_add(0xFFF)? & !0xFFF;
+    Some((src & !0xFFF, end))
+}
+
+fn cached_watch_ranges(u: &crate::gpu::uma::Uma, measure: bool) -> Arc<WatchRanges> {
     let key = (
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
@@ -851,10 +867,14 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
         .by_res
         .values()
         .filter(|e| e.cpu_backed)
-        .map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF))
+        .filter_map(|e| watched_texture_span(e.src, e.tex.size()))
         .collect();
     wanted.extend(super::sparse::mapped_ranges());
-    let computed = Arc::new(watch_ranges(&regions, wanted));
+    let exact = measure.then(|| plan_watch_ranges(&regions, wanted.clone(), usize::MAX));
+    let ranges = watch_ranges(&regions, wanted);
+    let wanted_bytes = exact.as_ref().map_or(0, |exact| exact.iter().fold(0usize, |bytes, &(_, n)| bytes.saturating_add(n)));
+    let scanned_bytes = ranges.iter().fold(0usize, |bytes, &(_, n)| bytes.saturating_add(n));
+    let computed = Arc::new(WatchRanges { ranges, wanted_bytes, excess_bytes: scanned_bytes.saturating_sub(wanted_bytes) });
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -895,19 +915,62 @@ pub(super) unsafe fn refresh(queue: *mut c_void) -> super::sparse::PreparationOu
 /// (`page`: their size). A full `buf` goes on after the last page it reported: starting again at
 /// `base` walked the pages already reset each time (4 GiB with every page written: 105 ms a
 /// look, 47 ms going on).
-unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
-    let end = base + size;
+#[derive(Default)]
+struct WatchMeasurement {
+    calls: u64,
+    elapsed_ns: u64,
+}
+
+unsafe fn take_written(
+    base: usize,
+    size: usize,
+    buf: &mut [*mut c_void],
+    dirty: &mut Vec<usize>,
+    page: &mut u32,
+    mut measurement: Option<&mut WatchMeasurement>,
+) -> bool {
+    let Some(end) = base.checked_add(size) else { return false };
     let mut at = base;
     while at < end {
         let mut n = buf.len();
-        if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
-            break;
+        let started = measurement.as_ref().map(|_| std::time::Instant::now());
+        let result = GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page);
+        if let Some(m) = measurement.as_mut() {
+            m.calls += 1;
+            m.elapsed_ns = m.elapsed_ns.saturating_add(started.unwrap().elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        if result != 0 {
+            return false;
         }
         dirty.extend(buf[..n].iter().map(|&p| p as usize));
         if n == 0 || n < buf.len() {
             break;
         }
-        at = buf[n - 1] as usize + *page as usize;
+        let Some(next) = (buf[n - 1] as usize).checked_add(*page as usize) else { return false };
+        at = next;
+    }
+    true
+}
+
+fn note_watch_measurement(plan: &WatchRanges, measurement: &WatchMeasurement) {
+    static TOTALS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    let values = [
+        1,
+        plan.wanted_bytes as u64,
+        plan.excess_bytes as u64,
+        plan.ranges.len() as u64,
+        measurement.calls,
+        measurement.elapsed_ns,
+    ];
+    let mut totals = [0u64; 6];
+    for (i, value) in values.into_iter().enumerate() {
+        totals[i] = TOTALS[i].fetch_add(value, Ordering::Relaxed).saturating_add(value);
+    }
+    if totals[0].is_power_of_two() {
+        crate::xlog_info!(
+            "write-watch trace: {} looks, {} MB wanted + {} MB gaps, {} planned / {} actual calls, {} us in GetWriteWatch",
+            totals[0], totals[1] >> 20, totals[2] >> 20, totals[3], totals[4], totals[5] / 1000
+        );
     }
 }
 
@@ -919,8 +982,9 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
     }
     recheck_gpu_view_sources();
     let mut page = 0x1000u32;
-    let ranges = cached_watch_ranges(u);
+    let ranges = cached_watch_ranges(u, look.is_some());
     let watch_t0 = look.is_some().then(std::time::Instant::now);
+    let mut measurement = look.is_some().then(WatchMeasurement::default);
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -929,20 +993,23 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            for &(base, size) in &ranges.ranges {
+                take_written(base, size, &mut buf, &mut dirty, &mut page, measurement.as_mut());
             }
         });
         dirty.sort_unstable();
         dirty.len()
     });
+    if let Some(measurement) = &measurement {
+        note_watch_measurement(&ranges, measurement);
+    }
     if let (Some(sample), Some(watch_t0)) = (look.as_deref_mut(), watch_t0) {
         super::sparse::note_watch(
             sample,
             watch_t0.elapsed(),
             dirty_len,
-            ranges.iter().fold(0usize, |bytes, range| bytes.saturating_add(range.1)),
-            ranges.len(),
+            ranges.ranges.iter().fold(0usize, |bytes, range| bytes.saturating_add(range.1)),
+            ranges.ranges.len(),
         );
     }
     if super::present::trace_frame() {
@@ -997,7 +1064,7 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
         let (p, b) = super::present::counters();
         p.max(b)
     };
-    recheck_streamed_unwatched(&ranges, recheck_frame);
+    recheck_streamed_unwatched(&ranges.ranges, recheck_frame);
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return super::sparse::PreparationOutcome::Ready;
     }
@@ -1032,7 +1099,7 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
             })
             .collect()
     });
-    seed_stream_recheck(&todo, &ranges, recheck_frame);
+    seed_stream_recheck(&todo, &ranges.ranges, recheck_frame);
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
     super::sparse::PreparationOutcome::Ready
 }
@@ -1679,6 +1746,70 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 /// otherwise made thousands of calls per submit, without scanning up to 64 MiB of unrelated pages
 /// between ranges. Gap pages may be reported too; uploads still keep to the ranges they track.
 const WATCH_GAP: usize = 8 << 20;
+
+#[derive(Clone, Copy)]
+struct WatchSpan {
+    region: usize,
+    start: usize,
+    end: usize,
+}
+
+/// Clip `wanted` to exact overlap/adjacent spans in the disjoint allocations `regions`, then bridge
+/// the smallest gaps toward `target_calls`. This is best effort: allocations are never bridged, so
+/// the result has at least one call per touched allocation. Invalid or overflowing allocations are
+/// ignored. Production keeps using `watch_ranges` until a Windows measurement establishes a target.
+fn plan_watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>, target_calls: usize) -> Vec<(usize, usize)> {
+    wanted.sort_unstable();
+    let mut normalized = Vec::<(usize, usize)>::new();
+    for (start, end) in wanted {
+        if start >= end {
+            continue;
+        }
+        match normalized.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => normalized.push((start, end)),
+        }
+    }
+    let mut exact = Vec::<WatchSpan>::new();
+    for (region, &(base, size)) in regions.iter().enumerate() {
+        let Some(end) = base.checked_add(size).filter(|&end| end > base) else { continue };
+        let first = normalized.partition_point(|&(_, b)| b <= base);
+        for &(a, b) in normalized[first..].iter().take_while(|&&(a, _)| a < end) {
+            let (start, stop) = (a.max(base), b.min(end));
+            if start >= stop {
+                continue;
+            }
+            match exact.last_mut() {
+                Some(last) if last.region == region && start <= last.end => last.end = last.end.max(stop),
+                _ => exact.push(WatchSpan { region, start, end: stop }),
+            }
+        }
+    }
+    if exact.len() > target_calls {
+        let mut gaps: Vec<(usize, usize, usize)> = exact
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair[0].region == pair[1].region)
+            .map(|(i, pair)| (pair[1].start - pair[0].end, pair[0].start, i))
+            .collect();
+        gaps.sort_unstable();
+        let bridge_count = gaps.len().min(exact.len() - target_calls);
+        let mut bridge = vec![false; exact.len().saturating_sub(1)];
+        for &(_, _, i) in &gaps[..bridge_count] {
+            bridge[i] = true;
+        }
+        let mut coalesced = Vec::<WatchSpan>::new();
+        for (i, span) in exact.into_iter().enumerate() {
+            match coalesced.last_mut() {
+                Some(last) if bridge[i - 1] => last.end = span.end,
+                _ => coalesced.push(span),
+            }
+        }
+        exact = coalesced;
+    }
+    exact.sort_unstable_by_key(|s| (s.start, s.end));
+    exact.into_iter().map(|s| (s.start, s.end - s.start)).collect()
+}
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -3196,19 +3327,72 @@ mod tests {
             assert!(base != 0);
             let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
             let (mut dirty, mut page) = (Vec::new(), 0u32);
-            take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+            take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page, None);
             for written in [(0..PAGES).filter(|i| i % 7 != 3).collect::<Vec<_>>(), (0..128).map(|i| i * 5).collect()] {
                 let want: Vec<usize> = written.iter().map(|i| base + i * PAGE).collect();
                 for &a in &want {
                     (a as *mut u8).write_volatile(1);
                 }
                 dirty.clear();
-                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page, None);
                 assert_eq!(page as usize, PAGE);
                 assert_eq!(dirty, want, "{} pages written", want.len());
                 dirty.clear();
-                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page, None);
                 assert!(dirty.is_empty(), "the look reset what it reported");
+            }
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual Windows GetWriteWatch timing"]
+    fn benchmark_write_watch_calls_against_gap_bytes() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 0x1000;
+        const SIZE: usize = 49 << 20;
+        fn distribution(mut samples: Vec<u64>) -> (u64, u64, u64) {
+            samples.sort_unstable();
+            (samples[0], samples[samples.len() / 2], samples[samples.len() - 1])
+        }
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
+            let (mut dirty, mut page) = (Vec::with_capacity(64), 0u32);
+            assert!(take_written(base, SIZE, &mut buf, &mut dirty, &mut page, None));
+            for gap_mb in [4usize, 6, 8, 10, 16] {
+                let gap = gap_mb << 20;
+                let spans: Vec<usize> = (0..4).map(|i| base + i * (PAGE + gap)).collect();
+                let mut samples: [Vec<u64>; 4] = std::array::from_fn(|_| Vec::new());
+                for trial in 0..9 {
+                    let order = if trial % 2 == 0 { [false, true] } else { [true, false] };
+                    for merged in order {
+                        for written in [false, true] {
+                            dirty.clear();
+                            assert!(take_written(base, SIZE, &mut buf, &mut dirty, &mut page, None));
+                            dirty.clear();
+                            if written {
+                                for &at in &spans { (at as *mut u8).write_volatile(1) }
+                            }
+                            let mut measurement = WatchMeasurement::default();
+                            if merged {
+                                assert!(take_written(spans[0], spans[3] + PAGE - spans[0], &mut buf, &mut dirty, &mut page, Some(&mut measurement)));
+                                assert_eq!(measurement.calls, 1);
+                            } else {
+                                for &at in &spans {
+                                    assert!(take_written(at, PAGE, &mut buf, &mut dirty, &mut page, Some(&mut measurement)));
+                                }
+                                assert_eq!(measurement.calls, spans.len() as u64);
+                            }
+                            dirty.sort_unstable();
+                            assert_eq!(dirty, if written { spans.clone() } else { Vec::new() });
+                            samples[(merged as usize) * 2 + written as usize].push(measurement.elapsed_ns);
+                        }
+                    }
+                }
+                println!("gap {gap_mb} MiB ns min/median/max: separate clean {:?}, dirty {:?}; merged clean {:?}, dirty {:?}", distribution(samples[0].clone()), distribution(samples[1].clone()), distribution(samples[2].clone()), distribution(samples[3].clone()));
             }
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
@@ -3579,6 +3763,46 @@ mod tests {
                 let (lo, hi) = (start.max(rbase), end.min(rbase + rsize));
                 if lo < hi {
                     assert!(ranges.iter().any(|&(base, size)| base <= lo && hi <= base + size), "wanted part {lo:#x}..{hi:#x} is not covered");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn budgeted_watch_ranges_merge_exact_spans_by_smallest_gap() {
+        let regions = [(100, 100)];
+        let wanted = vec![(165, 175), (150, 160), (120, 130), (100, 110), (135, 145), (108, 120)];
+        assert_eq!(plan_watch_ranges(&regions, wanted.clone(), usize::MAX), vec![(100, 30), (135, 10), (150, 10), (165, 10)]);
+        assert_eq!(plan_watch_ranges(&regions, wanted.clone(), 3), vec![(100, 45), (150, 10), (165, 10)], "equal gaps choose the lower address");
+        assert_eq!(plan_watch_ranges(&regions, wanted.into_iter().rev().collect(), 2), vec![(100, 60), (165, 10)], "input order does not change the selected gaps");
+    }
+
+    #[test]
+    fn budgeted_watch_ranges_do_not_bridge_allocations_or_invalid_regions() {
+        let regions = [(100, 20), (120, 20), (usize::MAX - 4, 8), (200, 0)];
+        let wanted = vec![(105, 135), (usize::MAX - 3, usize::MAX), (200, 210)];
+        assert_eq!(plan_watch_ranges(&regions, wanted, 0), vec![(105, 15), (120, 15)], "zero target cannot merge two allocations");
+    }
+
+    #[test]
+    fn watched_texture_span_rejects_size_and_rounding_overflow() {
+        assert_eq!(watched_texture_span(0x1234, 1), Some((0x1000, 0x2000)));
+        assert_eq!(watched_texture_span(0x1234, 0), None);
+        assert_eq!(watched_texture_span(usize::MAX - 0xFFF, 0x1000), None);
+        assert_eq!(watched_texture_span(usize::MAX - 0x800, 1), None);
+    }
+
+    #[test]
+    fn budgeted_watch_ranges_cover_every_wanted_byte() {
+        let regions = [(20, 20), (80, 30), (45, 10)];
+        let wanted = vec![(10, 25), (24, 29), (35, 50), (52, 54), (70, 87), (90, 120)];
+        for budget in [usize::MAX, 4, 1] {
+            let planned = plan_watch_ranges(&regions, wanted.clone(), budget);
+            for &(base, size) in &regions {
+                for at in base..base + size {
+                    let wanted_here = wanted.iter().any(|&(a, b)| a <= at && at < b);
+                    let covered = planned.iter().any(|&(a, n)| a <= at && at < a + n);
+                    assert!(!wanted_here || covered, "{at} is missing with budget {budget}");
                 }
             }
         }
