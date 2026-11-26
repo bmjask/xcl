@@ -158,6 +158,96 @@ fn allocator_benches(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "texture-selection-bench")]
+fn texture_selection_benches(c: &mut Criterion) {
+    use xcl::hle::d3d12x::title_textures::{TextureSelectionBench, TextureSelectionScenario as Scenario};
+
+    let mut group = c.benchmark_group("runtime/texture_selection");
+    for entries in [1_024usize, 4_096, 16_384] {
+        for (name, scenario) in [
+            ("empty_gate", Scenario::Empty),
+            ("pending_sparse", Scenario::SparsePending),
+            ("pending_all", Scenario::AllPending),
+            ("gpu_written_all", Scenario::AllGpuWritten),
+            ("dirty_1", Scenario::OneDirty),
+            ("dirty_sparse_64", Scenario::SparseDirty),
+            ("dirty_dense_4096", Scenario::DenseDirty),
+            ("mixed_aliases", Scenario::MixedAliases),
+        ] {
+            let fixture = TextureSelectionBench::new(entries, scenario);
+            let operations = if matches!(scenario, Scenario::Empty) { 1 } else { entries };
+            group.throughput(Throughput::Elements(operations as u64));
+            group.bench_function(&format!("{name}_{entries}"), |b| {
+                b.iter(|| black_box(fixture.scan()));
+            });
+        }
+    }
+
+    const ENTRIES: usize = 4_096;
+    const BATCH: usize = 64;
+    let workers = std::thread::available_parallelism().map_or(4, |count| count.get())
+        .saturating_sub(1).clamp(2, 8);
+    group.throughput(Throughput::Elements((ENTRIES * BATCH * workers) as u64));
+    for shared in [true, false] {
+        let pool = TextureSelectionWorkers::new(ENTRIES, workers, BATCH, shared);
+        let name = if shared { "mixed_shared_lock" } else { "mixed_distinct_locks" };
+        group.bench_function(&format!("{name}_{workers}"), |b| b.iter(|| pool.run()));
+    }
+    group.finish();
+}
+
+#[cfg(feature = "texture-selection-bench")]
+struct TextureSelectionWorkers {
+    start: Arc<Barrier>,
+    done: Arc<Barrier>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+#[cfg(feature = "texture-selection-bench")]
+impl TextureSelectionWorkers {
+    fn new(entries: usize, workers: usize, batch: usize, shared: bool) -> Self {
+        use xcl::hle::d3d12x::title_textures::{TextureSelectionBench, TextureSelectionScenario};
+
+        let start = Arc::new(Barrier::new(workers + 1));
+        let done = Arc::new(Barrier::new(workers + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let common = shared.then(|| Arc::new(TextureSelectionBench::new(entries, TextureSelectionScenario::MixedAliases)));
+        let threads = (0..workers).map(|worker| {
+            let fixture = common.clone().unwrap_or_else(|| Arc::new(TextureSelectionBench::new(entries, TextureSelectionScenario::MixedAliases)));
+            let (start, done, stop) = (start.clone(), done.clone(), stop.clone());
+            std::thread::Builder::new().name(format!("texture-select-bench-{worker}")).spawn(move || loop {
+                start.wait();
+                if stop.load(Ordering::Acquire) { break }
+                let mut checksum = 0usize;
+                for _ in 0..batch {
+                    let (matches, ids) = fixture.scan();
+                    checksum = checksum.wrapping_add(matches ^ ids);
+                }
+                black_box(checksum);
+                done.wait();
+            }).expect("texture selection benchmark worker")
+        }).collect();
+        Self { start, done, stop, threads }
+    }
+
+    fn run(&self) {
+        self.start.wait();
+        self.done.wait();
+    }
+}
+
+#[cfg(feature = "texture-selection-bench")]
+impl Drop for TextureSelectionWorkers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.start.wait();
+        for thread in self.threads.drain(..) {
+            thread.join().expect("texture selection benchmark worker panicked");
+        }
+    }
+}
+
 #[cfg(feature = "pipeline-resolution-bench")]
 fn pipeline_resolution_benches(c: &mut Criterion) {
     let fixture = Arc::new(xcl::hle::d3d12x::pso_async::PipelineResolutionBench::new());
@@ -588,6 +678,8 @@ fn main() {
         manifest_and_config_benches,
         vfs_benches,
         allocator_benches,
+        #[cfg(feature = "texture-selection-bench")]
+        texture_selection_benches,
         #[cfg(feature = "pipeline-resolution-bench")]
         pipeline_resolution_benches,
         #[cfg(feature = "pipeline-resolution-bench")]
