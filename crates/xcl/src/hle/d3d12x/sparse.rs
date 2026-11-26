@@ -388,6 +388,45 @@ impl WorkClaimLedger {
     }
 }
 
+/// Point-in-time identities needed to prove that planning and a later serialized upload commit
+/// still refer to the same sparse page. `source` names the observed CPU page by chunk hash rather
+/// than retaining a raw pointer across the unlocked interval. Title writes are outside sparse
+/// state/upload exclusion, so a future commit must own or revalidate the bytes it actually copies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct UploadPageObservation {
+    page: usize,
+    pool: (u32, u32),
+    hole: bool,
+    sent: Option<[u64; CHUNKS]>,
+    source: [u64; CHUNKS],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct PlannedUploadPage {
+    page: usize,
+    tile: usize,
+    pool: (u32, u32),
+    reasons: WorkReasons,
+    zero: bool,
+    dirty: bool,
+    dirty_ranges: Vec<(usize, usize)>,
+    sent: Option<[u64; CHUNKS]>,
+    source: [u64; CHUNKS],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum UploadPlanInvalid {
+    StateGeneration,
+    MappingEpoch,
+    MissingPage,
+    Mapping,
+    SentHashes,
+    SourceHashes,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreparationOutcome {
     Ready,
