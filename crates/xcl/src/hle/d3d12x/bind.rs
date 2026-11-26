@@ -37,9 +37,6 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
-    /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
-    /// dimensions), taken by its `bind_abi`
-    limits: [u32; 3],
 }
 
 const STATE_SHARDS: usize = 64;
@@ -296,7 +293,6 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
-        s.limits = [0; 3];
         (old, std::mem::take(&mut s.uma), old_resolution)
     });
     console_list::hold_until_reset(old, blocks);
@@ -1338,9 +1334,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
             crate::xlog_info!("D3D12.X: DispatchX with flags {flags:#x}: {x}x{y}x{z} launched as {}x{}x{} groups (thread limits {limits:?})", groups[0], groups[1], groups[2]);
         }
     }
-    with(this, |s| s.limits = limits);
-    let done = translated_dispatch(this, list, bound_pso, pso, groups[0], groups[1], groups[2]);
-    with(this, |s| s.limits = [0; 3]);
+    let done = translated_dispatch(this, list, bound_pso, pso, groups[0], groups[1], groups[2], limits);
     match done {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
@@ -1466,17 +1460,76 @@ unsafe fn translated_dispatch(
     x: u32,
     y: u32,
     z: u32,
+    limits: [u32; 3],
 ) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    bind_compute_abi_resolved(this, list, original, pso)?;
-    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+    let allocator = bind_compute_abi_resolved(this, list, original, pso, limits)?;
+    super::real::dispatch_chain::dispatch(list, pso, allocator, [x, y, z])
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
+struct PreparedAbiState {
+    layout: Option<Arc<Layout>>,
+    args: Vec<u8>,
+    inline: usize,
+    table_at: usize,
+    io_at: usize,
+    res_at: usize,
+    allocator: usize,
+}
+
+fn prepare_abi_state(
+    this: *mut c_void,
+    u: &crate::gpu::uma::Uma,
+    gfx: bool,
+    user_sgprs: Option<u32>,
+) -> Result<PreparedAbiState, String> {
+    with(this, |state| {
+        let (layout, args) = if gfx {
+            (state.layout_gfx.clone(), state.args_gfx.clone())
+        } else {
+            (state.layout.clone(), state.args.clone())
+        };
+        let inline = layout
+            .as_ref()
+            .map_or(0, |layout| if gfx { layout.inline_gfx } else { console_list::inline_for(layout, user_sgprs) } as usize)
+            .min(args.len());
+        let table_at = state.arena.take(u, (args.len() - inline).max(16), 256, &mut state.uma)
+            .ok_or("unified memory is full")? as usize;
+        let io_at = state.arena.take(
+            u,
+            crate::gpu::recomp::KERNEL_SGPRS * std::mem::size_of::<u32>(),
+            256,
+            &mut state.uma,
+        ).ok_or("unified memory is full")? as usize;
+        let res_at = state.arena.take(u, 256, 256, &mut state.uma).ok_or("unified memory is full")? as usize;
+        Ok(PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator: state.allocator })
+    })
+}
+
+fn prepared_abi_io(
+    layout: Option<&Layout>, args: &[u8], table_at: usize, gfx: bool,
+    user_sgprs: Option<u32>, uma_base: usize, limits: [u32; 3],
+) -> Vec<u32> {
+    let mut io = match layout {
+        Some(layout) if gfx => console_list::user_data_gfx(layout, args, table_at as u64),
+        Some(layout) => console_list::user_data_for(layout, user_sgprs, args, table_at as u64),
+        None => vec![table_at as u32, (table_at >> 32) as u32],
+    };
+    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (uma_base >> 32) as u32;
+    if !gfx {
+        for (k, limit) in limits.into_iter().enumerate() {
+            io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = limit;
+        }
+    }
+    io
+}
+
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
     let pso = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
     bind_abi_resolved(this, list, pso, gfx)
@@ -1486,11 +1539,11 @@ unsafe fn bind_abi_with_root(
     this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
 ) -> Result<(), String> {
     let pso = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
-    bind_abi_with_root_resolved(this, list, pso, gfx, root, None)
+    bind_abi_with_root_resolved(this, list, pso, gfx, root, None, [0; 3]).map(|_| ())
 }
 
 unsafe fn bind_abi_resolved(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    bind_abi_with_root_resolved(this, list, pso, gfx, 0, None)
+    bind_abi_with_root_resolved(this, list, pso, gfx, 0, None, [0; 3]).map(|_| ())
 }
 
 unsafe fn bind_compute_abi_resolved(
@@ -1498,14 +1551,15 @@ unsafe fn bind_compute_abi_resolved(
     list: &ID3D12GraphicsCommandList,
     original: usize,
     pso: usize,
-) -> Result<(), String> {
-    bind_abi_with_root_resolved(this, list, pso, false, 0, Some(original))
+    limits: [u32; 3],
+) -> Result<usize, String> {
+    bind_abi_with_root_resolved(this, list, pso, false, 0, Some(original), limits)
 }
 
 unsafe fn bind_abi_with_root_resolved(
     this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
-    exact_original: Option<usize>,
-) -> Result<(), String> {
+    exact_original: Option<usize>, limits: [u32; 3],
+) -> Result<usize, String> {
     #[cfg(test)]
     {
         if STOP_ABI_LIST.load(Ordering::Acquire) == this as usize {
@@ -1517,31 +1571,15 @@ unsafe fn bind_abi_with_root_resolved(
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
-    // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
-    let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
-        Ok(p as usize)
-    };
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(pso) };
-    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
-    let table_at = copy(&args[inline..])?;
-    let mut io = match layout.as_ref() {
-        Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
-        None => vec![table_at as u32, (table_at >> 32) as u32],
-    };
-    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-    if !gfx {
-        for (k, l) in take_dispatch_limits(this).into_iter().enumerate() {
-            io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = l;
-        }
-    }
-    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
+    let prepared = prepare_abi_state(this, u, gfx, user_sgprs)?;
+    let PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator } = prepared;
+    std::ptr::copy_nonoverlapping(args[inline..].as_ptr(), table_at as *mut u8, args.len() - inline);
+    let io = prepared_abi_io(layout.as_deref(), &args, table_at, gfx, user_sgprs, u.base(), limits);
+    let io_bytes = io.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    std::ptr::copy_nonoverlapping(io_bytes.as_ptr(), io_at as *mut u8, io_bytes.len());
+    std::ptr::write_bytes(res_at as *mut u8, 0, 256);
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = (root != 0).then_some(root)
         .or_else(|| super::real::pso_root_signature(pso))
@@ -1573,11 +1611,7 @@ unsafe fn bind_abi_with_root_resolved(
     if shared_view_bound && super::vram::srv_tracking_enabled() {
         super::list_x::note_shared_view_heap_use(this);
     }
-    Ok(())
-}
-
-fn take_dispatch_limits(list: *mut c_void) -> [u32; 3] {
-    with(list, |s| std::mem::take(&mut s.limits))
+    Ok(allocator)
 }
 
 #[cfg(test)]
@@ -2641,16 +2675,53 @@ void main(uint t : SV_GroupIndex) {
     }
 
     #[test]
-    fn deferred_dispatch_limits_are_consumed_once_and_reset_with_the_list() {
+    fn abi_preparation_snapshots_state_and_reserves_disjoint_regions() {
         let list = 0x7301_0001usize as *mut c_void;
-        with(list, |s| s.limits = [100, 17, 0]);
-        assert_eq!(take_dispatch_limits(list), [100, 17, 0]);
-        assert_eq!(take_dispatch_limits(list), [0; 3], "a later ordinary dispatch must not inherit deferred limits");
+        let u = crate::gpu::uma::Uma::with_windows(1, 8 << 20).expect("test UMA");
+        let layout = Arc::new(Layout { size: 64, inline: 4, ..Default::default() });
+        let args = (0..64u8).collect::<Vec<_>>();
+        with(list, |state| {
+            state.layout = Some(layout.clone());
+            state.args = args.clone();
+            state.allocator = 0x7301_1000;
+        });
 
-        with(list, |s| s.limits = [9, 8, 7]);
-        reset(list, 0x7301_1000, 0);
-        assert_eq!(take_dispatch_limits(list), [0; 3], "Reset drops an unconsumed deferred dispatch state");
-        forget(list);
+        let prepared = prepare_abi_state(list, &u, false, None).unwrap();
+        assert!(Arc::ptr_eq(prepared.layout.as_ref().unwrap(), &layout));
+        assert_eq!(prepared.args, args);
+        assert_eq!(prepared.inline, 4);
+        assert_eq!(prepared.allocator, 0x7301_1000);
+        assert_eq!((prepared.table_at | prepared.io_at | prepared.res_at) & 255, 0);
+        assert!(prepared.table_at + 60 <= prepared.io_at);
+        assert!(prepared.io_at + crate::gpu::recomp::KERNEL_SGPRS * std::mem::size_of::<u32>() <= prepared.res_at);
+
+        with(list, |state| {
+            state.layout = None;
+            state.args.clear();
+            state.allocator = 0x7301_2000;
+        });
+        assert!(Arc::ptr_eq(prepared.layout.as_ref().unwrap(), &layout));
+        assert_eq!(prepared.args, args);
+        assert_eq!(prepared.allocator, 0x7301_1000);
+
+        let state = take_state(list as usize).unwrap();
+        assert_eq!(state.uma.len(), 1, "the three reservations should share one arena block");
+        for block in state.uma {
+            assert!(u.free(block));
+        }
+    }
+
+    #[test]
+    fn dispatch_limits_are_explicit_and_graphics_ignores_them() {
+        let slots = crate::gpu::recomp::IO_THREAD_LIMIT;
+        let compute = prepared_abi_io(None, &[], 0x1234_0000, false, None, 0, [100, 17, 0]);
+        assert_eq!([compute[slots[0]], compute[slots[1]], compute[slots[2]]], [100, 17, 0]);
+
+        let ordinary = prepared_abi_io(None, &[], 0x1234_1000, false, None, 0, [0; 3]);
+        assert_eq!([ordinary[slots[0]], ordinary[slots[1]], ordinary[slots[2]]], [0; 3]);
+
+        let graphics = prepared_abi_io(None, &[], 0x1234_2000, true, None, 0, [9, 8, 7]);
+        assert_eq!([graphics[slots[0]], graphics[slots[1]], graphics[slots[2]]], [0; 3]);
     }
 
     #[test]
