@@ -47,6 +47,53 @@ fn branch_program(blocks: usize) -> Vec<u8> {
     code
 }
 
+fn graphics_program(instructions: usize, spills: bool) -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut count = 0usize;
+    if spills {
+        for lane in 0..48u64 {
+            code.extend(instruction(
+                "V_WRITELANE_B32",
+                "ENC_VOP3",
+                &[("VDST", 30), ("SRC0", 32 + lane), ("SRC1", 128 + lane)],
+            ));
+            count += 1;
+        }
+        for lane in 0..48u64 {
+            code.extend(instruction(
+                "V_READLANE_B32",
+                "ENC_VOP3",
+                &[("VDST", lane), ("SRC0", VGPR0 + 30), ("SRC1", 128 + lane)],
+            ));
+            count += 1;
+        }
+    }
+    let add = instruction(
+        "V_ADD_NC_U32",
+        "ENC_VOP2",
+        &[("VDST", 1), ("SRC0", VGPR0 + 2), ("VSRC1", 3)],
+    );
+    for _ in count..instructions {
+        code.extend(&add);
+    }
+    code.extend(instruction("S_ENDPGM", "ENC_SOPP", &[]));
+    code
+}
+
+fn graphics_options(split_wave64: bool) -> recomp::Options {
+    recomp::Options {
+        mode: recomp::Mode::Pixel(recomp::PsInterface {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            input_ena: 0,
+            attrs: None,
+        }),
+        wave64: true,
+        split_wave64,
+        ..Default::default()
+    }
+}
+
 fn rdna2_frontend(c: &mut Criterion) {
     let code = arithmetic_program(1024);
     let mesh_control_flow = branch_program(256);
@@ -113,6 +160,27 @@ fn translate(c: &mut Criterion) {
                         translated.instructions,
                         translated.blocks,
                     ))
+                })
+            },
+        );
+    }
+    let plain = graphics_program(256, false);
+    let spills = graphics_program(256, true);
+    let native = graphics_options(false);
+    let split = graphics_options(true);
+    for (name, code, options) in [
+        ("plain", &plain, &native),
+        ("spills_native", &spills, &native),
+        ("spills_split", &spills, &split),
+    ] {
+        group.throughput(Throughput::Elements(257));
+        group.bench_with_input(
+            BenchmarkId::new("wave64_graphics", name),
+            &(code, options),
+            |b, (code, options)| {
+                b.iter(|| {
+                    let translated = recomp::translate(black_box(code), black_box(options)).unwrap();
+                    black_box((translated.hlsl.len(), translated.instructions, translated.blocks))
                 })
             },
         );
