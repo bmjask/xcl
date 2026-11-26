@@ -976,20 +976,35 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
     Some(pending)
 }
 
-/// The whole-wave reductions of a wave32 program (`wave32_reductions`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReductionScope {
+    Half32,
+    Whole64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Reduction {
+    pub seed: u64,
+    pub accum: u64,
+    pub op: &'static str,
+    pub scope: ReductionScope,
+}
+
+/// The compiler's whole-wave reductions in vertex and pixel shaders.
 #[derive(Default)]
 pub struct Reductions {
     /// pc of a `v_cndmask` that starts one → the VGPR it writes
-    pub seeds: std::collections::BTreeMap<u64, u64>,
-    /// pc of the `v_readlane` that ends one → (its seed's pc, the operation: `xcl_red_<op>`)
-    pub reads: std::collections::BTreeMap<u64, (u64, &'static str)>,
+    pub(crate) seeds: std::collections::BTreeMap<u64, u64>,
+    /// pc of the `v_readlane` that ends one → its reduction
+    pub(crate) reads: std::collections::BTreeMap<u64, Reduction>,
 }
 
-/// The reductions the console's compiler makes over the lanes of a wave32 wave:
+/// The reductions the console's compiler makes over the lanes of a graphics wave:
 /// `s_or_saveexec_b32 s, -1` (every lane runs, launched or not), `v_cndmask v, identity, value,
 /// mask`, three DPP8 steps (within 2, 4 and 8 lanes), a DPP row mirror, `v_permlanex16 w, v`, one more
-/// step and `v_readlane s, v, 0` – nothing else in between, all in one basic block.
-fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64>) -> Reductions {
+/// step and `v_readlane s, v, 0`. Wave64 adds a read of lane 32 and one last combine before that
+/// read. Nothing else is in between and the sequence is all in one basic block.
+pub(crate) fn graphics_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64>, wave64: bool) -> Reductions {
     let op_of = |d: &Decoded| match d.inst.name {
         "V_OR_B32" => Some(("or", 128)),
         "V_MAX_U32" => Some(("max", 128)),
@@ -999,6 +1014,11 @@ fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64
     };
     let f = |d: &Decoded, n: &str| rdna2::field_value(d.enc, &d.words, n);
     let ext = |d: &Decoded, n: &str| emit::ext_encoding(d).and_then(|e| rdna2::field_value(e, &d.words, n));
+    let unmodified = |d: &Decoded| {
+        ["ABS", "NEG", "CLAMP", "OMOD", "OP_SEL", "SRC0_ABS", "SRC0_NEG", "SRC1_ABS", "SRC1_NEG"]
+            .iter()
+            .all(|n| f(d, n).or_else(|| ext(d, n)).unwrap_or(0) == 0)
+    };
     // (the steps' waits and nops are not part of it)
     let idle = |d: &Decoded| matches!(d.inst.name, "S_NOP" | "S_WAITCNT" | "V_NOP" | "S_WAITCNT_DEPCTR" | "S_INST_PREFETCH");
     // step k takes its value from the other half of the 2^(k+1) lanes a lane is in (all lanes of a
@@ -1006,14 +1026,38 @@ fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64
     let other_half = |k: usize, n: u64, sel: Option<u64>| sel.is_some_and(|s| s >> (k + 1) == n >> (k + 1) && (s ^ n) >> k & 1 == 1);
     let mut out = Reductions::default();
     for (i, seed) in insts.iter().enumerate() {
-        if seed.inst.name != "V_CNDMASK_B32" || seed.variant != rdna2::Variant::Plain {
+        if seed.inst.name != "V_CNDMASK_B32" || seed.variant != rdna2::Variant::Plain || !unmodified(seed) {
             continue;
         }
         // the every-lane section it is in, with no other EXEC write before the end
-        let Some(open) = insts[..i].iter().rev().take(6).position(|d| d.inst.name == "S_OR_SAVEEXEC_B32" && f(d, "SSRC0") == Some(193)) else { continue };
+        let opener = if wave64 { "S_OR_SAVEEXEC_B64" } else { "S_OR_SAVEEXEC_B32" };
+        let Some(open) = insts[..i].iter().rev().take(6).position(|d| d.inst.name == opener && f(d, "SSRC0") == Some(193)) else { continue };
         let open = i - 1 - open;
-        let steps: Vec<&Decoded> = insts[i + 1..].iter().filter(|d| !idle(d)).take(7).collect();
-        let [a, b, c, mirror, cross, last, read] = steps[..] else { continue };
+        // In a wave64 reduction the select mask is the old EXEC, optionally narrowed further.
+        // Proving that makes every never-launched lane's seed the identity.
+        if wave64 {
+            let (Some(saved), Some(mask)) = (f(&insts[open], "SDST"), f(seed, "SRC2")) else { continue };
+            let Some(narrow) = (open + 1..i).rev().find(|&j| !idle(&insts[j])) else { continue };
+            let narrow_inst = &insts[narrow];
+            if narrow_inst.inst.name != "S_AND_B64"
+                || f(narrow_inst, "SDST") != Some(mask)
+                || ![f(narrow_inst, "SSRC0"), f(narrow_inst, "SSRC1")].contains(&Some(saved))
+            {
+                continue;
+            }
+            let overwrites = |d: &Decoded, pair: u64| rdna2::sgpr_uses(d).1.iter().any(|&s| s == pair || s == pair + 1);
+            if insts[open + 1..narrow].iter().any(|d| overwrites(d, saved))
+                || insts[narrow + 1..i].iter().any(|d| overwrites(d, mask))
+            {
+                continue;
+            }
+        }
+        let n = if wave64 { 9 } else { 7 };
+        let steps: Vec<&Decoded> = insts[i + 1..].iter().filter(|d| !idle(d)).take(n).collect();
+        if steps.len() != n {
+            continue;
+        }
+        let (a, b, c, mirror, cross, last) = (steps[0], steps[1], steps[2], steps[3], steps[4], steps[5]);
         let Some((op, identity)) = op_of(a) else { continue };
         let (_, w) = rdna2::vgpr_uses(seed);
         let [v] = w[..] else { continue };
@@ -1022,30 +1066,83 @@ fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64
         }
         let same = |d: &Decoded, variant: rdna2::Variant| {
             let (r, w) = rdna2::vgpr_uses(d);
-            op_of(d).map(|o| o.0) == Some(op) && d.variant == variant && w == vec![v] && r.contains(&v)
+            op_of(d).map(|o| o.0) == Some(op)
+                && d.variant == variant
+                && unmodified(d)
+                && w == vec![v]
+                && r.contains(&v)
         };
-        let dpp8 = [a, b, c].iter().enumerate().all(|(k, d)| same(d, rdna2::Variant::Dpp8) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
-        let crossed = {
-            let (r, w) = rdna2::vgpr_uses(cross);
-            cross.inst.name == "V_PERMLANEX16_B32" && r.contains(&v) && w.len() == 1
+        let reads_only_v = |d: &Decoded| {
+            let r = rdna2::vgpr_uses(d).0;
+            !r.is_empty() && r.iter().all(|&x| x == v)
         };
-        if !dpp8 || !same(mirror, rdna2::Variant::Dpp16) || ext(mirror, "DPP_CTRL") != Some(0x140) || !crossed || !same(last, rdna2::Variant::Plain) {
+        let dpp8 = [a, b, c]
+            .iter()
+            .enumerate()
+            .all(|(k, d)| same(d, rdna2::Variant::Dpp8) && reads_only_v(d) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
+        let (cr, cw) = rdna2::vgpr_uses(cross);
+        let (lr, _) = rdna2::vgpr_uses(last);
+        let crossed = cross.inst.name == "V_PERMLANEX16_B32"
+            && unmodified(cross)
+            && cr == vec![v]
+            && cw.len() == 1
+            && cw[0] != v
+            && f(cross, "SRC1") == Some(128)
+            && f(cross, "SRC2") == Some(128);
+        let last_exact = crossed && same(last, rdna2::Variant::Plain) && lr.len() == 2 && lr.contains(&v) && lr.contains(&cw[0]);
+        if !dpp8
+            || !same(mirror, rdna2::Variant::Dpp16)
+            || !reads_only_v(mirror)
+            || ext(mirror, "DPP_CTRL") != Some(0x140)
+            || ext(mirror, "ROW_MASK") != Some(0xf)
+            || ext(mirror, "BANK_MASK") != Some(0xf)
+            || ext(mirror, "BOUND_CTRL").unwrap_or(0) != 0
+            || ext(mirror, "FI").unwrap_or(0) != 0
+            || !crossed
+            || !last_exact
+        {
             continue;
         }
+        let read = if wave64 {
+            let (upper, whole, read) = (steps[6], steps[7], steps[8]);
+            let (r, _) = rdna2::vgpr_uses(upper);
+            let Some(bridge) = f(upper, "VDST") else { continue };
+            if upper.inst.name != "V_READLANE_B32"
+                || !unmodified(upper)
+                || r != vec![v]
+                || f(upper, "SRC1") != Some(160)
+                || !same(whole, rdna2::Variant::Plain)
+                || !reads_only_v(whole)
+                || f(whole, "SRC0") != Some(bridge)
+            {
+                continue;
+            }
+            read
+        } else {
+            steps[6]
+        };
         let (r, _) = rdna2::vgpr_uses(read);
-        if read.inst.name != "V_READLANE_B32" || !r.contains(&v) || f(read, "SRC1") != Some(128) {
+        if read.inst.name != "V_READLANE_B32" || !unmodified(read) || r != vec![v] || f(read, "SRC1") != Some(128) {
             continue;
         }
         // one basic block, and EXEC kept all ones from the section's start
         let end = insts.iter().position(|d| d.pc == read.pc).unwrap_or(i);
         let inside = &insts[open + 1..=end];
         let straight = inside.iter().all(|d| !leaders.contains(&d.pc) && d.inst.flags & rdna2::F_TERMINATOR == 0 && rdna2::branch_target(d).is_none());
-        let exec = inside.iter().any(|d| d.inst.name.contains("SAVEEXEC") || (d.enc.name.starts_with("ENC_SOP") && f(d, "SDST").is_some_and(|x| (126..=127).contains(&x))));
+        let exec = inside.iter().any(|d| {
+            d.inst.name.contains("SAVEEXEC")
+                || d.inst.name.contains("WREXEC")
+                || d.inst.name.starts_with("V_CMPX")
+                || rdna2::sgpr_uses(d).1.iter().any(|&s| (126..=127).contains(&s))
+        });
         if !straight || exec {
             continue;
         }
         out.seeds.insert(seed.pc, v);
-        out.reads.insert(read.pc, (seed.pc, op));
+        out.reads.insert(
+            read.pc,
+            Reduction { seed: seed.pc, accum: v, op, scope: if wave64 { ReductionScope::Whole64 } else { ReductionScope::Half32 } },
+        );
     }
     out
 }
@@ -1592,8 +1689,8 @@ fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
             em.upper = Some(a);
         }
     }
-    if !opt.wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
-        em.reductions = wave32_reductions(&insts, &leaders);
+    if matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        em.reductions = graphics_reductions(&insts, &leaders, opt.wave64);
     }
     em.max_vgpr = insts
         .iter()
