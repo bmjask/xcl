@@ -781,9 +781,9 @@ impl HeldEvictionCandidate {
     }
 }
 
-/// Recipe-enabled binds append at most one weak identity per build. This path is reached only after
-/// the existing `XCL_PSO_REBUILD_RECIPES` gate selected generation-aware resolution; ordinary
-/// binds pay no candidate check, queue operation, registry scan, or allocation.
+/// Recipe-enabled binds append at most one weak identity per build. Recipe retention is explicit,
+/// or implied by a pressure-policy gate; ordinary binds pay no candidate check, queue operation,
+/// registry scan, or allocation.
 #[allow(dead_code)] // exercised by policy tests; production use resumes with pressure activation
 fn note_eviction_candidate_on<const N: usize>(build: &Arc<Build>, frame: u64, candidates: &CandidateQueue<Build, N>) {
     if !build.is_evictable() {
@@ -958,9 +958,9 @@ fn select_eviction_candidates(limits: EvictionSelectionLimits) -> Vec<SelectedEv
     select_eviction_candidates_on(eviction_candidates(), super::present::presents(), limits)
 }
 
-/// Pure admission for a future background eviction/rehydration policy. It deliberately consumes
+/// Pure admission for the background eviction/rehydration policy. It deliberately consumes
 /// an explicit memory-report sample: sampling DXGI here would put adapter work on whichever thread
-/// asked for a decision. Nothing constructs this state today, and its default remains disabled.
+/// asked for a decision. Its default remains disabled.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct PressureAdmissionConfig {
@@ -1000,6 +1000,13 @@ enum PressureMode {
     Idle,
     Evicting,
     Rehydrating,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PressurePolicyMode {
+    #[default]
+    Shadow,
+    Active,
 }
 
 #[allow(dead_code)]
@@ -1414,6 +1421,7 @@ impl<const N: usize> Drop for EvictedBuildReservation<'_, N> {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PressureObservation {
+    policy: PressurePolicyMode,
     mode: PressureMode,
     scanned: usize,
     eligible: usize,
@@ -1453,8 +1461,8 @@ impl PressureObservation {
     fn line(self) -> String {
         debug_assert!(self.attempts_accounted());
         format!(
-            "pipeline pressure observation: {:?}; {} scanned, {} eligible, {} deferred, {} discarded, {} requeue saturated; {} attempted, {} evicted; preflight {} prepared, {} recent, {} changed, {} busy, {} released, {} ledger full",
-            self.mode, self.scanned, self.eligible, self.deferred, self.discarded, self.requeue_saturated,
+            "pipeline pressure observation: {:?} {:?}; {} scanned, {} eligible, {} deferred, {} discarded, {} requeue saturated; {} attempted, {} evicted; preflight {} prepared, {} recent, {} changed, {} busy, {} released, {} ledger full",
+            self.policy, self.mode, self.scanned, self.eligible, self.deferred, self.discarded, self.requeue_saturated,
             self.attempted, self.evicted, self.prepared, self.recent, self.changed, self.busy,
             self.released, self.ledger_full,
         )
@@ -1471,6 +1479,12 @@ struct PressureObserver {
     work_budget_turn: Option<u64>,
     scans_issued: usize,
     attempts_issued: usize,
+}
+
+enum PressureAttempt {
+    Skipped(SelectedEvictionCandidate),
+    Aborted(EvictionPreflight, EvictionCandidate),
+    Detached(DetachedExactEviction),
 }
 
 impl PressureObserver {
@@ -1502,9 +1516,31 @@ impl PressureObserver {
         coordinator: &RestorationCoordinator<E, R>,
     ) -> PressureObservation {
         let limits = self.limits;
-        self.observe_on_with_preflight(candidates, turn, frame, sample, || {}, |selected| {
-            Some(preflight_exact_eviction_on(selected, frame, limits, coordinator, || {}))
-        })
+        self.observe_on_with_attempt(candidates, turn, frame, sample, || {}, PressurePolicyMode::Shadow,
+            |selected| {
+                let result = preflight_exact_eviction_on(&selected, frame, limits, coordinator, || {});
+                PressureAttempt::Aborted(result, selected.candidate)
+            }).0
+    }
+
+    fn evict_exact_on<const N: usize, const E: usize, const R: usize>(
+        &mut self,
+        candidates: &CandidateQueue<Build, N>,
+        turn: u64,
+        frame: u64,
+        sample: Option<PressureSample>,
+        coordinator: &RestorationCoordinator<E, R>,
+    ) -> (PressureObservation, Option<DetachedExactEviction>) {
+        let limits = self.limits;
+        self.observe_on_with_attempt(candidates, turn, frame, sample, || {}, PressurePolicyMode::Active,
+            |selected| match detach_exact_eviction_on(
+                selected, frame, limits, coordinator, || {}, || {},
+            ) {
+                ExactDetachAttempt::Aborted(result, candidate) => {
+                    PressureAttempt::Aborted(result, candidate)
+                }
+                ExactDetachAttempt::Detached(detached) => PressureAttempt::Detached(detached),
+            })
     }
 
     fn observe_on_after_drain<const N: usize>(
@@ -1527,8 +1563,28 @@ impl PressureObserver {
         after_drain: impl FnOnce(),
         mut preflight: impl FnMut(&SelectedEvictionCandidate) -> Option<EvictionPreflight>,
     ) -> PressureObservation {
+        self.observe_on_with_attempt(candidates, turn, frame, sample, after_drain,
+            PressurePolicyMode::Shadow, |selected| match preflight(&selected) {
+                Some(result) => PressureAttempt::Aborted(result, selected.candidate),
+                None => PressureAttempt::Skipped(selected),
+            }).0
+    }
+
+    fn observe_on_with_attempt<const N: usize>(
+        &mut self,
+        candidates: &CandidateQueue<Build, N>,
+        turn: u64,
+        frame: u64,
+        sample: Option<PressureSample>,
+        after_drain: impl FnOnce(),
+        policy: PressurePolicyMode,
+        mut attempt: impl FnMut(SelectedEvictionCandidate) -> PressureAttempt,
+    ) -> (PressureObservation, Option<DetachedExactEviction>) {
         let decision = self.admission.decide(turn, sample);
-        let mut observation = PressureObservation { mode: self.admission.mode, ..Default::default() };
+        let mut observation = PressureObservation {
+            policy, mode: self.admission.mode, ..Default::default()
+        };
+        let mut detached = None;
         if self.admission.accepted_policy_turn == Some(turn) && self.work_budget_turn != Some(turn) {
             self.work_budget_turn = Some(turn);
             self.scans_issued = 0;
@@ -1546,7 +1602,7 @@ impl PressureObserver {
         }
         observation.requeue_saturated = self.held.len();
         if !self.held.is_empty() || decision.max_evictions == 0 {
-            return observation;
+            return (observation, detached);
         }
         let limits = EvictionSelectionLimits {
             max_scan: self.limits.max_scan.saturating_sub(self.scans_issued),
@@ -1579,11 +1635,25 @@ impl PressureObserver {
         observation.deferred = deferred.len() + nonactionable.len();
         let mut actionable = Vec::with_capacity(selected.len() + deferred.len());
         for selected in selected {
-            if let Some(result) = preflight(&selected) {
-                observation.note_preflight(result);
-                self.attempts_issued += 1;
+            if policy == PressurePolicyMode::Active && detached.is_some() {
+                actionable.push(selected.candidate);
+                continue;
             }
-            actionable.push(selected.candidate);
+            match attempt(selected) {
+                PressureAttempt::Skipped(selected) => actionable.push(selected.candidate),
+                PressureAttempt::Aborted(result, candidate) => {
+                    observation.note_preflight(result);
+                    self.attempts_issued += 1;
+                    actionable.push(candidate);
+                }
+                PressureAttempt::Detached(owner) => {
+                    observation.attempted += 1;
+                    observation.evicted += 1;
+                    self.attempts_issued += 1;
+                    self.admission.note_evictions(turn, 1);
+                    detached = Some(owner);
+                }
+            }
         }
         actionable.extend(deferred);
         for candidate in actionable {
@@ -1600,23 +1670,47 @@ impl PressureObserver {
         }
         observation.requeue_saturated = self.held.len();
         debug_assert!(observation.attempts_accounted());
-        observation
+        (observation, detached)
     }
 }
 
-fn pressure_observe_gate_value(value: Option<&str>) -> bool { value.is_some_and(|value| value.trim() == "1") }
+fn pressure_gate_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+fn pressure_policy_mode_values(
+    evict: Option<&str>, observe: Option<&str>,
+) -> Option<PressurePolicyMode> {
+    if pressure_gate_value(evict) {
+        Some(PressurePolicyMode::Active)
+    } else if pressure_gate_value(observe) {
+        Some(PressurePolicyMode::Shadow)
+    } else {
+        None
+    }
+}
+
+fn pressure_policy_mode() -> Option<PressurePolicyMode> {
+    static MODE: OnceLock<Option<PressurePolicyMode>> = OnceLock::new();
+    *MODE.get_or_init(|| pressure_policy_mode_values(
+        std::env::var("XCL_PSO_PRESSURE_EVICT").ok().as_deref(),
+        std::env::var("XCL_PSO_PRESSURE_OBSERVE").ok().as_deref(),
+    ))
+}
+
+/// Whether the host should take the bounded two-second DXGI memory sample. This does not enable
+/// the unrelated high-frequency diagnostics behind `XCL_ACTIVITY`.
+pub(crate) fn pressure_sampling_enabled() -> bool { pressure_policy_mode().is_some() }
 
 fn pressure_observer() -> Option<&'static Mutex<PressureObserver>> {
     static OBSERVER: OnceLock<Option<Mutex<PressureObserver>>> = OnceLock::new();
     OBSERVER.get_or_init(|| {
-        let requested = std::env::var("XCL_PSO_PRESSURE_OBSERVE").ok();
-        if !pressure_observe_gate_value(requested.as_deref()) || !rebuild_recipes_enabled() {
-            return None;
-        }
+        let policy = pressure_policy_mode()?;
+        debug_assert!(rebuild_recipes_enabled());
         let config = PressureAdmissionConfig {
             enabled: true,
             max_sample_age_turns: 0,
-            max_evictions_per_turn: 8,
+            max_evictions_per_turn: 1,
             ..Default::default()
         };
         let limits = EvictionSelectionLimits {
@@ -1625,9 +1719,14 @@ fn pressure_observer() -> Option<&'static Mutex<PressureObserver>> {
             min_unused_frames: 600,
             min_resident_frames: 60,
         };
-        crate::xlog_info!(
-            "D3D12.X: XCL_PSO_PRESSURE_OBSERVE=1 - observing pipeline pressure only; pipelines are not evicted"
-        );
+        match policy {
+            PressurePolicyMode::Shadow => crate::xlog_info!(
+                "D3D12.X: XCL_PSO_PRESSURE_OBSERVE=1 - shadowing compute pipeline pressure eviction"
+            ),
+            PressurePolicyMode::Active => crate::xlog_info!(
+                "D3D12.X: XCL_PSO_PRESSURE_EVICT=1 - evicting old rebuildable compute pipelines under video-memory pressure"
+            ),
+        }
         PressureObserver::new(config, limits).map(Mutex::new)
     }).as_ref()
 }
@@ -1639,10 +1738,22 @@ pub(crate) fn observe_pressure_turn(
 ) -> Option<String> {
     let observer = pressure_observer()?;
     let sample = local.map(|segment| PressureSample { observed_turn: turn, segment });
-    Some(observer.lock().unwrap().observe_exact_on(
-        eviction_candidates(), turn, super::present::presents(), sample,
-        pipeline_restoration_coordinator(),
-    ).line())
+    let (observation, detached) = {
+        let mut observer = observer.lock().unwrap();
+        match pressure_policy_mode().expect("pressure observer without a policy") {
+            PressurePolicyMode::Shadow => (observer.observe_exact_on(
+                eviction_candidates(), turn, super::present::presents(), sample,
+                pipeline_restoration_coordinator(),
+            ), None),
+            PressurePolicyMode::Active => observer.evict_exact_on(
+                eviction_candidates(), turn, super::present::presents(), sample,
+                pipeline_restoration_coordinator(),
+            ),
+        }
+    };
+    let line = observation.line();
+    if let Some(detached) = detached { detached.retire() }
+    Some(line)
 }
 
 #[allow(dead_code)]
@@ -2871,13 +2982,14 @@ fn recipe_gate_value(value: Option<&str>) -> bool {
 }
 
 /// Whether background builds retain their immutable inputs after the initial one-shot job.
-/// This is preparation for a future eviction policy only; it does not rebuild or evict PSOs.
+/// Explicit recipe retention is observation-only; either pressure gate also needs these recipes.
 pub(super) fn rebuild_recipes_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let value = std::env::var("XCL_PSO_REBUILD_RECIPES").ok();
-        let on = recipe_gate_value(value.as_deref());
-        if on {
+        let explicit = recipe_gate_value(value.as_deref());
+        let on = explicit || pressure_policy_mode().is_some();
+        if explicit && pressure_policy_mode().is_none() {
             crate::xlog_info!("D3D12.X: XCL_PSO_REBUILD_RECIPES=1 - retaining pipeline rebuild inputs only; pipelines are not evicted or rebuilt");
         }
         on
@@ -3955,6 +4067,7 @@ mod used_tests {
         generation: *const Mutex<GenerationSlot<ID3D12PipelineState>>,
         admission: *const Mutex<()>,
         timestamp_access: *const AtomicUsize,
+        observer: *const Mutex<PressureObserver>,
     }
 
     static PIPELINE_RESTORATION_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -3977,6 +4090,10 @@ mod used_tests {
                 assert!((&*probe.generation).try_lock().is_ok());
                 assert!((&*probe.admission).try_lock().is_ok());
                 assert_eq!((&*probe.timestamp_access).load(Ordering::Acquire), 0);
+                if !probe.observer.is_null() {
+                    assert!((&*probe.observer).try_lock().is_ok(),
+                        "final native drop ran under the pressure observer lock");
+                }
             });
         }
         remaining
@@ -6257,6 +6374,7 @@ mod used_tests {
             generation: &recipe.0.generation,
             admission: &coordinator.admission,
             timestamp_access: &build.eviction_timestamp_access,
+            observer: std::ptr::null(),
         };
         EVICTION_RELEASE_PROBE.with(|address| address.set(&probe as *const _ as usize));
         let limits = EvictionSelectionLimits {
@@ -6472,11 +6590,107 @@ mod used_tests {
     fn rebuild_recipe_gate_requires_exact_one() {
         assert!(recipe_gate_value(Some("1")));
         assert!(recipe_gate_value(Some(" 1\t")));
-        assert!(pressure_observe_gate_value(Some(" 1\t")));
+        assert!(pressure_gate_value(Some(" 1\t")));
+        assert_eq!(pressure_policy_mode_values(Some("1"), Some("1")),
+            Some(PressurePolicyMode::Active));
+        assert_eq!(pressure_policy_mode_values(None, Some(" 1\t")),
+            Some(PressurePolicyMode::Shadow));
         for value in [None, Some(""), Some("0"), Some("true"), Some("2")] {
             assert!(!recipe_gate_value(value));
-            assert!(!pressure_observe_gate_value(value));
+            assert!(!pressure_gate_value(value));
+            assert_eq!(pressure_policy_mode_values(value, value), None);
         }
+    }
+
+    #[test]
+    fn active_pressure_observer_preserves_attempt_and_success_budgets() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_reenter_release as usize];
+        let mut native = [
+            RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) },
+            RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) },
+            RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) },
+        ];
+        let mut builds = Vec::new();
+        let mut recipes = Vec::new();
+        let queue = CandidateQueue::<Build, 4>::new();
+        for (last_use, value) in native.iter_mut().enumerate() {
+            let raw = value as *mut RebuildFakePso as usize;
+            let recipe = Recipe::new(move || raw);
+            let build = completed_recipe_build(&recipe);
+            build.completed_frame.store(0, Ordering::Relaxed);
+            note_eviction_candidate_on(&build, last_use as u64, &queue);
+            builds.push(build);
+            recipes.push(recipe);
+        }
+        let config = PressureAdmissionConfig {
+            enabled: true, max_sample_age_turns: 0, max_evictions_per_turn: 1,
+            ..Default::default()
+        };
+        let limits = EvictionSelectionLimits {
+            max_scan: 3, max_select: 3, min_unused_frames: 0, min_resident_frames: 0,
+        };
+        let observer = Mutex::new(PressureObserver::new(config, limits).unwrap());
+        let coordinator = RestorationCoordinator::<4, 4>::new(1).unwrap();
+        let busy_pin = recipes[0].pin_with_residency(
+            builds[0].real.load(Ordering::Acquire),
+        ).0.unwrap();
+        let busy = coordinator.install_eviction(
+            &builds[0], busy_pin.ledger_identity(),
+        ).unwrap().commit();
+        drop(busy_pin);
+        let (observed, detached) = observer.lock().unwrap().evict_exact_on(
+            &queue, 1, 100, Some(pressure_sample(1, 100)), &coordinator,
+        );
+        assert_eq!(observed, PressureObservation {
+            policy: PressurePolicyMode::Active,
+            mode: PressureMode::Evicting,
+            scanned: 3,
+            eligible: 3,
+            attempted: 2,
+            evicted: 1,
+            busy: 1,
+            ..Default::default()
+        });
+        assert!(observed.attempts_accounted());
+        {
+            let state = observer.lock().unwrap();
+            assert_eq!((state.attempts_issued, state.admission.evictions_succeeded), (2, 1),
+                "the failed exact attempt consumed the success allowance");
+        }
+        let evicted = builds.iter().position(|build| build.real.load(Ordering::Acquire) == 0).unwrap();
+        assert_ne!(evicted, 0, "the already-armed candidate unexpectedly detached");
+        assert!(builds[evicted].eviction_token().is_some());
+        assert!(!builds[evicted].candidate_queued.load(Ordering::Acquire));
+        assert!(builds.iter().enumerate().filter(|(i, _)| *i != evicted)
+            .all(|(_, build)| build.candidate_queued.load(Ordering::Acquire)));
+        assert!(queue.pop().unwrap().upgrade().is_some());
+        assert!(queue.pop().unwrap().upgrade().is_some());
+        assert!(queue.pop().is_none(), "the successful candidate was requeued");
+
+        let release_probe = EvictionReleaseProbe {
+            done: &builds[evicted].done,
+            rebuild: &recipes[evicted].0.rebuild,
+            generation: &recipes[evicted].0.generation,
+            admission: &coordinator.admission,
+            timestamp_access: &builds[evicted].eviction_timestamp_access,
+            observer: &observer,
+        };
+        EVICTION_RELEASE_PROBE.with(|address| address.set(&release_probe as *const _ as usize));
+        detached.unwrap().retire();
+        EVICTION_RELEASE_PROBE.with(|address| address.set(0));
+        let token = builds[evicted].eviction_token().unwrap();
+        assert!(builds[evicted].clear_eviction_token(&token));
+        assert!(coordinator.evicted.finish(&token, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&token));
+        assert!(builds[0].clear_eviction_token(&busy));
+        assert!(coordinator.evicted.finish(&busy, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&busy));
+        for (_, build) in builds.iter().enumerate().filter(|(i, _)| *i != evicted) {
+            build.candidate_queued.store(false, Ordering::Release);
+            release(build.real.swap(0, Ordering::AcqRel));
+        }
+        drop(builds); drop(recipes);
+        assert!(native.iter().all(|value| value.refs.load(Ordering::Relaxed) == 0));
     }
 
     #[test]
