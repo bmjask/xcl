@@ -451,6 +451,38 @@ impl SubmissionReceipt {
     }
 }
 
+#[cfg(test)]
+pub(super) fn submission_receipt_for_test(completed: u64, value: u64) -> (SubmissionReceipt, &'static AtomicU64) {
+    use std::mem::{offset_of, size_of};
+    use std::sync::atomic::AtomicU32;
+
+    #[repr(C)]
+    struct Fence { vtable: *const usize, completed: AtomicU64, refs: AtomicU32 }
+    unsafe extern "system" fn get_completed(this: *mut c_void) -> u64 {
+        (*(this as *mut Fence)).completed.load(Ordering::Acquire)
+    }
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut Fence)).refs.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        (*(this as *mut Fence)).refs.fetch_sub(1, Ordering::Relaxed) - 1
+    }
+    extern "system" fn unexpected() { panic!("unexpected test fence call") }
+
+    let mut vtable = vec![unexpected as usize; size_of::<ID3D12Fence_Vtbl>() / size_of::<usize>()].into_boxed_slice();
+    vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / size_of::<usize>()] = get_completed as usize;
+    vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / size_of::<usize>()] = add_ref as usize;
+    vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / size_of::<usize>()] = release as usize;
+    let vtable = Box::leak(vtable);
+    let object = Box::leak(Box::new(Fence {
+        vtable: vtable.as_ptr(), completed: AtomicU64::new(completed), refs: AtomicU32::new(1),
+    }));
+    let object = object as *mut Fence;
+    let completed = unsafe { &(*object).completed };
+    let fence = unsafe { ID3D12Fence::from_raw(object.cast()) };
+    (SubmissionReceipt { fence, value }, completed)
+}
+
 /// Result of a receipt-requesting submission. Once execution begins, failure to mark it cannot
 /// be turned back into `NotExecuted`: callers must retain dependent objects indefinitely.
 #[allow(dead_code)] // consumed by the later opt-in generation-pin stage
