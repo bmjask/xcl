@@ -512,7 +512,9 @@ fn remapped_grid(mut grid: [u32; 3], remap: Option<(u32, u32)>) -> Option<[u32; 
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
-pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
+pub(in crate::hle::d3d12x) unsafe fn dispatch(
+    list: &ID3D12GraphicsCommandList, original: usize, pso: usize, allocator: usize, grid: [u32; 3],
+) -> Result<(), String> {
     if grid.into_iter().any(|n| n > 65_535) {
         return Err("dispatch group count exceeds 65535 on one axis".into());
     }
@@ -522,7 +524,8 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
         match remapped_grid(grid, super::pso_dispatch_remap_exact(pso)) {
             Some([x, y, z]) => list.Dispatch(x, y, z),
             None => {
-                list.SetPipelineState(&super::remap_fallback::whole_exact(pso)?);
+                let whole = super::remap_fallback::whole_exact(pso)?;
+                super::bind_pipeline_exact(list.as_raw(), original, whole.as_raw() as usize);
                 list.Dispatch(x, y, z);
             }
         }
@@ -542,7 +545,8 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        let whole = chain.whole()?;
+        super::bind_pipeline_exact(list.as_raw(), original, whole.as_raw() as usize);
         list.Dispatch(x, y, z);
         return Ok(());
     };
@@ -551,7 +555,11 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
+    pso::record_dispatch_chain(
+        list, grid, most, &held.scratch.buffer, used,
+        std::iter::once(&held.first).chain(&held.chain.tail),
+        |piece| super::bind_pipeline_exact(list.as_raw(), original, piece.as_raw() as usize),
+    );
     Ok(())
 }
 
@@ -585,7 +593,7 @@ fn indirect_readiness(
 /// set is independent of the direct whole-form build. Otherwise preserve the synchronous fallback;
 /// the slicer writes either bounded piece commands or the whole-form command, never a partial chain.
 pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
-    list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, args: u64,
+    list: &ID3D12GraphicsCommandList, original: usize, pso: usize, allocator: usize, args: u64,
     bind: impl FnOnce(usize) -> Result<(), String>,
 ) -> Result<bool, String> {
     let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(false) };
@@ -621,14 +629,19 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
         &chain.builder.device, list.as_raw() as usize, allocator, command_bytes,
     ).ok_or("no command buffer for split ExecuteIndirect")?;
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    pso::record_indirect_slicer(list, args, rounds, (scratch.bytes / group).max(1), &commands.buffer)?;
+    pso::record_indirect_slicer(
+        list, args, rounds, (scratch.bytes / group).max(1), &commands.buffer,
+        |slicer| super::bind_pipeline_exact(list.as_raw(), original, slicer.as_raw() as usize),
+    )?;
     let bound = bind(indirect.signature.as_raw() as usize);
     if bound.is_ok() {
-        list.SetPipelineState(&indirect.whole);
+        super::bind_pipeline_exact(list.as_raw(), original, indirect.whole.as_raw() as usize);
         list.ExecuteIndirect(&signature, 1, &commands.buffer,
             pso::chain_tail_offset(rounds), None::<&ID3D12Resource>, 0);
-        pso::record_dispatch_chain_indirect(list, &signature, &commands.buffer, rounds, &scratch.buffer,
-            indirect.pieces.iter());
+        pso::record_dispatch_chain_indirect(
+            list, &signature, &commands.buffer, rounds, &scratch.buffer, indirect.pieces.iter(),
+            |piece| super::bind_pipeline_exact(list.as_raw(), original, piece.as_raw() as usize),
+        );
     }
     pso::restore_indirect_commands(list, &commands.buffer);
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording {
@@ -844,7 +857,7 @@ mod tests {
             let (raw_list, allocator) = (list.as_raw() as usize, alloc.as_raw() as usize);
             super::super::super::alloc_pool::created_on(raw_list, allocator, ty.0);
             let args = pso::chain_commands_buffer(&dev, 1).unwrap();
-            assert_eq!(execute_indirect(&list, key, allocator, args.GetGPUVirtualAddress(), |_| Err("bind failed".into())), Err("bind failed".into()));
+            assert_eq!(execute_indirect(&list, key, key, allocator, args.GetGPUVirtualAddress(), |_| Err("bind failed".into())), Err("bind failed".into()));
             let recorded = RECORDINGS.lock().unwrap().get(&allocator).unwrap()[0]._indirect_commands.clone().unwrap();
             let reused = commands_for(&dev, raw_list, allocator, pso::chain_tail_offset(1) + 12).unwrap();
             assert!(Arc::ptr_eq(&recorded, &reused));
