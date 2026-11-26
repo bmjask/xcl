@@ -242,6 +242,63 @@ impl Drop for EmissionWorkers {
 }
 
 #[cfg(feature = "pipeline-resolution-bench")]
+struct BindWorkers {
+    start: Arc<Barrier>,
+    done: Arc<Barrier>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl BindWorkers {
+    fn new(fixture: Arc<xcl::hle::d3d12x::bind::BindStateBench>, workers: usize) -> Self {
+        let start = Arc::new(Barrier::new(workers + 1));
+        let done = Arc::new(Barrier::new(workers + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = (0..workers)
+            .map(|worker| {
+                let fixture = fixture.clone();
+                let start = start.clone();
+                let done = done.clone();
+                let stop = stop.clone();
+                std::thread::Builder::new()
+                    .name(format!("bind-bench-{worker}"))
+                    .spawn(move || loop {
+                        start.wait();
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let mut checksum = 0usize;
+                        for _ in 0..EMISSION_BATCH {
+                            checksum = checksum.wrapping_add(fixture.snapshot_worker(worker));
+                        }
+                        black_box(checksum);
+                        done.wait();
+                    })
+                    .expect("bind-state benchmark worker")
+            })
+            .collect();
+        Self { start, done, stop, threads }
+    }
+
+    fn run(&self) {
+        self.start.wait();
+        self.done.wait();
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl Drop for BindWorkers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.start.wait();
+        for thread in self.threads.drain(..) {
+            thread.join().expect("bind-state benchmark worker panicked");
+        }
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
 fn emission_bookkeeping_benches(c: &mut Criterion) {
     let workers = std::thread::available_parallelism().map_or(4, |count| count.get())
         .saturating_sub(1).clamp(2, 8);
@@ -261,6 +318,25 @@ fn emission_bookkeeping_benches(c: &mut Criterion) {
     group.throughput(Throughput::Elements((workers * EMISSION_BATCH) as u64));
     group.bench_function(&format!("distinct_lists_serial_{workers}"), |b| {
         b.iter(|| black_box(&fixture).record_workers_serial(workers, EMISSION_BATCH));
+    });
+    group.bench_function(&format!("distinct_lists_parallel_{workers}"), |b| {
+        b.iter(|| pool.run());
+    });
+    group.finish();
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+fn bind_state_benches(c: &mut Criterion) {
+    let workers = std::thread::available_parallelism().map_or(4, |count| count.get())
+        .saturating_sub(1).clamp(2, 8);
+    let fixture = Arc::new(xcl::hle::d3d12x::bind::BindStateBench::new(workers));
+    let pool = BindWorkers::new(fixture.clone(), workers);
+    // This is one retained-pipeline snapshot, not a whole draw or dispatch; those take STATES
+    // several more times while preparing their root arguments and ABI memory.
+    let mut group = c.benchmark_group("runtime/emission_bookkeeping/bind_pipeline_snapshot");
+    group.throughput(Throughput::Elements((workers * EMISSION_BATCH) as u64));
+    group.bench_function(&format!("distinct_lists_serial_{workers}"), |b| {
+        b.iter(|| black_box(&fixture).snapshot_workers_serial(workers, EMISSION_BATCH));
     });
     group.bench_function(&format!("distinct_lists_parallel_{workers}"), |b| {
         b.iter(|| pool.run());
@@ -425,5 +501,7 @@ fn main() {
         pipeline_resolution_benches,
         #[cfg(feature = "pipeline-resolution-bench")]
         emission_bookkeeping_benches,
+        #[cfg(feature = "pipeline-resolution-bench")]
+        bind_state_benches,
     ]);
 }
