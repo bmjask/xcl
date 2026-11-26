@@ -4791,7 +4791,7 @@ mod used_tests {
         let recipe = Recipe::new(move || raw);
         let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
         let old = structured_pending(build.clone(), false);
-        let resolution = PipelineResolution(classify_retained(original, &old), old.compute);
+        let resolution = PipelineResolution(classify_retained(original, &old), old.compute, unavailable_set(&old));
         let replacement = structured_pending(
             Arc::new(Build::new(Box::new(|| panic!("replacement build ran")), false)), false,
         );
@@ -4921,7 +4921,7 @@ mod used_tests {
         ));
         assert!(replacement.build.job.lock().unwrap().is_some());
         complete(&build, job());
-        let ready = PipelineResolution(classify_retained(original, &pending), false);
+        let ready = PipelineResolution(classify_retained(original, &pending), false, UnavailableSet::Poison);
         let NativePipelineChoice::Exact { raw: ready_raw, generation: ready_generation } =
             ready.select_for_native_bind(NativePipelineBindMode::ForBind)
             else { panic!("ready retained native choice was not exact") };
@@ -4957,7 +4957,7 @@ mod used_tests {
         }
         let (compute_build, compute_pending, compute_finish) = pending_build(true);
         let compute = PipelineResolution(
-            StructuredResolve::initial(0x7E57_D031, compute_pending, 0x7E57_D031, true), true,
+            StructuredResolve::initial(0x7E57_D031, compute_pending, 0x7E57_D031, true), true, UnavailableSet::Omit,
         );
         assert!(matches!(
             compute.select_for_native_bind_with_budget(
@@ -4980,7 +4980,7 @@ mod used_tests {
         }), false));
         let exact = PipelineResolution(StructuredResolve::initial(
             0x7E57_D035, structured_pending(exact_build.clone(), true), 0x7E57_D035, true,
-        ), true);
+        ), true, UnavailableSet::Omit);
         let (result_tx, result_rx) = mpsc::channel();
         let waiter = exact.clone();
         let thread = std::thread::spawn(move || {
@@ -5005,7 +5005,7 @@ mod used_tests {
 
         let (graphics_build, graphics_pending, graphics_finish) = pending_build(false);
         let graphics = PipelineResolution(
-            StructuredResolve::initial(0x7E57_D032, graphics_pending, 0x7E57_D032, true), false,
+            StructuredResolve::initial(0x7E57_D032, graphics_pending, 0x7E57_D032, true), false, UnavailableSet::Poison,
         );
         assert!(matches!(
             graphics.select_for_native_bind_with_budget(NativePipelineBindMode::ForBind, None),
@@ -5038,7 +5038,7 @@ mod used_tests {
         let resolution = PipelineResolution(StructuredResolve::Deferred {
             original, pending: pending.clone(), fallback: original,
             restoration: restoration.clone(),
-        }, true);
+        }, true, UnavailableSet::Omit);
         assert!(matches!(
             resolution.select_for_native_bind(NativePipelineBindMode::Lazy),
             NativePipelineChoice::Unavailable
@@ -5070,7 +5070,7 @@ mod used_tests {
         let terminal = PipelineResolution(StructuredResolve::Terminal {
             original, pending: pending.clone(), fallback: original,
             failure: StructuredResolveFailure::RestorationUnavailable,
-        }, true);
+        }, true, UnavailableSet::Omit);
         assert!(matches!(
             terminal.select_for_native_bind(NativePipelineBindMode::Lazy),
             NativePipelineChoice::Unavailable
@@ -5089,7 +5089,7 @@ mod used_tests {
         let build = Arc::new(Build::new(Box::new(|| panic!("released build ran")), false));
         let pending = structured_pending(build.clone(), true);
         let resolution = PipelineResolution(
-            StructuredResolve::initial(0x7E57_D034, pending, 0x7E57_D034, true), true,
+            StructuredResolve::initial(0x7E57_D034, pending, 0x7E57_D034, true), true, UnavailableSet::Omit,
         );
         build.owners.store(0, Ordering::Release);
         for mode in [NativePipelineBindMode::Lazy, NativePipelineBindMode::ForBind] {
@@ -5101,7 +5101,7 @@ mod used_tests {
     fn initial_pending_probe_does_not_take_the_completion_lock() {
         let build = Arc::new(Build::new(Box::new(|| 0), false));
         let pending = structured_pending(build.clone(), true);
-        let resolution = PipelineResolution(StructuredResolve::initial(0x7E57_D01B, pending, 0x7E57_D01B, true), true);
+        let resolution = PipelineResolution(StructuredResolve::initial(0x7E57_D01B, pending, 0x7E57_D01B, true), true, UnavailableSet::Omit);
         let done = build.done.lock().unwrap();
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || tx.send(resolution.submit_demand_pending()).unwrap());
@@ -5153,7 +5153,7 @@ mod used_tests {
         let released_build = Arc::new(Build::new(Box::new(|| panic!("released build ran")), false));
         let released_pending = structured_pending(released_build.clone(), true);
         let released = PipelineResolution(
-            classify_retained(0x7E57_D01D, &released_pending), released_pending.compute,
+            classify_retained(0x7E57_D01D, &released_pending), released_pending.compute, UnavailableSet::Poison,
         );
         released_build.owners.store(0, Ordering::Release);
         assert!(matches!(released.resolve_for_indirect(), IndirectPipelineChoice::Unavailable));
@@ -5167,10 +5167,10 @@ mod used_tests {
         let recipe = Recipe::new(move || raw);
         let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
         let pending = structured_pending(build.clone(), true);
-        let stale = PipelineResolution(classify_retained(0x7E57_D01E, &pending), pending.compute);
+        let stale = PipelineResolution(classify_retained(0x7E57_D01E, &pending), pending.compute, UnavailableSet::Poison);
         let initial = build.job.lock().unwrap().take().unwrap();
         complete(&build, initial());
-        let ready = PipelineResolution(classify_retained(0x7E57_D01F, &pending), pending.compute);
+        let ready = PipelineResolution(classify_retained(0x7E57_D01F, &pending), pending.compute, UnavailableSet::Poison);
         assert!(ready.is_compute() && ready.clone().is_compute(), "a ready snapshot lost compute kind");
         assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
         assert!(matches!(stale.resolve_for_indirect(), IndirectPipelineChoice::Unavailable),
@@ -5268,7 +5268,7 @@ mod used_tests {
         drop(build.job.lock().unwrap().take());
         complete(&build, 0);
         let pending = structured_pending(build.clone(), false);
-        let resolution = PipelineResolution(classify_retained(original, &pending), pending.compute);
+        let resolution = PipelineResolution(classify_retained(original, &pending), pending.compute, UnavailableSet::Poison);
         assert!(matches!(resolution.resolve_for_indirect(), IndirectPipelineChoice::Unavailable));
 
         let (published, replaced) = recipe.publish(raw);
@@ -5403,7 +5403,7 @@ mod used_tests {
         let initial = build.job.lock().unwrap().take().unwrap();
         complete(&build, initial());
         let pending = structured_pending(build.clone(), false);
-        let resolution = PipelineResolution(classify_retained(0x7E57_D014, &pending), pending.compute);
+        let resolution = PipelineResolution(classify_retained(0x7E57_D014, &pending), pending.compute, UnavailableSet::Poison);
 
         next.store(second_raw, Ordering::Release);
         assert_eq!(rebuild_once(&build), Some(RebuildResult::Published { generation: 2 }));
@@ -5604,7 +5604,7 @@ mod used_tests {
         drop(pin); assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
         next.store(0, Ordering::Release);
         let pending = structured_pending(build.clone(), true);
-        let resolution = PipelineResolution(classify_retained(0x7E57_D020, &pending), pending.compute);
+        let resolution = PipelineResolution(classify_retained(0x7E57_D020, &pending), pending.compute, UnavailableSet::Poison);
         assert!(matches!(&resolution.0, StructuredResolve::Deferred { .. }));
 
         assert!(resolution.need_by_submit());
@@ -5617,7 +5617,7 @@ mod used_tests {
             "retryable failure lost its exact eviction identity");
 
         next.store(replacement_raw, Ordering::Release);
-        let retry = PipelineResolution(classify_retained(0x7E57_D021, &pending), pending.compute);
+        let retry = PipelineResolution(classify_retained(0x7E57_D021, &pending), pending.compute, UnavailableSet::Poison);
         assert!(retry.need_by_submit());
         let IndirectPipelineChoice::Exact { raw: retry_raw, generation: retry_generation } = retry.resolve_for_indirect()
             else { panic!("second bind did not restore the exact recipe") };
@@ -9187,10 +9187,21 @@ fn reconcile_pipeline_restorations() {
 }
 
 /// Opaque retained resolver decision carried by command-list state.
-/// The bool is the Pending's immutable compute kind, retained even after address reuse/release.
+/// Immutable compute kind and unavailable-Set policy are retained across address reuse/release.
 #[allow(dead_code)] // consumed by a later emission stage; retaining it pins exact identity now
 #[derive(Clone)]
-pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>, bool);
+pub(super) struct PipelineResolution(
+    StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>, bool, UnavailableSet,
+);
+
+#[derive(Clone, Copy)]
+enum UnavailableSet { Omit, Poison }
+
+fn unavailable_set(pending: &Pending) -> UnavailableSet {
+    let evictable = pending.build.is_evictable();
+    debug_assert!(!evictable || pending.compute);
+    if pending.compute && evictable { UnavailableSet::Omit } else { UnavailableSet::Poison }
+}
 
 /// Generation-aware emission result. `Unavailable` is fail-closed: emission must never recover
 /// by looking up the title address again after this retained identity was selected.
@@ -9230,19 +9241,30 @@ fn begin_pipeline_resolution_on<const E: usize>(
     coordinator: &RestorationCoordinator<E, PIPELINE_RESOLUTION_RECEIPTS>,
     q: &BuildQueue,
 ) -> PipelineResolution {
-    PipelineResolution(classify_structured_on(original, pending, coordinator, q), pending.compute)
+    PipelineResolution(
+        classify_structured_on(original, pending, coordinator, q),
+        pending.compute, unavailable_set(pending),
+    )
 }
 
 /// Classify a bind without waiting or running driver work. Worker startup, consumption of the
 /// decision, and pressure policy remain separate stages.
 pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResolution> {
     let pending = entry(original)?;
-    Some(PipelineResolution(classify_retained(original, &pending), pending.compute))
+    Some(PipelineResolution(
+        classify_retained(original, &pending), pending.compute, unavailable_set(&pending),
+    ))
 }
 
 impl PipelineResolution {
     #[allow(dead_code)] // consumed by the ExecuteIndirect integration stage
     pub(super) fn is_compute(&self) -> bool { self.1 }
+
+    /// Only immutable eviction-eligible compute may omit an unavailable SetPipelineState: every
+    /// translated emission consumes its retained resolution and fails closed.
+    pub(super) fn can_omit_unavailable_set(&self) -> bool {
+        matches!(self.2, UnavailableSet::Omit)
+    }
 
     /// Select a native bind from this retained identity only. Lazy never waits; ForBind keeps
     /// the existing bounded compute wait while graphics remains lazy.
@@ -9627,18 +9649,18 @@ impl PipelineResolutionBench {
 
         let ready_pending = make_pending();
         finish(&ready_pending, raws[0]);
-        let retained_ready = PipelineResolution(classify_retained(raws[0] ^ 0x101, &ready_pending), ready_pending.compute);
+        let retained_ready = PipelineResolution(classify_retained(raws[0] ^ 0x101, &ready_pending), ready_pending.compute, UnavailableSet::Poison);
         assert!(matches!(&retained_ready.0, StructuredResolve::Ready { .. }));
 
         let initial_pending = make_pending();
-        let initial_completed = PipelineResolution(classify_retained(raws[1] ^ 0x202, &initial_pending), initial_pending.compute);
+        let initial_completed = PipelineResolution(classify_retained(raws[1] ^ 0x202, &initial_pending), initial_pending.compute, UnavailableSet::Poison);
         assert!(matches!(&initial_completed.0, StructuredResolve::Initial { .. }));
         finish(&initial_pending, raws[1]);
         let _ = Self::consume(initial_completed.resolve_for_emission());
 
         let make_unpromoted = || {
             let pending = make_pending();
-            let resolution = PipelineResolution(classify_retained(raws[1] ^ 0x303, &pending), pending.compute);
+            let resolution = PipelineResolution(classify_retained(raws[1] ^ 0x303, &pending), pending.compute, UnavailableSet::Poison);
             finish(&pending, raws[1]);
             resolution
         };
@@ -9772,7 +9794,10 @@ fn pipeline_resolution_for_kind_test(
         late: AtomicBool::new(false),
         spared: AtomicBool::new(false),
     });
-    PipelineResolution(StructuredResolve::initial(original, pending, original, true), compute)
+    PipelineResolution(
+        StructuredResolve::initial(original, pending, original, true),
+        compute, if compute { UnavailableSet::Omit } else { UnavailableSet::Poison },
+    )
 }
 
 #[cfg(test)]
@@ -9802,7 +9827,7 @@ impl PipelineResolution {
         Self(StructuredResolve::Terminal {
             original, pending, fallback,
             failure: StructuredResolveFailure::RestorationUnavailable,
-        }, self.1)
+        }, self.1, self.2)
     }
 }
 
