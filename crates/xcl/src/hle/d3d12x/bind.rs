@@ -74,6 +74,72 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+/// Opaque fixture for measuring the actual retained-pipeline state snapshot without a device.
+#[cfg(feature = "pipeline-resolution-bench")]
+#[doc(hidden)]
+pub struct BindStateBench {
+    _resolutions: Vec<super::pso_async::PipelineResolutionBench>,
+    lists: Vec<usize>,
+    _keys: Vec<Box<u8>>,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl BindStateBench {
+    pub fn new(workers: usize) -> Self {
+        assert!(workers != 0);
+        let resolutions = (0..workers)
+            .map(|_| super::pso_async::PipelineResolutionBench::new())
+            .collect::<Vec<_>>();
+        let keys = (0..workers).map(|index| Box::new(index as u8)).collect::<Vec<_>>();
+        let lists = keys.iter().map(|key| (&**key as *const u8) as usize).collect::<Vec<_>>();
+        {
+            let mut states = STATES.lock().unwrap();
+            let states = states.get_or_insert_with(HashMap::new);
+            assert!(lists.iter().all(|list| !states.contains_key(list)));
+            for (worker, &list) in lists.iter().enumerate() {
+                states.insert(list, State {
+                    pso: worker + 1,
+                    resolution: Some(resolutions[worker].retained_resolution()),
+                    ..Default::default()
+                });
+            }
+        }
+        Self { _resolutions: resolutions, lists, _keys: keys }
+    }
+
+    #[inline(never)]
+    pub fn snapshot_worker(&self, worker: usize) -> usize {
+        let (pso, resolution) = with(self.lists[worker] as *mut c_void, |state| {
+            (state.pso, state.resolution.clone())
+        });
+        std::hint::black_box(resolution);
+        pso
+    }
+
+    #[inline(never)]
+    pub fn snapshot_workers_serial(&self, workers: usize, batch: usize) -> usize {
+        let mut checksum = 0usize;
+        for worker in 0..workers {
+            for _ in 0..batch {
+                checksum = checksum.wrapping_add(self.snapshot_worker(worker).rotate_left(worker as u32));
+            }
+        }
+        checksum
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl Drop for BindStateBench {
+    fn drop(&mut self) {
+        let removed = {
+            let mut states = STATES.lock().unwrap();
+            let Some(states) = states.as_mut() else { return };
+            self.lists.iter().filter_map(|list| states.remove(list)).collect::<Vec<_>>()
+        };
+        drop(removed);
+    }
+}
+
 fn native_backing(list: *mut c_void, allocator: usize) -> usize {
     if allocator == 0 {
         0
