@@ -251,16 +251,28 @@ impl Inner {
     }
 
     fn promote(&self, id: JobId, priority: Priority) -> bool {
+        // Stop admission at the authoritative transition, then wake the accepted work before
+        // publishing timing. Reporting must never delay a worker that can now take the job.
+        let admission = crate::stall::deferred_span();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(job) = state.jobs.get_mut(&id) else { return false };
+        let Some(job) = state.jobs.get_mut(&id) else {
+            let admission = admission.map(crate::stall::DeferredSpan::stop);
+            drop(state);
+            if let Some(admission) = admission {
+                admission.finish(crate::stall::StallKind::PipelineQueueAdmission);
+            }
+            return false;
+        };
         if priority <= job.priority {
+            let admission = admission.map(crate::stall::DeferredSpan::stop);
+            drop(state);
+            if let Some(admission) = admission {
+                admission.finish(crate::stall::StallKind::PipelineQueueAdmission);
+            }
             return true;
         }
         let ranked_preload = job.priority == Priority::Preload && job.preload_rank.is_some();
-        if queue_stall_kind(job.priority) != queue_stall_kind(priority) {
-            job.previous_queue_wait = job.queue_wait.take().map(crate::stall::DeferredSpan::stop);
-            job.queue_wait = crate::stall::deferred_span();
-        }
+        let cross_band = queue_stall_kind(job.priority) != queue_stall_kind(priority);
         job.priority = priority;
         job.generation += 1;
         let ticket = Ticket { id, generation: job.generation };
@@ -269,7 +281,21 @@ impl Inner {
         if ranked_preload {
             self.ranked_preloads.promoted.fetch_add(1, Ordering::Relaxed);
         }
+        if cross_band {
+            let job = state.jobs.get_mut(&id).unwrap();
+            // Admission legitimately overlaps the old band's residence until this promotion is
+            // accepted. The new band's residence starts only after admission itself has stopped.
+            job.previous_queue_wait = job.queue_wait.take().map(crate::stall::DeferredSpan::stop);
+        }
+        let admission = admission.map(crate::stall::DeferredSpan::stop);
+        if cross_band {
+            state.jobs.get_mut(&id).unwrap().queue_wait = crate::stall::deferred_span();
+        }
+        drop(state);
         self.wake(priority);
+        if let Some(admission) = admission {
+            admission.finish(crate::stall::StallKind::PipelineQueueAdmission);
+        }
         true
     }
 
@@ -400,13 +426,22 @@ impl BuildQueue {
 
     /// Add work, optionally ordered by an earlier-run rank within the Preload band only.
     ///
-    /// Queue latency measures accepted priority-band residence: it starts at insertion after the
-    /// state mutex is acquired, so admission mutex wait is excluded. A cross-band promotion ends
-    /// the speculative interval when that promotion is accepted while holding the same mutex.
+    /// Queue latency measures accepted priority-band residence: it starts at the handoff after
+    /// queue insertion, immediately before the state mutex is released, so admission is excluded.
+    /// A cross-band promotion ends the old interval when that promotion is accepted while holding
+    /// the same mutex and starts the new interval after promotion admission stops.
     pub(super) fn submit_ranked(&self, priority: Priority, preload_rank: Option<usize>, work: Work) -> Option<JobHandle> {
         let completion = Arc::new(Completion::new());
+        // Accepted queue residence deliberately excludes admission synchronization. Stop that
+        // interval at the handoff, start residence, unlock, wake, then publish admission timing.
+        let admission = crate::stall::deferred_span();
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped {
+            let admission = admission.map(crate::stall::DeferredSpan::stop);
+            drop(state);
+            if let Some(admission) = admission {
+                admission.finish(crate::stall::StallKind::PipelineQueueAdmission);
+            }
             return None;
         }
         state.next_id = state.next_id.checked_add(1).expect("build queue job ID overflow");
@@ -418,7 +453,7 @@ impl BuildQueue {
             preload_rank,
             generation,
             previous_queue_wait: None,
-            queue_wait: crate::stall::deferred_span(),
+            queue_wait: None,
             work,
             completion: completion.clone(),
         });
@@ -426,8 +461,13 @@ impl BuildQueue {
         if preload_rank.is_some() {
             self.inner.ranked_preloads.submissions.fetch_add(1, Ordering::Relaxed);
         }
+        let admission = admission.map(crate::stall::DeferredSpan::stop);
+        state.jobs.get_mut(&id).unwrap().queue_wait = crate::stall::deferred_span();
         drop(state);
         self.inner.wake(priority);
+        if let Some(admission) = admission {
+            admission.finish(crate::stall::StallKind::PipelineQueueAdmission);
+        }
         Some(JobHandle { id, queue: Arc::downgrade(&self.inner), completion })
     }
 
