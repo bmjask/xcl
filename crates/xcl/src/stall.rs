@@ -19,6 +19,7 @@ pub enum StallKind {
     ShaderTranslation,
     DxcQueue,
     DxcCompile,
+    PipelineQueueAdmission,
     PipelineQueueSpeculative,
     PipelineQueueDemand,
     PipelineWait,
@@ -42,10 +43,11 @@ pub enum StallKind {
 }
 
 impl StallKind {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::ShaderTranslation,
         Self::DxcQueue,
         Self::DxcCompile,
+        Self::PipelineQueueAdmission,
         Self::PipelineQueueSpeculative,
         Self::PipelineQueueDemand,
         Self::PipelineWait,
