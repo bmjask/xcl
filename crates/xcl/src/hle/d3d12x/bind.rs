@@ -137,6 +137,31 @@ pub(super) struct PreparedSplit {
     resolution: Option<super::pso_async::PipelineResolution>,
 }
 
+impl PreparedSplit {
+    /// Native Reset may borrow only an already-owned exact generation. A retained asynchronous
+    /// pipeline which is not ready starts the continuation with no PSO and binds at emission.
+    pub(super) fn initial_pipeline(&self) -> (usize, Option<super::pso_async::NativeGeneration>) {
+        initial_pipeline_for_reset(self.pso, self.resolution.as_ref())
+    }
+}
+
+fn initial_pipeline_for_reset(
+    pso: usize,
+    resolution: Option<&super::pso_async::PipelineResolution>,
+) -> (usize, Option<super::pso_async::NativeGeneration>) {
+    match resolution {
+        Some(resolution) => resolution.ready_for_reset().map_or((0, None), |(raw, pin)| (raw, Some(pin))),
+        None => (pso, None),
+    }
+}
+
+/// Exact retained initial pipeline for Reset after a recording is submitted. This snapshots the
+/// bind identity before waiting on no work and never resolves the title's reusable address.
+pub(super) fn initial_pipeline(list: *mut c_void) -> (usize, Option<super::pso_async::NativeGeneration>) {
+    let (pso, resolution) = with(list, |s| (s.pso, s.resolution.clone()));
+    initial_pipeline_for_reset(pso, resolution.as_ref())
+}
+
 pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize) -> PreparedSplit {
     let backing = native_backing(to, allocator);
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution) = with(from, |s| {
@@ -1875,6 +1900,70 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(with(from, |s| s.resolution.as_ref().unwrap().identity_for_test()), replacement_identity);
         forget(from);
         forget(to);
+    }
+
+    #[test]
+    fn split_reset_uses_only_an_owned_ready_generation() {
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut native = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut ResolutionPso as usize;
+        let standin = 0x7100_6200usize;
+        let from = 0x7100_6201usize as *mut c_void;
+        let to = 0x7100_6202usize as *mut c_void;
+        pso_async::submit_lazy(standin, false, Box::new(move || raw), 0);
+        assert_eq!(pso_async::resolve_wait(standin), raw);
+        set_tracked_pipeline_state(from, standin);
+        reset(to, 0, 0);
+        let prepared = prepare_split(from, to, 0);
+        let (initial, pin) = prepared.initial_pipeline();
+        assert_eq!(initial, raw);
+        assert!(pin.is_some(), "ready split initial pipeline has no exact owner");
+        drop(pin); drop(prepared); forget(from); forget(to);
+        let raw_owner = pso_async::released(standin);
+        assert_eq!(raw_owner, raw);
+        assert_eq!(unsafe { resolution_release(raw_owner as *mut c_void) }, 0);
+
+        let pending = 0x7100_6210usize;
+        let from = 0x7100_6211usize as *mut c_void;
+        let to = 0x7100_6212usize as *mut c_void;
+        pso_async::submit_lazy(pending, false, Box::new(|| panic!("split Reset started pending build")), 0);
+        set_tracked_pipeline_state(from, pending);
+        reset(to, 0, 0);
+        let prepared = prepare_split(from, to, 0);
+        assert!(matches!(prepared.initial_pipeline(), (0, None)), "pending split consulted its reusable address");
+        drop(prepared); forget(from); forget(to);
+        assert_eq!(pso_async::released(pending), 0);
+    }
+
+    #[test]
+    fn kickoff_reset_uses_the_retained_generation_after_address_reuse() {
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut original = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let original_raw = &mut original as *mut ResolutionPso as usize;
+        let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let standin = 0x7100_6220usize;
+        let list = 0x7100_6221usize as *mut c_void;
+
+        pso_async::submit_lazy(standin, false, Box::new(move || original_raw), 0);
+        assert_eq!(pso_async::resolve_wait(standin), original_raw);
+        set_tracked_pipeline_state(list, standin);
+        let original_owner = pso_async::released(standin);
+        assert_eq!(original_owner, original_raw);
+
+        pso_async::submit_lazy(standin, false, Box::new(move || replacement_raw), 0);
+        assert_eq!(pso_async::resolve_wait(standin), replacement_raw);
+        let (initial, pin) = initial_pipeline(list);
+        assert_eq!(initial, original_raw, "Kickoff Reset followed the reused title address");
+        assert!(pin.is_some(), "Kickoff Reset did not own the retained generation");
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 1, "Kickoff Reset retained the replacement generation");
+
+        let replacement_owner = pso_async::released(standin);
+        assert_eq!(replacement_owner, replacement_raw);
+        drop(pin);
+        forget(list);
+        assert_eq!(unsafe { resolution_release(original_owner as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_owner as *mut c_void) }, 0);
     }
 
     #[test]
