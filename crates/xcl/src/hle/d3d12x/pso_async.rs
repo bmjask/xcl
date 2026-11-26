@@ -4142,6 +4142,45 @@ mod used_tests {
     }
 
     #[test]
+    fn bind_snapshot_defers_evicted_pipeline_without_requesting_restoration() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            raw
+        });
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        let pin = recipe.pin_with_residency(raw).0.unwrap();
+        let coordinator = pipeline_restoration_coordinator();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin);
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        let original = 0x7E57_D012usize;
+        let pending = structured_pending(build.clone(), false);
+        PENDING.insert(original, pending.clone());
+
+        let resolution = begin_pipeline_resolution(original).expect("registered evicted pipeline");
+        assert!(matches!(&resolution.0, StructuredResolve::Deferred { pending: retained, .. }
+            if Arc::ptr_eq(retained, &pending)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "bind snapshot ran the rebuild recipe");
+        assert!(build.queued.lock().unwrap().is_none(), "bind snapshot queued build work");
+        assert!(coordinator.receipts.records(1).is_empty(), "bind snapshot reserved a receipt");
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted));
+
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &pending));
+        assert!(build.clear_eviction_token(&evicted));
+        assert!(coordinator.evicted.finish(&evicted, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&evicted));
+        drop(resolution); drop(pending); drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn restoration_coordinator_reuses_its_bounded_eviction_capacity() {
         let coordinator = RestorationCoordinator::<2, PIPELINE_RESOLUTION_RECEIPTS>::new(510).unwrap();
         let first_build = ledger_build();
@@ -6603,6 +6642,11 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.get(pso)
 }
 
+#[cfg(test)]
+pub(super) fn pending_identity_for_test(pso: usize) -> Option<(usize, usize)> {
+    entry(pso).map(|pending| (pso, Arc::as_ptr(&pending) as usize))
+}
+
 impl Pending {
     /// What a bind of the stand-in `pso` gives the driver while the pipeline is not built.
     fn stand(&self, pso: usize) -> usize {
@@ -6814,9 +6858,8 @@ pub(super) fn resolve_and_pin_for_bind(pso: usize) -> (usize, Option<NativeGener
 #[derive(Clone, Copy)]
 enum ResolveMode { Lazy, Wait, ForBind }
 
-/// One retained resolver decision. This is private and unwired: a later list integration can
-/// classify without waiting, retain the original `Pending` across title-address reuse, and wait
-/// only when correctness-critical emission consumes an exact restoration ticket.
+/// One retained resolver decision. Bind state snapshots it without waiting; a later emission
+/// stage can consume it without looking up a possibly reused title address.
 #[allow(dead_code)]
 #[derive(Clone)]
 enum StructuredResolve<const R: usize> {
@@ -6830,6 +6873,12 @@ enum StructuredResolve<const R: usize> {
         pending: Arc<Pending>,
         fallback: usize,
         bound_unbuilt: bool,
+    },
+    /// Exact identity retained, but no restoration was requested by this snapshot.
+    Deferred {
+        original: usize,
+        pending: Arc<Pending>,
+        fallback: usize,
     },
     Restoring {
         original: usize,
@@ -6845,13 +6894,16 @@ enum StructuredResolve<const R: usize> {
     },
 }
 
+#[allow(dead_code)] // activated with the later restoration-request stage
 const PIPELINE_RESTORATION_EVICTIONS: usize = 1024;
 const PIPELINE_RESOLUTION_RECEIPTS: usize = 1024;
+#[allow(dead_code)] // activated with the later restoration-request stage
 type PipelineRestorationCoordinator =
     RestorationCoordinator<PIPELINE_RESTORATION_EVICTIONS, PIPELINE_RESOLUTION_RECEIPTS>;
 
-/// One dormant coordinator identity for the later live classification stage. Merely obtaining it
-/// neither starts workers nor enables eviction; no production caller classifies through it yet.
+/// One dormant coordinator identity for a later restoration-request stage. Merely obtaining it
+/// neither starts workers nor enables eviction.
+#[allow(dead_code)] // activated with the later restoration-request stage
 fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator {
     static COORDINATOR: OnceLock<PipelineRestorationCoordinator> = OnceLock::new();
     COORDINATOR.get_or_init(|| {
@@ -6859,14 +6911,14 @@ fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator
     })
 }
 
-/// Opaque retained resolver decision carried by command-list state. Live callers do not make
-/// these yet; the later classification stage supplies them without exposing coordinator types.
-#[allow(dead_code)]
+/// Opaque retained resolver decision carried by command-list state.
+#[allow(dead_code)] // consumed by a later emission stage; retaining it pins exact identity now
 #[derive(Clone)]
 pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>);
 
 /// Wrap one nonblocking decision without exposing coordinator or receipt types to command-list
 /// state. This does not start workers and never runs a queued driver build on the caller.
+#[allow(dead_code)] // activated with the later restoration-request stage
 fn begin_pipeline_resolution_on<const E: usize>(
     original: usize,
     pending: &Arc<Pending>,
@@ -6876,17 +6928,11 @@ fn begin_pipeline_resolution_on<const E: usize>(
     PipelineResolution(classify_structured_on(original, pending, coordinator, q))
 }
 
-/// Dormant live-queue seam for the later bind integration. There are intentionally no production
-/// callers yet; worker startup, state installation, and emission waits remain separate stages.
-#[allow(dead_code)]
-fn begin_pipeline_resolution(original: usize) -> Option<PipelineResolution> {
+/// Classify a bind without waiting or running driver work. Worker startup, consumption of the
+/// decision, and pressure policy remain separate stages.
+pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResolution> {
     let pending = entry(original)?;
-    Some(begin_pipeline_resolution_on(
-        original,
-        &pending,
-        pipeline_restoration_coordinator(),
-        queue(),
-    ))
+    Some(PipelineResolution(classify_retained(original, &pending)))
 }
 
 #[cfg(test)]
@@ -6933,6 +6979,7 @@ impl PipelineResolution {
     pub(super) fn identity_for_test(&self) -> (usize, usize) {
         match &self.0 {
             StructuredResolve::Initial { original, pending, .. }
+            | StructuredResolve::Deferred { original, pending, .. }
             | StructuredResolve::Restoring { original, pending, .. }
             | StructuredResolve::Terminal { original, pending, .. } => {
                 (*original, Arc::as_ptr(pending) as usize)
@@ -6972,7 +7019,8 @@ impl<const R: usize> StructuredResolve<R> {
             Self::Initial { fallback, bound_unbuilt, .. } => StructuredResolvedPipeline {
                 raw: *fallback, pin: None, bound_unbuilt: *bound_unbuilt,
             },
-            Self::Restoring { fallback, .. } | Self::Terminal { fallback, .. } => {
+            Self::Deferred { fallback, .. } | Self::Restoring { fallback, .. }
+            | Self::Terminal { fallback, .. } => {
                 StructuredResolvedPipeline { raw: *fallback, pin: None, bound_unbuilt: true }
             }
         }
@@ -6985,7 +7033,7 @@ impl<const R: usize> StructuredResolve<R> {
             Self::Ready { raw, pin, .. } => Ok(Some(StructuredResolvedPipeline {
                 raw: *raw, pin: pin.clone(), bound_unbuilt: false,
             })),
-            Self::Initial { .. } => Ok(None),
+            Self::Initial { .. } | Self::Deferred { .. } => Ok(None),
             Self::Restoring { ticket, .. } => ticket.wait_and_take_pin()
                 .map(|pin| Some(StructuredResolvedPipeline { raw: pin.raw(), pin: Some(pin), bound_unbuilt: false }))
                 .map_err(StructuredResolveFailure::from),
@@ -7005,6 +7053,34 @@ impl From<RehydrateCompletion> for StructuredResolveFailure {
             RehydrateCompletion::Reserved | RehydrateCompletion::Queued
             | RehydrateCompletion::Succeeded { .. } => Self::RestorationUnavailable,
         }
+    }
+}
+
+/// Retain one point-in-time bind decision. This takes no coordinator receipt and submits no work;
+/// an absent exact generation stays deferred for a later restoration-request stage.
+fn classify_retained<const R: usize>(original: usize, pending: &Arc<Pending>) -> StructuredResolve<R> {
+    let done = pending.build.done.lock().unwrap();
+    let raw = pending.build.real.load(Ordering::Acquire);
+    let fallback = pending.stand(original);
+    if !*done {
+        return StructuredResolve::Initial {
+            original, pending: pending.clone(), fallback, bound_unbuilt: true,
+        };
+    }
+    let Some(recipe) = pending.build.recipe.as_ref() else {
+        return StructuredResolve::Initial {
+            original, pending: pending.clone(), fallback, bound_unbuilt: false,
+        };
+    };
+    let (pin, residency) = recipe.pin_with_residency(raw);
+    match (pin, residency) {
+        (Some(pin), Residency::Resident | Residency::Rebuilding) => {
+            StructuredResolve::Ready { original, raw, pin: Some(pin) }
+        }
+        (_, Residency::Failed) => StructuredResolve::Initial {
+            original, pending: pending.clone(), fallback, bound_unbuilt: false,
+        },
+        _ => StructuredResolve::Deferred { original, pending: pending.clone(), fallback },
     }
 }
 

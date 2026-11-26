@@ -29,7 +29,7 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
-    /// Retained decision for `pso`; live classification is added by a later stage.
+    /// Retained nonblocking decision for `pso`.
     resolution: Option<super::pso_async::PipelineResolution>,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
@@ -87,12 +87,13 @@ fn native_backing(list: *mut c_void, allocator: usize) -> usize {
 /// recording's memory is the previous native backing's until that backing is reset, and
 /// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    let resolution = super::pso_async::begin_pipeline_resolution(initial_pso);
     let backing = native_backing(list, allocator);
     let (old, blocks, old_resolution) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.pso = initial_pso;
-        let old_resolution = s.resolution.take();
+        let old_resolution = std::mem::replace(&mut s.resolution, resolution);
         s.layout = None;
         s.args.clear();
         s.layout_gfx = None;
@@ -108,9 +109,10 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
+    let resolution = super::pso_async::begin_pipeline_resolution(pso);
     let old_resolution = with(list, |s| {
         s.pso = pso;
-        let old_resolution = s.resolution.take();
+        let old_resolution = std::mem::replace(&mut s.resolution, resolution);
         s.layout = None;
         s.args.clear();
         s.layout_gfx = None;
@@ -997,9 +999,10 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 }
 
 fn set_tracked_pipeline_state(this: *mut c_void, pso: usize) {
+    let resolution = super::pso_async::begin_pipeline_resolution(pso);
     let old_resolution = with(this, |s| {
         s.pso = pso;
-        s.resolution.take()
+        std::mem::replace(&mut s.resolution, resolution)
     });
     drop(old_resolution);
 }
@@ -1577,6 +1580,68 @@ void main(uint t : SV_GroupIndex) {
             dropped.store(true, Ordering::Release);
             let _ = list;
         })
+    }
+
+    #[test]
+    fn pipeline_changes_retain_the_pending_they_classified() {
+        let list = 0x7100_4800usize as *mut c_void;
+        let psos = [0x7100_4810usize, 0x7100_4820, 0x7100_4830];
+        for pso in psos {
+            pso_async::submit_lazy(pso, false, Box::new(|| {
+                panic!("bind-time classification ran pipeline work")
+            }), 0);
+        }
+        let identity = |pso| with(list, |s| {
+            assert_eq!(s.pso, pso);
+            s.resolution.as_ref().expect("registered pipeline was not classified").identity_for_test()
+        });
+
+        set_tracked_pipeline_state(list, psos[0]);
+        assert_eq!(identity(psos[0]), pso_async::pending_identity_for_test(psos[0]).unwrap());
+        clear_state(list, psos[1]);
+        assert_eq!(identity(psos[1]), pso_async::pending_identity_for_test(psos[1]).unwrap());
+        reset(list, 0, psos[2]);
+        assert_eq!(identity(psos[2]), pso_async::pending_identity_for_test(psos[2]).unwrap());
+
+        set_tracked_pipeline_state(list, 0x7100_4840);
+        with(list, |s| assert!(s.resolution.is_none(), "unregistered pipeline got a decision"));
+        clear_state(list, 0);
+        with(list, |s| assert!(s.resolution.is_none(), "null pipeline got a decision"));
+
+        forget(list);
+        for pso in psos {
+            assert_eq!(pso_async::released(pso), 0);
+        }
+    }
+
+    #[test]
+    fn pipeline_bind_retains_pending_across_real_address_reuse() {
+        let old_list = 0x7100_4850usize as *mut c_void;
+        let new_list = 0x7100_4860usize as *mut c_void;
+        let pso = 0x7100_4870usize;
+        pso_async::submit_lazy(pso, false, Box::new(|| {
+            panic!("old retained pipeline work ran")
+        }), 0);
+        set_tracked_pipeline_state(old_list, pso);
+        let old_identity = with(old_list, |s| {
+            s.resolution.as_ref().unwrap().identity_for_test()
+        });
+        assert_eq!(Some(old_identity), pso_async::pending_identity_for_test(pso));
+
+        assert_eq!(pso_async::released(pso), 0);
+        assert!(pso_async::pending_identity_for_test(pso).is_none());
+        pso_async::submit_lazy(pso, false, Box::new(|| {
+            panic!("replacement pipeline work ran")
+        }), 0);
+        let replacement_identity = pso_async::pending_identity_for_test(pso).unwrap();
+        assert_ne!(replacement_identity.1, old_identity.1);
+        set_tracked_pipeline_state(new_list, pso);
+
+        assert_eq!(with(old_list, |s| s.resolution.as_ref().unwrap().identity_for_test()), old_identity);
+        assert_eq!(with(new_list, |s| s.resolution.as_ref().unwrap().identity_for_test()), replacement_identity);
+        forget(old_list);
+        forget(new_list);
+        assert_eq!(pso_async::released(pso), 0);
     }
 
     #[test]
