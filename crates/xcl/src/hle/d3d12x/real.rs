@@ -3820,7 +3820,12 @@ pub fn switch_form_retries() -> u64 {
 unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
-    let hr = if injected { E_OUTOFMEMORY } else { f(this, desc, riid, ppv) };
+    let hr = if injected {
+        E_OUTOFMEMORY
+    } else {
+        let _stall = crate::stall::span(crate::stall::StallKind::DriverCompile);
+        f(this, desc, riid, ppv)
+    };
     if hr == E_OUTOFMEMORY && heap {
         HEAP_WINDOW_OOM.with(|o| o.set(true));
     }
@@ -4065,7 +4070,9 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
+    let gate_stall = huge.then(|| crate::stall::span(crate::stall::StallKind::DriverCompileGate)).flatten();
     let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    drop(gate_stall);
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -6095,7 +6102,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut take_cold_slot = || {
         if gate && slot.is_none() {
             let waited = std::time::Instant::now();
+            let gate_stall = crate::stall::span(crate::stall::StallKind::DriverCompileGate);
             slot = Some(big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+            drop(gate_stall);
             crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
         }
     };
