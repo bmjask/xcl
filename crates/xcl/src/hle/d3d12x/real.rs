@@ -8903,6 +8903,15 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
     cl_set_pipeline_state(this, pso)
 }
 
+/// Bind an already-selected exact native generation without sending its raw pointer back through
+/// the title-address resolver. Used by direct Dispatch after its retained bind is consumed.
+pub(super) unsafe fn bind_pipeline_exact(this: *mut c_void, original: usize, raw: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "SetPipelineState")));
+    f(this, raw as *mut c_void);
+    super::dred::mark_pipeline(this, original, raw);
+}
+
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot!(this, "SetPipelineState")));
