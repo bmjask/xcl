@@ -1571,7 +1571,7 @@ fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
             leaders.insert(next);
         }
     }
-    let mut em = emit::Em::new(opt.clone());
+    let mut em = emit::Em::new(opt.clone(), leaders.clone());
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
