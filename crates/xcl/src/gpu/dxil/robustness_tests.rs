@@ -104,24 +104,39 @@ fn a_group_barrier_of_several_hardware_waves_is_left_to_the_hlsl_path() {
     let code = prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]);
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
     let cs = |threads| CsInterface { threads, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
-    // 16 x 16 threads: 8 hardware waves in the split form, 4 native 64-lane ones, 8 of a
-    // 32-lane program; and the two 32-lane halves of one console wave
-    for (wave64, split, threads) in [(true, true, [16, 16, 1]), (true, false, [16, 16, 1]), (false, false, [16, 16, 1]), (true, true, [64, 1, 1]), (false, false, [64, 1, 1])] {
-        let e = kernel::translate_compute(&code, o(wave64, split), &cs(threads)).err().unwrap_or_else(|| panic!("translated: wave64 {wave64}, split {split}, {threads:?}"));
-        assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");
+    let unsafe_groups = [
+        (true, true, [16, 16, 1]), (true, false, [16, 16, 1]), (false, false, [16, 16, 1]),
+        (true, true, [33, 1, 1]), (true, false, [65, 1, 1]), (false, false, [33, 1, 1]),
+    ];
+    for (wave64, split, threads) in unsafe_groups {
+        let translated = kernel::translate_compute(&code, o(wave64, split), &cs(threads));
+        if crate::gpu::recomp::emit::safe_barrier_wanted() {
+            let e = translated.err().unwrap_or_else(|| panic!("translated: wave64 {wave64}, split {split}, {threads:?}"));
+            assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");
+        } else {
+            translated.unwrap_or_else(|e| panic!("XCL_SAFE_BARRIER=0 refused wave64 {wave64}, split {split}, {threads:?}: {e}"));
+        }
     }
     // one hardware wave has nobody to wait for: translated as before
+    kernel::translate_compute(&code, o(true, false), &cs([63, 1, 1])).expect("a partial 64-lane wave");
     kernel::translate_compute(&code, o(true, false), &cs([64, 1, 1])).expect("one 64-lane wave");
+    kernel::translate_compute(&code, o(false, false), &cs([31, 1, 1])).expect("a partial 32-lane wave");
     kernel::translate_compute(&code, o(false, false), &cs([32, 1, 1])).expect("one 32-lane wave");
     // (the kernel form of the tests is no thread group of a title's: its barrier stays)
     kernel::translate(&code, o(true, true)).expect("kernel");
     // a mesh program's compute pass: two console waves a group, as a retail title's
     let ms = |threads| crate::gpu::recomp::MsInterface { outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], threads, max_vertices: 64, max_primitives: 64 };
-    for split in [true, false] {
-        let e = kernel::translate_mesh(&code, o(true, split), &ms(128)).err().unwrap_or_else(|| panic!("a mesh pass translated (split {split})"));
-        assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");
+    for (wave64, split, threads) in [(true, true, 128), (true, false, 128), (false, false, 64)] {
+        let translated = kernel::translate_mesh(&code, o(wave64, split), &ms(threads));
+        if crate::gpu::recomp::emit::safe_barrier_wanted() {
+            let e = translated.err().unwrap_or_else(|| panic!("a mesh pass translated (wave64 {wave64}, split {split})"));
+            assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");
+        } else {
+            translated.unwrap_or_else(|e| panic!("XCL_SAFE_BARRIER=0 refused mesh wave64 {wave64}, split {split}: {e}"));
+        }
     }
     kernel::translate_mesh(&code, o(true, false), &ms(64)).expect("a mesh pass of one 64-lane wave");
+    kernel::translate_mesh(&code, o(false, false), &ms(32)).expect("a mesh pass of one 32-lane wave");
 }
 
 // ---- builder misuse: recorded as the first error, finish fails instead of panicking
