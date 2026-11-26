@@ -160,7 +160,7 @@ fn allocator_benches(c: &mut Criterion) {
 
 #[cfg(feature = "pipeline-resolution-bench")]
 fn pipeline_resolution_benches(c: &mut Criterion) {
-    let fixture = xcl::hle::d3d12x::pso_async::PipelineResolutionBench::new();
+    let fixture = Arc::new(xcl::hle::d3d12x::pso_async::PipelineResolutionBench::new());
     let mut group = c.benchmark_group("runtime/pipeline_resolution");
     group.throughput(Throughput::Elements(1));
     group.bench_function("retained_ready", |b| {
@@ -177,7 +177,98 @@ fn pipeline_resolution_benches(c: &mut Criterion) {
     group.bench_function("initial_completed_dispatch", |b| {
         b.iter(|| black_box(&fixture).initial_completed_dispatch());
     });
+    group.bench_function("initial_unpromoted_completed_probe", |b| {
+        b.iter(|| black_box(&fixture).initial_unpromoted_shared_probe());
+    });
+
+    let workers = std::thread::available_parallelism().map_or(4, |count| count.get())
+        .saturating_sub(1).clamp(2, 8);
+    group.throughput(Throughput::Elements((PIPELINE_PROBE_BATCH * workers) as u64));
+    for (name, mode) in [
+        ("initial_unpromoted_shared", PipelineProbeMode::UnpromotedShared),
+        ("initial_unpromoted_distinct", PipelineProbeMode::UnpromotedDistinct),
+        ("initial_promoted_control", PipelineProbeMode::Promoted),
+    ] {
+        let pool = PipelineProbeWorkers::new(fixture.clone(), workers, mode);
+        group.bench_function(&format!("{name}_parallel_{workers}"), |b| b.iter(|| pool.run()));
+    }
     group.finish();
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+const PIPELINE_PROBE_BATCH: usize = 4_096;
+
+#[cfg(feature = "pipeline-resolution-bench")]
+#[derive(Clone, Copy)]
+enum PipelineProbeMode {
+    UnpromotedShared,
+    UnpromotedDistinct,
+    Promoted,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+struct PipelineProbeWorkers {
+    start: Arc<Barrier>,
+    done: Arc<Barrier>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl PipelineProbeWorkers {
+    fn new(
+        fixture: Arc<xcl::hle::d3d12x::pso_async::PipelineResolutionBench>,
+        workers: usize,
+        mode: PipelineProbeMode,
+    ) -> Self {
+        let start = Arc::new(Barrier::new(workers + 1));
+        let done = Arc::new(Barrier::new(workers + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = (0..workers)
+            .map(|worker| {
+                let fixture = fixture.clone();
+                let start = start.clone();
+                let done = done.clone();
+                let stop = stop.clone();
+                std::thread::Builder::new()
+                    .name(format!("pipeline-probe-bench-{worker}"))
+                    .spawn(move || loop {
+                        start.wait();
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let mut pending = 0usize;
+                        for _ in 0..PIPELINE_PROBE_BATCH {
+                            pending += match mode {
+                                PipelineProbeMode::UnpromotedShared => fixture.initial_unpromoted_shared_probe(),
+                                PipelineProbeMode::UnpromotedDistinct => fixture.initial_unpromoted_distinct_probe(worker),
+                                PipelineProbeMode::Promoted => fixture.initial_promoted_probe(),
+                            } as usize;
+                        }
+                        black_box(pending);
+                        done.wait();
+                    })
+                    .expect("pipeline probe benchmark worker")
+            })
+            .collect();
+        Self { start, done, stop, threads }
+    }
+
+    fn run(&self) {
+        self.start.wait();
+        self.done.wait();
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl Drop for PipelineProbeWorkers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.start.wait();
+        for thread in self.threads.drain(..) {
+            thread.join().expect("pipeline probe benchmark worker panicked");
+        }
+    }
 }
 
 #[cfg(feature = "pipeline-resolution-bench")]

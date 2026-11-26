@@ -74,6 +74,9 @@ struct Build {
     /// Exact armed eviction visible before its native owners may be detached. Kept separate
     /// from recipe state so coordinator locks never overlap the build/rebuild/generation chain.
     eviction: Mutex<Option<EvictedBuildToken>>,
+    /// Lock-free observation that terminal state has been fully published. Exact generation,
+    /// release, and condvar decisions remain serialized by `done`.
+    completed: AtomicBool,
     done: Mutex<bool>,
     cv: Condvar,
     /// every stand-in interested in this build was released before it finished
@@ -317,6 +320,7 @@ impl Build {
             completed_frame: AtomicU64::new(0),
             candidate_queued: AtomicBool::new(false),
             eviction: Mutex::new(None),
+            completed: AtomicBool::new(false),
             done: Mutex::new(false),
             cv: Condvar::new(),
             orphan: Default::default(),
@@ -343,6 +347,17 @@ impl Build {
         if mark_queue_done(&self.queue_state) {
             QUEUED_BUILDS.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Publish terminal state after the caller has installed the result while holding `done`.
+    /// The release flag is observational only; waiters and exact owner transitions keep using
+    /// the mutex so the condvar predicate and generation lifetime cannot be separated.
+    fn publish_completed(&self, mut done: std::sync::MutexGuard<'_, bool>) {
+        debug_assert!(!*done);
+        *done = true;
+        self.finish_queued();
+        self.completed.store(true, Ordering::Release);
+        self.cv.notify_all();
     }
 
     fn promote(&self, priority: Priority) {
@@ -2093,7 +2108,7 @@ fn complete(build: &Arc<Build>, real: usize) {
         build.completed_frame.store(super::present::presents(), Ordering::Relaxed);
     }
     let (orphan, replaced_generation) = {
-        let mut done = build.done.lock().unwrap();
+        let done = build.done.lock().unwrap();
         let orphan = build.orphan.load(Ordering::Acquire);
         let mut replaced_generation = None;
         if !orphan {
@@ -2106,9 +2121,7 @@ fn complete(build: &Arc<Build>, real: usize) {
             }
             build.real.store(real, Ordering::Release);
         }
-        *done = true;
-        build.finish_queued();
-        build.cv.notify_all();
+        build.publish_completed(done);
         (orphan, replaced_generation)
     };
     // outside `done`: a pipeline Release override can re-enter pipeline bookkeeping
@@ -2854,10 +2867,8 @@ fn drop_unstarted_job(build: &Arc<Build>) {
     if let Some(job) = job {
         build.cancel_queued();
         {
-            let mut done = build.done.lock().unwrap();
-            *done = true;
-            build.finish_queued();
-            build.cv.notify_all();
+            let done = build.done.lock().unwrap();
+            build.publish_completed(done);
         }
         drop(job);
         forget_in_flight(build);
@@ -4377,6 +4388,73 @@ mod used_tests {
         drop(exact); drop(nonblocking); drop(retained); drop(reset); drop(second); drop(first);
         drop(resolution); drop(pending); drop(build);
         assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn initial_pending_probe_does_not_take_the_completion_lock() {
+        let build = Arc::new(Build::new(Box::new(|| 0), false));
+        let pending = structured_pending(build.clone(), true);
+        let resolution = PipelineResolution(StructuredResolve::initial(0x7E57_D01B, pending, 0x7E57_D01B, true));
+        let done = build.done.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || tx.send(resolution.initial_build_pending()).unwrap());
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("completion probe took the done lock"));
+        drop(done);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn terminal_paths_release_publish_completion_after_their_result() {
+        fn observe_after(build: Arc<Build>, publish: impl FnOnce()) -> usize {
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let observer_gate = gate.clone();
+            let observer = build.clone();
+            let (tx, rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                observer_gate.wait();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !observer.completed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                tx.send(observer.completed.load(Ordering::Acquire).then(|| observer.real.load(Ordering::Acquire))).unwrap();
+            });
+            gate.wait();
+            publish();
+            let observed = rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("completion observer did not finish")
+                .expect("terminal state was not release-published");
+            thread.join().unwrap();
+            observed
+        }
+
+        let success = Arc::new(Build::new(Box::new(|| 0xC011_E7ED), false));
+        let success_job = success.job.lock().unwrap().take().unwrap();
+        let observed = observe_after(success.clone(), || complete(&success, success_job()));
+        assert_eq!(observed, 0xC011_E7ED, "completion became visible before its result");
+        success.real.store(0, Ordering::Release);
+
+        let failed = Arc::new(Build::new(Box::new(|| 0), false));
+        drop(failed.job.lock().unwrap().take());
+        let observed = observe_after(failed.clone(), || complete(&failed, 0));
+        assert_eq!(observed, 0, "failed completion published a native result");
+        assert!(*failed.done.lock().unwrap());
+
+        let unstarted = Arc::new(Build::new(Box::new(|| 0), false));
+        unstarted.owners.store(0, Ordering::Release);
+        unstarted.orphan.store(true, Ordering::Release);
+        drop_unstarted_job(&unstarted);
+        assert!(unstarted.completed.load(Ordering::Acquire));
+        assert!(*unstarted.done.lock().unwrap());
+        assert!(unstarted.job.lock().unwrap().is_none());
+
+        let running = Arc::new(Build::new(Box::new(|| 0), false));
+        let running_job = running.job.lock().unwrap().take().unwrap();
+        running.owners.store(0, Ordering::Release);
+        running.orphan.store(true, Ordering::Release);
+        drop_unstarted_job(&running);
+        assert!(!running.completed.load(Ordering::Acquire), "an orphaned running job completed before its worker");
+        complete(&running, running_job());
+        assert!(running.completed.load(Ordering::Acquire));
     }
 
     #[test]
@@ -7684,7 +7762,7 @@ impl PipelineResolution {
             if promoted.get().is_none()
                 && pending.build.owners.load(Ordering::Acquire) != 0
                 && !pending.build.orphan.load(Ordering::Acquire)
-                && !*pending.build.done.lock().unwrap())
+                && !pending.build.completed.load(Ordering::Acquire))
     }
 
     /// Promote this retained bind's exact initial build for a deferred submit without looking up
@@ -7756,6 +7834,8 @@ fn promote_initial_choice(
 pub struct PipelineResolutionBench {
     retained_ready: PipelineResolution,
     initial_completed: PipelineResolution,
+    initial_unpromoted_shared: PipelineResolution,
+    initial_unpromoted_distinct: Vec<PipelineResolution>,
     registry_original: usize,
     registry_pending: Arc<Pending>,
     _raw_owners: Vec<ID3D12PipelineState>,
@@ -7862,8 +7942,9 @@ impl PipelineResolutionBench {
         });
         let finish = |pending: &Pending, raw| {
             drop(pending.build.job.lock().unwrap().take());
+            let done = pending.build.done.lock().unwrap();
             pending.build.real.store(raw, Ordering::Release);
-            *pending.build.done.lock().unwrap() = true;
+            pending.build.publish_completed(done);
         };
 
         let ready_pending = make_pending();
@@ -7877,6 +7958,15 @@ impl PipelineResolutionBench {
         finish(&initial_pending, raws[1]);
         let _ = Self::consume(initial_completed.resolve_for_emission());
 
+        let make_unpromoted = || {
+            let pending = make_pending();
+            let resolution = PipelineResolution(classify_retained(raws[1] ^ 0x303, &pending));
+            finish(&pending, raws[1]);
+            resolution
+        };
+        let initial_unpromoted_shared = make_unpromoted();
+        let initial_unpromoted_distinct = (0..8).map(|_| make_unpromoted()).collect();
+
         let registry_pending = make_pending();
         finish(&registry_pending, raws[2]);
         let registry_original = raws[2] ^ 0x404;
@@ -7887,6 +7977,8 @@ impl PipelineResolutionBench {
         Self {
             retained_ready,
             initial_completed,
+            initial_unpromoted_shared,
+            initial_unpromoted_distinct,
             registry_original,
             registry_pending,
             _raw_owners: raw_owners,
@@ -7921,6 +8013,21 @@ impl PipelineResolutionBench {
             return 0;
         }
         Self::consume(self.initial_completed.resolve_for_emission())
+    }
+
+    #[inline(never)]
+    pub fn initial_unpromoted_shared_probe(&self) -> bool {
+        self.initial_unpromoted_shared.initial_build_pending()
+    }
+
+    #[inline(never)]
+    pub fn initial_unpromoted_distinct_probe(&self, worker: usize) -> bool {
+        self.initial_unpromoted_distinct[worker % self.initial_unpromoted_distinct.len()].initial_build_pending()
+    }
+
+    #[inline(never)]
+    pub fn initial_promoted_probe(&self) -> bool {
+        self.initial_completed.initial_build_pending()
     }
 
     fn consume(choice: PipelineChoice) -> usize {
