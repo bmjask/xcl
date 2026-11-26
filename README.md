@@ -354,6 +354,13 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     between submit preparation and synchronous readback, and other refresh work). A negative
     `other` exposes an overlapping or stale sample; unavailable
     adapter segments say `unknown`. Where the lines stop changing is where the title stopped.
+  - `XCL_PSO_PRESSURE_OBSERVE=1`: every 2 seconds, shadow the compute-pipeline eviction policy
+    without changing residency. It retains rebuild inputs and logs bounded policy outcomes when
+    adapter-local usage reaches 90% of budget. `XCL_ACTIVITY` is not required.
+  - `XCL_PSO_PRESSURE_EVICT=1`: enable that policy. At most one rebuildable non-console compute
+    pipeline unused for 600 frames and resident for 60 frames is evicted per sample (at most 32
+    candidates scanned and 8 exact transactions attempted); demand restores its exact identity.
+    Eviction stops below 75% of budget. This experimental opt-in takes precedence over observe mode.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
