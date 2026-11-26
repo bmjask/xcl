@@ -87,6 +87,7 @@ fn stall_kind_name(kind: crate::stall::StallKind) -> &'static str {
         StallKind::ShaderTranslation => "shader_translation",
         StallKind::DxcQueue => "dxc_queue",
         StallKind::DxcCompile => "dxc_compile",
+        StallKind::PipelineQueueAdmission => "pipeline_queue_admission",
         StallKind::PipelineQueueSpeculative => "pipeline_queue_speculative",
         StallKind::PipelineQueueDemand => "pipeline_queue_demand",
         StallKind::PipelineWait => "pipeline_wait",
@@ -422,6 +423,7 @@ mod tests {
 
     #[test]
     fn pipeline_queue_stall_names_are_stable() {
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueAdmission), "pipeline_queue_admission");
         assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueSpeculative), "pipeline_queue_speculative");
         assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueDemand), "pipeline_queue_demand");
     }
