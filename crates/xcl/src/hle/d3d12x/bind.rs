@@ -674,8 +674,8 @@ unsafe fn execute_indirect_snapshot(
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if compute && max == 1 && count_buf == 0 && signature.dispatch_only().is_some() {
         let chained = indirect_address(args, args_off_title, args_off).map_or(Ok(false), |address| {
-            super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), address,
-                |root| bind_abi_with_root_resolved(this, list, pso, false, root, None, [0; 3]).map(|_| ()))
+            super::real::dispatch_chain::execute_indirect(list, raw_pso, pso, with(this, |s| s.allocator), address,
+                |root| bind_abi_with_root_resolved(this, list, raw_pso, pso, false, root, [0; 3]).map(|_| ()))
         });
         match chained {
             Ok(true) => {
@@ -693,12 +693,14 @@ unsafe fn execute_indirect_snapshot(
             }
         }
     }
-    match bind_abi_resolved(this, list, pso, gfx) {
+    match bind_abi_resolved(this, list, raw_pso, pso, gfx) {
         Ok(()) => {
             if compute {
                 if super::real::pso_dispatch_remap_exact(pso).is_some() {
                     match super::real::remap_fallback::whole_exact(pso) {
-                        Ok(fallback) => list.SetPipelineState(&fallback),
+                        Ok(fallback) => super::real::bind_pipeline_exact(
+                            this, raw_pso, fallback.as_raw() as usize,
+                        ),
                         Err(e) => {
                             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -710,7 +712,9 @@ unsafe fn execute_indirect_snapshot(
                     }
                 }
                 match super::real::dispatch_chain::whole(pso) {
-                    Ok(Some(whole)) => list.SetPipelineState(&whole),
+                    Ok(Some(whole)) => super::real::bind_pipeline_exact(
+                        this, raw_pso, whole.as_raw() as usize,
+                    ),
                     Ok(None) => {}
                     Err(e) => {
                         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -917,6 +921,8 @@ static LAST_ABI_PSO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 #[cfg(test)]
 static STOP_ABI_LIST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
+static STOP_ABI_AFTER_BIND_LIST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
 static STOP_ABI_TEST: Mutex<()> = Mutex::new(());
 
 /// #13 DrawIndexedInstanced
@@ -1027,7 +1033,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<(ID3D12GraphicsCommandList
     if super::present::trace_frame() {
         trace_ui_draw(this, pso, real);
     }
-    match bind_abi_resolved(this, &list, real, true) {
+    match bind_abi_resolved(this, &list, pso, real, true) {
         Ok(()) => {
             count(DRAWS);
             Some((list, real))
@@ -1528,7 +1534,7 @@ unsafe fn translated_dispatch(
         trace_fullscreen(this, pso, [x, y, z]);
     }
     let allocator = bind_compute_abi_resolved(this, list, original, pso, limits)?;
-    super::real::dispatch_chain::dispatch(list, pso, allocator, [x, y, z])
+    super::real::dispatch_chain::dispatch(list, original, pso, allocator, [x, y, z])
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
@@ -1592,8 +1598,10 @@ fn prepared_abi_io(
     io
 }
 
-unsafe fn bind_abi_resolved(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    bind_abi_with_root_resolved(this, list, pso, gfx, 0, None, [0; 3]).map(|_| ())
+unsafe fn bind_abi_resolved(
+    this: *mut c_void, list: &ID3D12GraphicsCommandList, original: usize, pso: usize, gfx: bool,
+) -> Result<(), String> {
+    bind_abi_with_root_resolved(this, list, original, pso, gfx, 0, [0; 3]).map(|_| ())
 }
 
 unsafe fn bind_compute_abi_resolved(
@@ -1603,12 +1611,12 @@ unsafe fn bind_compute_abi_resolved(
     pso: usize,
     limits: [u32; 3],
 ) -> Result<usize, String> {
-    bind_abi_with_root_resolved(this, list, pso, false, 0, Some(original), limits)
+    bind_abi_with_root_resolved(this, list, original, pso, false, 0, limits)
 }
 
 unsafe fn bind_abi_with_root_resolved(
-    this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
-    exact_original: Option<usize>, limits: [u32; 3],
+    this: *mut c_void, list: &ID3D12GraphicsCommandList, original: usize, pso: usize, gfx: bool,
+    root: usize, limits: [u32; 3],
 ) -> Result<usize, String> {
     #[cfg(test)]
     {
@@ -1616,6 +1624,12 @@ unsafe fn bind_abi_with_root_resolved(
             LAST_ABI_PSO.store(pso, Ordering::Release);
             return Err("stopped after resolved PSO for test".into());
         }
+    }
+    #[cfg(test)]
+    if STOP_ABI_AFTER_BIND_LIST.load(Ordering::Acquire) == this as usize && root == 0 {
+        super::real::bind_pipeline_exact(this, original, pso);
+        LAST_ABI_PSO.store(pso, Ordering::Release);
+        return Err("stopped after exact native bind for test".into());
     }
     let shared_view_bound = super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
@@ -1650,13 +1664,7 @@ unsafe fn bind_abi_with_root_resolved(
         }
     }
     if root == 0 {
-        let pso = pso as *mut c_void;
-        let pc = ID3D12PipelineState::from_raw_borrowed(&pso).ok_or("pipeline")?;
-        if let Some(original) = exact_original {
-            super::real::bind_pipeline_exact(this, original, pso as usize);
-        } else {
-            list.SetPipelineState(pc);
-        }
+        super::real::bind_pipeline_exact(this, original, pso);
     }
     if shared_view_bound && super::vram::srv_tracking_enabled() {
         super::list_x::note_shared_view_heap_use(this);
@@ -2236,21 +2244,46 @@ void main(uint t : SV_GroupIndex) {
     #[test]
     fn graphics_entrypoints_pass_the_retained_raw_to_the_abi() {
         let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0), set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let _class = real::test_command_list_class(
+            orig_vt.as_ptr() as usize,
+            unsafe { ext_vt.as_ptr().add(1) } as usize,
+        );
         let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
-        let list = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
-        let list = &list as *const ResolutionPso as *mut c_void;
         let mut old = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let mut replacement = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut selected_alias = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let old_raw = &mut old as *mut ResolutionPso as usize;
         let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let selected_alias_raw = &mut selected_alias as *mut ResolutionPso as usize;
         let standin = 0x7100_4898usize;
         pso_async::submit_lazy(standin, false, Box::new(move || old_raw), 0);
         assert_eq!(pso_async::resolve_wait(standin), old_raw);
         real::register_translated_graphics_for_test(old_raw);
+        unsafe { list_x::on_create(list, 0, standin, D3D12_COMMAND_LIST_TYPE_DIRECT) };
         set_tracked_pipeline_state(list, standin);
         assert_eq!(pso_async::released(standin), old_raw);
         pso_async::submit_lazy(standin, false, Box::new(move || replacement_raw), 0);
-        STOP_ABI_LIST.store(list as usize, Ordering::Release);
+        let alias_calls = Arc::new(AtomicUsize::new(0));
+        let selected_calls = alias_calls.clone();
+        pso_async::submit_lazy(old_raw, false, Box::new(move || {
+            selected_calls.fetch_add(1, Ordering::Relaxed);
+            selected_alias_raw
+        }), 0);
+        STOP_ABI_AFTER_BIND_LIST.store(list as usize, Ordering::Release);
 
         LAST_ABI_PSO.store(0, Ordering::Release);
         assert!(unsafe { graphics_bound(list) }.is_none());
@@ -2259,14 +2292,22 @@ void main(uint t : SV_GroupIndex) {
         assert!(unsafe { prepare_indexed_draw(list, 3, 1, 0, 0) }.is_none());
         assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), old_raw,
             "indexed draw must reuse the retained generation, not the title or replacement address");
+        assert_eq!(fake.last_pso.load(Ordering::Acquire), old_raw);
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(alias_calls.load(Ordering::Relaxed), 0, "graphics ABI bind ran selected raw's alias build");
+        assert_eq!(list_x::bound_pipeline_for_test(list as usize), standin,
+            "graphics ABI bind replaced title-visible pipeline state");
 
-        STOP_ABI_LIST.store(0, Ordering::Release);
+        STOP_ABI_AFTER_BIND_LIST.store(0, Ordering::Release);
         forget(list);
         list_x::clear_segment_state(list as usize);
+        list_x::on_release(list as usize);
         assert_eq!(pso_async::released(standin), 0);
+        assert_eq!(pso_async::released(old_raw), 0);
         real::forget_pso_for_test(old_raw);
         assert_eq!(unsafe { resolution_release(old_raw as *mut c_void) }, 0);
         assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(selected_alias_raw as *mut c_void) }, 0);
     }
 
     #[test]
@@ -2319,6 +2360,7 @@ void main(uint t : SV_GroupIndex) {
         let mut orig_vt = [0usize; 64];
         orig_vt[1] = fake_add_ref as usize;
         orig_vt[2] = fake_release as usize;
+        orig_vt[25] = fake_set_pso as usize;
         orig_vt[59] = fake_execute_indirect as usize;
         let mut ext_vt = vec![0usize; 65];
         ext_vt[0] = orig_vt.as_ptr() as usize;
@@ -2337,14 +2379,17 @@ void main(uint t : SV_GroupIndex) {
         let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
         let mut original = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let mut replacement = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut selected_alias = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let original_raw = &mut original as *mut ResolutionPso as usize;
         let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let selected_alias_raw = &mut selected_alias as *mut ResolutionPso as usize;
         let standin = 0x7100_48B0usize;
         let signature = IndirectSignatureInfo::new(true, false, None);
 
         pso_async::submit_lazy(standin, true, Box::new(move || original_raw), 0);
         assert_eq!(pso_async::resolve_wait(standin), original_raw);
         real::register_translated_compute_for_test(original_raw);
+        unsafe { list_x::on_create(list, 0, standin, D3D12_COMMAND_LIST_TYPE_DIRECT) };
         set_tracked_pipeline_state(list, standin);
         let original_owner = pso_async::released(standin);
         let replacement_calls = Arc::new(AtomicUsize::new(0));
@@ -2353,22 +2398,37 @@ void main(uint t : SV_GroupIndex) {
             calls.fetch_add(1, Ordering::Relaxed);
             replacement_raw
         }), 0);
-        STOP_ABI_LIST.store(list as usize, Ordering::Release);
+        let alias_calls = Arc::new(AtomicUsize::new(0));
+        let selected_calls = alias_calls.clone();
+        pso_async::submit_lazy(original_raw, true, Box::new(move || {
+            selected_calls.fetch_add(1, Ordering::Relaxed);
+            selected_alias_raw
+        }), 0);
+        STOP_ABI_AFTER_BIND_LIST.store(list as usize, Ordering::Release);
         for _ in 0..2 {
             LAST_ABI_PSO.store(0, Ordering::Release);
             unsafe { execute_indirect_classified(list, 1, 1, 0, 0, 0, 0, signature) };
             assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), original_raw);
+            assert_eq!(fake.last_pso.load(Ordering::Acquire), original_raw,
+                "selected raw was redirected through its registry alias at native bind");
         }
         assert_eq!(replacement_calls.load(Ordering::Relaxed), 0, "ExecuteIndirect ran a replacement build at the reused title address");
+        assert_eq!(alias_calls.load(Ordering::Relaxed), 0, "ExecuteIndirect ran the selected raw's alias build");
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(list_x::bound_pipeline_for_test(list as usize), standin,
+            "exact internal bind replaced title-visible pipeline state");
         assert_eq!(list_x::native_generation_count_for_test(list as usize), 1, "repeated ExecuteIndirect duplicated its exact pin");
 
-        STOP_ABI_LIST.store(0, Ordering::Release);
+        STOP_ABI_AFTER_BIND_LIST.store(0, Ordering::Release);
         forget(list);
         list_x::clear_segment_state(list as usize);
+        list_x::on_release(list as usize);
         assert_eq!(pso_async::released(standin), 0);
+        assert_eq!(pso_async::released(original_raw), 0);
         real::forget_pso_for_test(original_raw);
         assert_eq!(unsafe { resolution_release(original_owner as *mut c_void) }, 0);
         assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(selected_alias_raw as *mut c_void) }, 0);
     }
 
     #[test]

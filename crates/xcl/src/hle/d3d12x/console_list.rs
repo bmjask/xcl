@@ -929,10 +929,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         for k in 0..4 {
                             list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
                         }
-                        let raw = real as *mut c_void;
-                        let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
-                        list.SetPipelineState(pc);
-                        super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z])?;
+                        super::real::bind_pipeline_exact(list.as_raw(), (*p).pc, real);
+                        super::real::dispatch_chain::dispatch(&list, (*p).pc, real, st.allocator, [x, y, z])?;
                         recording_uses_shared_view |= track_shared_view && shared_view_bound;
                         out.dispatches += 1;
                     }

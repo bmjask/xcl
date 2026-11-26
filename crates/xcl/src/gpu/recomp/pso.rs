@@ -1456,6 +1456,7 @@ pub(crate) fn dispatch_slabs(grid: [u32; 3], most: u64) -> Vec<([u32; 3], [u32; 
 pub(crate) unsafe fn record_dispatch_chain<'a>(
     list: &ID3D12GraphicsCommandList, grid: [u32; 3], most: u64, scratch: &ID3D12Resource, used: bool,
     pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
+    mut bind_pipeline: impl FnMut(&ID3D12PipelineState),
 ) {
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
     for (slab, (origin, size)) in dispatch_slabs(grid, most).into_iter().enumerate() {
@@ -1467,7 +1468,7 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
         }
         let constants = [x, y, z, i as u32, ox, oy, oz, 0];
         list.SetComputeRoot32BitConstants(7, 8, constants.as_ptr().cast(), 0);
-        list.SetPipelineState(piece);
+        bind_pipeline(piece);
         list.Dispatch(x, y, z);
     }
     }
@@ -1568,13 +1569,14 @@ pub(crate) unsafe fn chain_commands_storage(dev: &ID3D12Device, bytes: u64) -> O
 
 pub(crate) unsafe fn record_indirect_slicer(
     list: &ID3D12GraphicsCommandList, args: u64, rounds: u32, most: u64, out: &ID3D12Resource,
+    mut bind_pipeline: impl FnMut(&ID3D12PipelineState),
 ) -> Result<(), String> {
     let mut dev = None;
     list.GetDevice(&mut dev).map_err(|e| e.to_string())?;
     let (rs, pso) = indirect_slicer(&dev.ok_or("device")?)?;
     let constants = [rounds, most.min(u64::from(u32::MAX)) as u32];
     list.SetComputeRootSignature(&rs);
-    list.SetPipelineState(&pso);
+    bind_pipeline(&pso);
     list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
     list.SetComputeRootShaderResourceView(1, args);
     list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
@@ -1602,6 +1604,7 @@ pub(crate) unsafe fn restore_indirect_commands(list: &ID3D12GraphicsCommandList,
 pub(crate) unsafe fn record_dispatch_chain_indirect<'a>(
     list: &ID3D12GraphicsCommandList, sig: &ID3D12CommandSignature, commands: &ID3D12Resource, rounds: u32,
     scratch: &ID3D12Resource, pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
+    mut bind_pipeline: impl FnMut(&ID3D12PipelineState),
 ) {
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
     for r in 0..rounds {
@@ -1610,7 +1613,7 @@ pub(crate) unsafe fn record_dispatch_chain_indirect<'a>(
         for piece in pieces.clone() {
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
-            list.SetPipelineState(piece);
+            bind_pipeline(piece);
             list.ExecuteIndirect(sig, 1, commands, offset + CHAIN_DISPATCH_AT, None::<&ID3D12Resource>, 0);
         }
     }
