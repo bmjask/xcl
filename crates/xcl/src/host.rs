@@ -135,6 +135,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             crate::report::write_final(None);
             crate::log::flush();
             crate::hle::d3d12x::pso_async::shutdown_used();
+            crate::hle::d3d12x::real::shutdown_indirect_split_records(std::time::Duration::from_millis(500));
             crate::hle::d3d12x::real::end_title(0);
         });
     }
@@ -180,5 +181,6 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     crate::hle::d3d12x::pso_async::shutdown_used();
+    crate::hle::d3d12x::real::shutdown_indirect_split_records(std::time::Duration::from_millis(500));
     code as i32
 }
