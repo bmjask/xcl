@@ -563,19 +563,54 @@ pub(super) unsafe fn execute_indirect_classified(
     this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64,
     count_buf: usize, count_off: u64, signature: IndirectSignatureInfo,
 ) {
+    let (pso, resolution) = with(this, |state| (state.pso, state.resolution.clone()));
+    execute_indirect_snapshot(
+        this, sig, max, args, args_off, count_buf, count_off, signature, pso, resolution, true,
+    )
+}
+
+pub(super) unsafe fn execute_indirect_retained(
+    this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64,
+    count_buf: usize, count_off: u64, signature: IndirectSignatureInfo,
+) {
+    let (pso, resolution) = with(this, |state| (state.pso, state.resolution.clone()));
+    execute_indirect_snapshot(
+        this, sig, max, args, args_off, count_buf, count_off, signature, pso, resolution, false,
+    )
+}
+
+unsafe fn execute_indirect_snapshot(
+    this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64,
+    count_buf: usize, count_off: u64, signature: IndirectSignatureInfo, raw_pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>, allow_defer: bool,
+) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let raw_pso = with(this, |s| s.pso);
     let dispatches = signature.dispatches();
     let _detail = crate::stall::detail_span(if dispatches { crate::stall::StallKind::DetailDispatch } else { crate::stall::StallKind::DetailDraw });
-    let unbuilt_compute = dispatches && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
-    if unbuilt_compute && super::list_x::defer(this, raw_pso, super::list_x::Deferred::Indirect(
-        sig, max, args, args_off, count_buf, count_off, signature,
-    )) {
-        return;
+    let retained_compute = resolution.as_ref().map(|resolution| resolution.is_compute());
+    if allow_defer && dispatches && retained_compute == Some(true) {
+        let resolution = resolution.as_ref().unwrap();
+        if super::list_x::defer_retained(this, resolution, super::list_x::Deferred::Indirect {
+            sig, max, args, args_off, count_buf, count_off, signature,
+        }) { return }
     }
-    let ((pso, bound_unbuilt), generation) = super::pso_async::resolve_wait_bound_and_pin_if_enabled(raw_pso);
-    super::list_x::record_native_generation(this as usize, generation);
+    let (pso, bound_unbuilt) = match resolution {
+        Some(resolution) => match resolution.resolve_for_indirect() {
+            super::pso_async::IndirectPipelineChoice::Exact { raw, generation } => {
+                super::list_x::record_native_generation(this as usize, Some(generation));
+                (raw, false)
+            }
+            super::pso_async::IndirectPipelineChoice::InitialFallback { raw, bound_unbuilt } => {
+                (raw, bound_unbuilt)
+            }
+            super::pso_async::IndirectPipelineChoice::Unavailable => {
+                count_indirect_skip(dispatches);
+                return;
+            }
+        },
+        None => (raw_pso, false),
+    };
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let args_off_title = args_off;
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -586,7 +621,7 @@ pub(super) unsafe fn execute_indirect_classified(
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if bound_unbuilt {
-            count(DRAWS_SKIPPED);
+            count_indirect_skip(dispatches);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -614,7 +649,7 @@ pub(super) unsafe fn execute_indirect_classified(
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
         // the driver pipeline `resolve_wait` returned.)
-        if dispatches && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
+        if dispatches && retained_compute.unwrap_or_else(|| super::real::is_console_compute(raw_pso)) {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -698,6 +733,26 @@ pub(super) unsafe fn execute_indirect_classified(
             }
         }
     }
+}
+
+fn count_indirect_skip(dispatches: bool) {
+    count(if dispatches { DISPATCHES_SKIPPED } else { DRAWS_SKIPPED });
+    #[cfg(test)]
+    INDIRECT_SKIP_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        next[dispatches as usize] += 1;
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static INDIRECT_SKIP_COUNTS: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+#[cfg(test)]
+fn take_indirect_skip_counts() -> [u32; 2] {
+    INDIRECT_SKIP_COUNTS.with(|counts| counts.replace([0; 2]))
 }
 
 unsafe fn indirect_address(resource: usize, title_offset: u64, pc_offset: u64) -> Option<u64> {
@@ -2259,6 +2314,214 @@ void main(uint t : SV_GroupIndex) {
     }
 
     #[test]
+    fn execute_indirect_uses_retained_generation_after_address_reuse() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0), set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let _class = real::test_command_list_class(
+            orig_vt.as_ptr() as usize,
+            unsafe { ext_vt.as_ptr().add(1) } as usize,
+        );
+        let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut original = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let original_raw = &mut original as *mut ResolutionPso as usize;
+        let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let standin = 0x7100_48B0usize;
+        let signature = IndirectSignatureInfo::new(true, false, None);
+
+        pso_async::submit_lazy(standin, true, Box::new(move || original_raw), 0);
+        assert_eq!(pso_async::resolve_wait(standin), original_raw);
+        real::register_translated_compute_for_test(original_raw);
+        set_tracked_pipeline_state(list, standin);
+        let original_owner = pso_async::released(standin);
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let calls = replacement_calls.clone();
+        pso_async::submit_lazy(standin, true, Box::new(move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            replacement_raw
+        }), 0);
+        STOP_ABI_LIST.store(list as usize, Ordering::Release);
+        for _ in 0..2 {
+            LAST_ABI_PSO.store(0, Ordering::Release);
+            unsafe { execute_indirect_classified(list, 1, 1, 0, 0, 0, 0, signature) };
+            assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), original_raw);
+        }
+        assert_eq!(replacement_calls.load(Ordering::Relaxed), 0, "ExecuteIndirect ran a replacement build at the reused title address");
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 1, "repeated ExecuteIndirect duplicated its exact pin");
+
+        STOP_ABI_LIST.store(0, Ordering::Release);
+        forget(list);
+        list_x::clear_segment_state(list as usize);
+        assert_eq!(pso_async::released(standin), 0);
+        real::forget_pso_for_test(original_raw);
+        assert_eq!(unsafe { resolution_release(original_owner as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn execute_indirect_native_snapshot_ignores_a_later_registry_alias() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0), set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let native = 0x7100_48B2usize;
+        reset(list, 0, native);
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let calls = build_calls.clone();
+        pso_async::submit_lazy(native, true, Box::new(move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            0x7100_48B3
+        }), 0);
+
+        unsafe { execute_indirect_classified(list, 1, 1, 0, 0, 0, 0, IndirectSignatureInfo::default()) };
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(build_calls.load(Ordering::Relaxed), 0, "native ExecuteIndirect re-resolved its raw address through the registry");
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 0);
+
+        forget(list);
+        let _ = pso_async::released(native);
+    }
+
+    #[test]
+    fn deferred_execute_indirect_replays_its_inherited_resolution_once() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let make_list = || Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0), set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let source_object = make_list();
+        let replay_object = make_list();
+        let source = &*source_object as *const FakeAdoptedList as *mut c_void;
+        let replay = &*replay_object as *const FakeAdoptedList as *mut c_void;
+        let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut old = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let old_raw = &mut old as *mut ResolutionPso as usize;
+        let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let standin = 0x7100_48B4usize;
+
+        pso_async::submit_lazy(standin, true, Box::new(move || old_raw), 0);
+        assert_eq!(pso_async::resolve_wait(standin), old_raw);
+        real::register_translated_compute_for_test(old_raw);
+        set_tracked_pipeline_state(source, standin);
+        let (inherited_pso, inherited_resolution) = with(source, |state| {
+            (state.pso, state.resolution.clone())
+        });
+        with(replay, |state| {
+            state.pso = inherited_pso;
+            state.resolution = inherited_resolution;
+        });
+
+        let old_owner = pso_async::released(standin);
+        pso_async::submit_lazy(standin, true, Box::new(move || replacement_raw), 0);
+        set_tracked_pipeline_state(source, standin);
+        STOP_ABI_LIST.store(replay as usize, Ordering::Release);
+        LAST_ABI_PSO.store(0, Ordering::Release);
+        unsafe {
+            execute_indirect_retained(
+                replay, 1, 1, 0, 0, 0, 0, IndirectSignatureInfo::new(true, false, None),
+            )
+        };
+        assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), old_raw);
+        assert_eq!(list_x::native_generation_count_for_test(replay as usize), 1);
+        assert_eq!(list_x::native_generation_count_for_test(source as usize), 0,
+            "deferred replay recursively split or pinned the source segment");
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 1,
+            "deferred replay resolved the replacement generation");
+
+        STOP_ABI_LIST.store(0, Ordering::Release);
+        forget(source);
+        forget(replay);
+        list_x::clear_segment_state(replay as usize);
+        assert_eq!(pso_async::released(standin), 0);
+        real::forget_pso_for_test(old_raw);
+        assert_eq!(unsafe { resolution_release(old_owner as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn unavailable_execute_indirect_counts_one_signature_selected_skip() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0), set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        STOP_ABI_LIST.store(list as usize, Ordering::Release);
+        LAST_ABI_PSO.store(0, Ordering::Release);
+        let _ = take_indirect_skip_counts();
+
+        let compute = pso_async::pipeline_resolution_for_compute_test(0x7100_48B6, || {});
+        with(list, |state| {
+            state.pso = 0x7100_48B6;
+            state.resolution = Some(compute.unavailable_for_test());
+        });
+        unsafe {
+            execute_indirect_retained(
+                list, 1, 1, 0, 0, 0, 0, IndirectSignatureInfo::new(true, false, None),
+            )
+        };
+        assert_eq!(take_indirect_skip_counts(), [0, 1]);
+
+        let graphics = pso_async::pipeline_resolution_for_test(0x7100_48B7, || {});
+        with(list, |state| {
+            state.pso = 0x7100_48B7;
+            state.resolution = Some(graphics.unavailable_for_test());
+        });
+        unsafe {
+            execute_indirect_retained(list, 1, 1, 0, 0, 0, 0, IndirectSignatureInfo::default())
+        };
+        assert_eq!(take_indirect_skip_counts(), [1, 0]);
+        assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), 0, "unavailable resolution reached ABI binding");
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0, "unavailable resolution reached PC ExecuteIndirect");
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 0);
+
+        STOP_ABI_LIST.store(0, Ordering::Release);
+        forget(list);
+    }
+
+    #[test]
     fn dispatch_waits_outside_states_and_selects_the_build_once() {
         let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
@@ -2763,10 +3026,13 @@ void main(uint t : SV_GroupIndex) {
         let sig = 0x7301_2830usize;
         let original = IndirectSignatureInfo::new(true, false, Some(12));
         note_indirect_signature(sig, original);
-        let deferred = list_x::Deferred::Indirect(1, 2, 3, 4, 5, 6, indirect_signature(sig));
+        let deferred = list_x::Deferred::Indirect {
+            sig: 1, max: 2, args: 3, args_off: 4, count_buf: 5, count_off: 6,
+            signature: indirect_signature(sig),
+        };
         note_indirect_signature(sig, IndirectSignatureInfo::new(false, true, None));
 
-        let list_x::Deferred::Indirect(_, _, _, _, _, _, retained) = deferred else { unreachable!() };
+        let list_x::Deferred::Indirect { signature: retained, .. } = deferred else { unreachable!() };
         assert_eq!(retained, original,
             "deferred replay followed the classification now stored at a reused signature address");
     }

@@ -789,7 +789,10 @@ pub(super) enum Deferred {
     Dispatch(u32, u32, u32, u32),
     /// Raw signature/resources rely on the existing D3D12 caller lifetime requirement through
     /// execution; this stage retains only the immutable classification snapshot.
-    Indirect(usize, u32, usize, u64, usize, u64, super::bind::IndirectSignatureInfo),
+    Indirect {
+        sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64,
+        signature: super::bind::IndirectSignatureInfo,
+    },
 }
 
 /// Why a recording needs a physical command-list boundary.
@@ -3673,11 +3676,6 @@ fn wait_target_after_split(list: *mut c_void, placement: WaitPlacement, continua
     }
 }
 
-/// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
-pub(super) unsafe fn defer(list: *mut c_void, pso: usize, what: Deferred) -> bool {
-    defer_with(list, what, super::pso_async::waits_bounded(), || { super::pso_async::need_by_submit(pso); })
-}
-
 /// Defer a direct dispatch against the bind's retained pipeline identity. Address reuse after
 /// SetPipelineState cannot redirect either the demand or the later exact emission.
 pub(super) unsafe fn defer_retained(
@@ -3769,8 +3767,8 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         }
         match what {
             Deferred::Dispatch(x, y, z, flags) => super::bind::dispatch_flags(seg, x, y, z, flags),
-            Deferred::Indirect(sig, max, args, args_off, count_buf, count_off, signature) => {
-                super::bind::execute_indirect_classified(
+            Deferred::Indirect { sig, max, args, args_off, count_buf, count_off, signature } => {
+                super::bind::execute_indirect_retained(
                     seg, sig, max, args, args_off, count_buf, count_off, signature,
                 )
             }
