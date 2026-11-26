@@ -87,6 +87,8 @@ fn stall_kind_name(kind: crate::stall::StallKind) -> &'static str {
         StallKind::ShaderTranslation => "shader_translation",
         StallKind::DxcQueue => "dxc_queue",
         StallKind::DxcCompile => "dxc_compile",
+        StallKind::PipelineQueueSpeculative => "pipeline_queue_speculative",
+        StallKind::PipelineQueueDemand => "pipeline_queue_demand",
         StallKind::PipelineWait => "pipeline_wait",
         StallKind::DriverCompileGate => "driver_compile_gate",
         StallKind::DriverCompile => "driver_compile",
@@ -416,6 +418,12 @@ mod tests {
         assert_eq!(json["slow_events"][0]["kind"], "gpu_wait");
         assert_eq!(json["slow_events"][0]["sequence"], 7);
         assert_eq!(json["slow_events"][0]["duration_ns"], 50_000_000);
+    }
+
+    #[test]
+    fn pipeline_queue_stall_names_are_stable() {
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueSpeculative), "pipeline_queue_speculative");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueDemand), "pipeline_queue_demand");
     }
 
     #[test]
