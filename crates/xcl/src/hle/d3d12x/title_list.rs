@@ -533,7 +533,6 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
                 rel(raw);
             }
         }
-        super::bind::forget(pc);
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n
@@ -565,6 +564,39 @@ mod tests {
     }
     unsafe extern "system" fn fake_this(this: *mut c_void, a: u64, b: u64, c: u64, d: u64) -> u64 {
         this as u64 + a + 10 * b + 100 * c + 1000 * d
+    }
+
+    const REUSED_PSO: usize = 0x7E57_D102;
+
+    unsafe extern "system" fn reuse_release(this: *mut c_void) -> u32 {
+        let fake = &mut *(this as *mut Fake);
+        fake.refs -= 1;
+        if fake.refs == 0 {
+            // The adopted list forgets before the native runtime frees it. Model an allocator
+            // immediately handing the same address to a new list before Release returns.
+            super::super::bind::forget(this);
+            super::super::bind::reset(this, 0, REUSED_PSO);
+        }
+        fake.refs
+    }
+
+    #[test]
+    fn wrapper_release_does_not_forget_a_new_list_at_the_reused_primary_address() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = reuse_release as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        unsafe {
+            let wrapper = wrap(primary as *mut c_void);
+            super::super::bind::reset(primary as *mut c_void, 0, REUSED_PSO + 1);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*(*(wrapper as *const *const usize)).add(2));
+            assert_eq!(rel(wrapper), 0);
+            assert_eq!(super::super::bind::tracked_pso(primary as *mut c_void), REUSED_PSO);
+            super::super::bind::forget(primary as *mut c_void);
+            drop(Box::from_raw(primary));
+        }
     }
 
     #[test]
