@@ -1193,6 +1193,13 @@ enum UploadPlanInvalid {
     SentHashes,
     SourceHashes,
 }
+/// Private owned stand-in for a future mapped staging allocation. Keeping the copied bytes here
+/// makes it impossible for the record/execute callback to retain a borrowed title-memory view.
+#[allow(dead_code)]
+struct OwnedUploadStaging {
+    range: UploadRingRange,
+    bytes: Box<[u8]>,
+}
 
 fn build_upload_pages(
     claimed: &[(usize, WorkReasons)], mut observe: impl FnMut(usize) -> Option<UploadPageObservation>,
@@ -1634,15 +1641,6 @@ impl Drop for UploadReservation {
         }
     }
 }
-
-/// Private owned stand-in for a future mapped staging allocation. Keeping the copied bytes here
-/// makes it impossible for the record/execute callback to retain a borrowed title-memory view.
-#[allow(dead_code)]
-struct OwnedUploadStaging {
-    range: UploadRingRange,
-    bytes: Box<[u8]>,
-}
-
 
 enum CoordinatedPublishError {
     Reservation(UploadReservationError),
@@ -4528,6 +4526,21 @@ mod tests {
     }
 
     #[test]
+    fn late_claim_completion_cannot_change_a_newer_owner() {
+        let mut ledger = WorkClaimLedger::new(11);
+        ledger.add_dirty_pages([0x8000]);
+        let old = ledger.claim(1).unwrap();
+        assert_eq!(ledger.commit(old.token), WorkClaimResolution::Committed);
+
+        ledger.add_retry_pages([0x8000]);
+        let newer = ledger.claim(1).unwrap();
+        assert_eq!(ledger.restore(old.token), WorkClaimResolution::AlreadyFinished);
+        assert_eq!(ledger.owners.get(&0x8000), Some(&newer.token.serial));
+        assert_eq!(ledger.commit(newer.token), WorkClaimResolution::Committed);
+        assert!(ledger.available.is_empty());
+    }
+
+    #[test]
     fn foreground_queue_cannot_pass_or_steal_an_unreceipted_claim() {
         let mut frontier = ClaimFrontier::new(23);
         let planner = frontier.claim(100).unwrap();
@@ -4621,6 +4634,51 @@ mod tests {
         takeover.next_lease = u64::MAX;
         assert_eq!(takeover.take_over(token, 2), Err(ClaimFrontierError::Exhausted));
         assert_eq!(takeover.observe(43, token.epoch, 1), Ok(ClaimFrontierAction::Progress(token)));
+    }
+
+    #[test]
+    fn work_claim_ledger_merges_orders_and_restores_exact_out_of_order_work() {
+        let mut ledger = WorkClaimLedger::new(7);
+        ledger.add_zero_ranges(&[(0x3000, 2 * PAGE)]);
+        ledger.add_retry_pages([0x3001, 0x1000, 0x1000]);
+        ledger.add_dirty_pages([0x4000, 0x6001, 0x6000]);
+
+        let first = ledger.claim(2).unwrap();
+        assert_eq!(first.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x1000, WorkReasons::RETRY.0),
+            (0x3000, WorkReasons::ZERO.0 | WorkReasons::RETRY.0),
+        ]);
+        let second = ledger.claim(8).unwrap();
+        assert_eq!(second.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x4000, WorkReasons::ZERO.0 | WorkReasons::DIRTY.0),
+            (0x6000, WorkReasons::DIRTY.0),
+        ]);
+
+        ledger.add_dirty_pages([0x1000]);
+        assert!(ledger.claim(1).is_none(), "new work escaped an older owner of the same page");
+        assert_eq!(ledger.cancel(second.token), WorkClaimResolution::Restored);
+        let out_of_order = ledger.claim(1).unwrap();
+        assert_eq!(out_of_order.pages[0].0, 0x4000);
+        assert_eq!(ledger.commit(first.token), WorkClaimResolution::Committed);
+        let later = ledger.claim(1).unwrap();
+        assert_eq!(later.pages, [(0x1000, WorkReasons::DIRTY)]);
+        assert_eq!(ledger.commit(later.token), WorkClaimResolution::Committed);
+        assert_eq!(ledger.cancel(out_of_order.token), WorkClaimResolution::Restored);
+        let restored = ledger.claim(8).unwrap();
+        assert_eq!(restored.pages.iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x4000, 0x6000]);
+    }
+
+    #[test]
+    fn replaced_sparse_batch_handles_reject_stale_additions() {
+        let batches = SparseBatches::new(17);
+        let stale_clone = batches.clone();
+        let current = batches.replace_generation(18).unwrap();
+        assert!(!batches.add_dirty_pages([0xC000]));
+        assert!(!stale_clone.add_retry_pages([0xD000]));
+        assert!(matches!(batches.seal(1, 1), Err(SparseBatchError::StaleGeneration)));
+        assert!(matches!(stale_clone.replace_generation(19), Err(SparseBatchError::StaleGeneration)));
+        assert!(current.add_dirty_pages([0xB000]));
+        assert_eq!(current.seal(1, 1).unwrap().unwrap().pages()[0].0, 0xB000);
     }
 
     #[test]
@@ -4870,6 +4928,109 @@ mod tests {
             71, 7, |_| Some(observation.clone()), reservations, slot, 64,
             |_, _| Ok(vec![0; 64]), |_, _| Ok(()), |_, _| {}, || Ok(fence),
         )
+    }
+
+    #[test]
+    fn shared_upload_page_builder_preserves_intent_order_and_dirty_ranges() {
+        let claimed = [
+            (0x1_1000, WorkReasons(WorkReasons::ZERO.0 | WorkReasons::DIRTY.0)),
+            (0x1_2000, WorkReasons::RETRY),
+        ];
+        let first = upload_observation(0x1_1000, (2, 3), 0x91);
+        let second = upload_observation(0x1_2000, (2, 3), ZERO_HASH);
+        let pages = build_upload_pages(&claimed, |page| match page {
+            0x1_1000 => Some(first.clone()),
+            0x1_2000 => Some(second.clone()),
+            _ => None,
+        }).unwrap();
+
+        assert_eq!(pages.iter().map(|page| page.page).collect::<Vec<_>>(), [0x1_1000, 0x1_2000]);
+        assert!(pages[0].zero && pages[0].dirty);
+        assert_eq!(pages[0].dirty_ranges, [(0x1_1000 + CHUNK, 2 * CHUNK)]);
+        assert!(!pages[1].zero && pages[1].dirty);
+        assert!(pages[1].dirty_ranges.is_empty(), "retry intent was lost when no chunks changed");
+        assert!(build_upload_pages(&claimed, |page| {
+            (page == 0x1_1000).then(|| first.clone())
+        }).is_none());
+    }
+
+    #[test]
+    fn coordinated_plan_revalidates_every_sparse_page_identity() {
+        let (_, plan, observation, _) = coordinated_upload_fixture(1);
+        assert_eq!(plan.validate(72, 7, |_| Some(observation.clone())), Err(UploadPlanInvalid::StateGeneration));
+        assert_eq!(plan.validate(71, 8, |_| Some(observation.clone())), Err(UploadPlanInvalid::MappingEpoch));
+        assert_eq!(plan.validate(71, 7, |_| None), Err(UploadPlanInvalid::MissingPage));
+
+        let mut remapped = observation.clone();
+        remapped.page += TILE;
+        assert_eq!(plan.validate(71, 7, |_| Some(remapped.clone())), Err(UploadPlanInvalid::Mapping));
+        let mut repooled = observation.clone();
+        repooled.pool.1 += 1;
+        assert_eq!(plan.validate(71, 7, |_| Some(repooled.clone())), Err(UploadPlanInvalid::Mapping));
+        let mut hole = observation.clone();
+        hole.hole = true;
+        assert_eq!(plan.validate(71, 7, |_| Some(hole.clone())), Err(UploadPlanInvalid::Mapping));
+        let mut resent = observation.clone();
+        resent.sent.as_mut().unwrap()[3] ^= 1;
+        assert_eq!(plan.validate(71, 7, |_| Some(resent.clone())), Err(UploadPlanInvalid::SentHashes));
+        let mut rewritten = observation.clone();
+        rewritten.source[3] ^= 1;
+        assert_eq!(plan.validate(71, 7, |_| Some(rewritten.clone())), Err(UploadPlanInvalid::SourceHashes));
+    }
+
+    #[test]
+    fn coordinated_preaccept_unwind_cancels_reservation_and_leaves_batch_visible() {
+        for panic_at in ["copy", "prepare"] {
+            let (batches, plan, observation, token) = coordinated_upload_fixture(1);
+            let reservations = UploadReservations::new(71, 1, 256, 64);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = plan.commit_reserved(
+                    71, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+                    |_, _| -> Result<Vec<u8>, ()> {
+                        if panic_at == "copy" { panic!("copy panicked") }
+                        Ok(vec![0; 64])
+                    },
+                    |_, _| -> Result<(), ()> {
+                        if panic_at == "prepare" { panic!("prepare panicked") }
+                        Ok(())
+                    },
+                    |_, _| {}, || Ok::<_, ()>(9),
+                );
+            }));
+            assert!(result.is_err());
+            assert_eq!(batches.observe(1, 9), Ok(ClaimFrontierAction::TakeOver(token)));
+            let ledger = reservations.0.lock().unwrap();
+            assert!(!ledger.poisoned && ledger.records.is_empty());
+            assert!(ledger.slots.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn coordinated_commit_orders_callbacks_and_owns_copied_staging() {
+        let (_, plan, observation, _) = coordinated_upload_fixture(1);
+        let reservations = UploadReservations::new(71, 1, 256, 64);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let receipt = plan.commit_reserved(
+            71, 7, |_| Some(observation.clone()), &reservations, 0, 4,
+            |range, pages| {
+                calls.borrow_mut().push("copy");
+                assert_eq!(range, UploadRingRange { start: 0, end: 4 });
+                assert_eq!(pages[0].page, observation.page);
+                Ok::<_, ()>(vec![1, 2, 3, 4])
+            },
+            |staging, _| {
+                calls.borrow_mut().push("prepare");
+                assert_eq!(&*staging.bytes, &[1, 2, 3, 4]);
+                Ok::<_, ()>(())
+            },
+            |staging, _| {
+                calls.borrow_mut().push("execute");
+                assert_eq!(&*staging.bytes, &[1, 2, 3, 4]);
+            },
+            || { calls.borrow_mut().push("signal"); Ok::<_, ()>(9) },
+        ).unwrap();
+        assert_eq!(&*calls.borrow(), &["copy", "prepare", "execute", "signal"]);
+        assert_eq!(reservations.complete(receipt), Ok(4));
     }
 
     #[test]
@@ -6381,51 +6542,4 @@ mod tests {
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
         }
     }
-
-    #[test]
-    fn late_claim_completion_cannot_change_a_newer_owner() {
-        let mut ledger = WorkClaimLedger::new(11);
-        ledger.add_dirty_pages([0x8000]);
-        let old = ledger.claim(1).unwrap();
-        assert_eq!(ledger.commit(old.token), WorkClaimResolution::Committed);
-
-        ledger.add_retry_pages([0x8000]);
-        let newer = ledger.claim(1).unwrap();
-        assert_eq!(ledger.restore(old.token), WorkClaimResolution::AlreadyFinished);
-        assert_eq!(ledger.owners.get(&0x8000), Some(&newer.token.serial));
-        assert_eq!(ledger.commit(newer.token), WorkClaimResolution::Committed);
-        assert!(ledger.available.is_empty());
-    }
-    #[test]
-    fn work_claim_ledger_merges_orders_and_restores_exact_out_of_order_work() {
-        let mut ledger = WorkClaimLedger::new(7);
-        ledger.add_zero_ranges(&[(0x3000, 2 * PAGE)]);
-        ledger.add_retry_pages([0x3001, 0x1000, 0x1000]);
-        ledger.add_dirty_pages([0x4000, 0x6001, 0x6000]);
-
-        let first = ledger.claim(2).unwrap();
-        assert_eq!(first.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
-            (0x1000, WorkReasons::RETRY.0),
-            (0x3000, WorkReasons::ZERO.0 | WorkReasons::RETRY.0),
-        ]);
-        let second = ledger.claim(8).unwrap();
-        assert_eq!(second.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
-            (0x4000, WorkReasons::ZERO.0 | WorkReasons::DIRTY.0),
-            (0x6000, WorkReasons::DIRTY.0),
-        ]);
-
-        ledger.add_dirty_pages([0x1000]);
-        assert!(ledger.claim(1).is_none(), "new work escaped an older owner of the same page");
-        assert_eq!(ledger.cancel(second.token), WorkClaimResolution::Restored);
-        let out_of_order = ledger.claim(1).unwrap();
-        assert_eq!(out_of_order.pages[0].0, 0x4000);
-        assert_eq!(ledger.commit(first.token), WorkClaimResolution::Committed);
-        let later = ledger.claim(1).unwrap();
-        assert_eq!(later.pages, [(0x1000, WorkReasons::DIRTY)]);
-        assert_eq!(ledger.commit(later.token), WorkClaimResolution::Committed);
-        assert_eq!(ledger.cancel(out_of_order.token), WorkClaimResolution::Restored);
-        let restored = ledger.claim(8).unwrap();
-        assert_eq!(restored.pages.iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x4000, 0x6000]);
-    }
-
 }
