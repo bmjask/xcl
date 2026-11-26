@@ -83,6 +83,8 @@ struct Build {
     /// One of the title's threads waits, or a recorded submit will wait, for this build. Polled
     /// by DXC and driver admission.
     wanted: AtomicBool,
+    /// Record-time submit demand has completed worker startup, promotion, and scheduling.
+    by_submit: AtomicBool,
     demand: Mutex<Demand>,
     queued: Mutex<Option<JobHandle>>,
 }
@@ -188,11 +190,9 @@ fn eviction_candidates() -> &'static EvictionCandidateQueue {
     CANDIDATES.get_or_init(EvictionCandidateQueue::new)
 }
 
-/// Submit demand and the preload worker building this pipeline.
+/// The preload worker building this pipeline.
 #[derive(Default)]
 struct Demand {
-    /// a call put off to the submit needs it (`need_by_submit`)
-    by_submit: bool,
     /// thread id of the preload worker (lowest priority) building it, 0 = none
     preload_thread: u32,
 }
@@ -322,6 +322,7 @@ impl Build {
             orphan: Default::default(),
             owners: AtomicUsize::new(1),
             wanted: AtomicBool::new(false),
+            by_submit: AtomicBool::new(false),
             demand: Default::default(),
             queued: Mutex::new(None),
         }
@@ -3117,7 +3118,7 @@ fn schedule(build: &Arc<Build>, priority: Priority, preload: bool, preload_rank:
     let mut queued = build.queued.lock().unwrap();
     let mut refused = false;
     if !build.sent.swap(true, Ordering::AcqRel) {
-        let priority = if build.wanted.load(Ordering::Acquire) || build.demand.lock().unwrap().by_submit {
+        let priority = if build.wanted.load(Ordering::Acquire) || build.by_submit.load(Ordering::Acquire) {
             Priority::Foreground
         } else {
             priority
@@ -6638,6 +6639,7 @@ mod used_tests {
 
         need_by_submit(standins[1]);
         assert!(build.wanted.load(Ordering::Acquire));
+        assert!(build.by_submit.load(Ordering::Acquire), "coalesced owners did not share submit demand");
         assert!(wanted_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it"));
         go_tx.send(()).unwrap();
         assert_eq!(resolve_wait_for(standins[0], None), 0xC411);
@@ -6933,12 +6935,12 @@ mod used_tests {
     /// through the atomic wanted signal, so the probe cannot take this build's demand lock.
     #[test]
     fn submit_demand_wanted_probe_is_lock_free() {
-        let build = Arc::new(Build::new(Box::new(|| 0), false));
+        let build = Arc::new(Build::new(Box::new(|| 0), true));
+        let pending = structured_pending(build.clone(), true);
         let before = BUILDING.with(|building| building.replace(Some(build.clone())));
         let _restore = RestoreBuilding(before);
         let wanted = wanted_here();
-        build.demand.lock().unwrap().by_submit = true;
-        build.want();
+        need_pending_by_submit(&pending);
         assert!(wanted(), "submit demand reaches DXC and driver admission");
 
         let demand = build.demand.lock().unwrap();
@@ -6947,6 +6949,76 @@ mod used_tests {
         assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).expect("wanted probe took the demand lock"));
         drop(demand);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn submit_demand_publishes_after_work_and_repeats_without_build_locks() {
+        let build = Arc::new(Build::new(Box::new(|| 0), true));
+        let pending = structured_pending(build.clone(), true);
+        let queued = build.queued.lock().unwrap();
+        let (first_tx, first_rx) = mpsc::channel();
+        let first_pending = pending.clone();
+        let first = std::thread::spawn(move || {
+            need_pending_by_submit(&first_pending);
+            first_tx.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !build.wanted.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(build.wanted.load(Ordering::Acquire), "first demand did not become wanted");
+        assert!(!build.by_submit.load(Ordering::Acquire), "demand published before promotion completed");
+        assert!(matches!(first_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(queued);
+        first_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("first demand did not complete");
+        first.join().unwrap();
+        assert!(build.by_submit.load(Ordering::Acquire));
+
+        let queued = build.queued.lock().unwrap();
+        let demand = build.demand.lock().unwrap();
+        let (repeat_tx, repeat_rx) = mpsc::channel();
+        let repeat = std::thread::spawn(move || {
+            need_pending_by_submit(&pending);
+            repeat_tx.send(()).unwrap();
+        });
+        repeat_rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("published demand took the queued or preload lock");
+        drop(demand);
+        drop(queued);
+        repeat.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_submit_demand_calls_publish_one_shared_state() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job_runs = runs.clone();
+        let build = Arc::new(Build::new(Box::new(move || {
+            job_runs.fetch_add(1, Ordering::Relaxed);
+            0
+        }), false));
+        let pending = structured_pending(build.clone(), true);
+        let gate = Arc::new(std::sync::Barrier::new(9));
+        let callers: Vec<_> = (0..8).map(|_| {
+            let (pending, gate) = (pending.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                need_pending_by_submit(&pending);
+            })
+        }).collect();
+        gate.wait();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert!(build.wanted.load(Ordering::Acquire));
+        assert!(build.by_submit.load(Ordering::Acquire));
+        assert!(build.sent.load(Ordering::Acquire));
+        let (done, timeout) = build.cv.wait_timeout_while(
+            build.done.lock().unwrap(),
+            std::time::Duration::from_secs(10),
+            |done| !*done,
+        ).unwrap();
+        assert!(!timeout.timed_out() && *done, "concurrent demand did not complete its build");
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "concurrent first callers executed more than one job");
     }
 
     /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
@@ -8279,11 +8351,14 @@ pub fn need_by_submit(pso: usize) {
 }
 
 fn need_pending_by_submit(p: &Arc<Pending>) {
-    p.build.want();
-    let first = !std::mem::replace(&mut p.build.demand.lock().unwrap().by_submit, true);
-    if first {
-        schedule(&p.build, Priority::BoundSoon, false, None);
+    if p.build.by_submit.load(Ordering::Acquire) {
+        return;
     }
+    p.build.want();
+    schedule(&p.build, Priority::BoundSoon, false, None);
+    // True means all record-time demand work above is complete. Concurrent first callers may
+    // repeat the idempotent promotion/schedule, but no caller observes publication too early.
+    p.build.by_submit.store(true, Ordering::Release);
 }
 
 /// (built in the background, failed, still building)
