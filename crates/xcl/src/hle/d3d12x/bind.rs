@@ -552,8 +552,8 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
 /// The vertex layout is not looked at: each 4-byte word that is the same in all three vertices
 /// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
 /// vertex index alone (no vertex buffer) are not expanded.
-unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
-    if !cpu_rect_expansion(with(this, |s| s.pso)) {
+unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    if !cpu_rect_expansion(pso) {
         return false;
     }
     let Some(vbs) = super::list_x::rect_list_state(this) else { return false };
@@ -608,15 +608,15 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
 /// not with the rect list GS (`real::has_rect_list_gs`), which completes each rect itself – both
 /// would draw every rect twice (each CPU half is three corners of the rect).
 fn cpu_rect_expansion(pso: usize) -> bool {
-    !super::real::has_rect_list_gs(super::pso_async::resolve(pso))
+    !super::real::has_rect_list_gs(pso)
 }
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailDraw);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
-    if let Some(list) = graphics_bound(this) {
-        if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+    if let Some((list, pso)) = graphics_bound(this) {
+        if draw_rects(this, &list, pso, vertices, instances, first_vertex, first_instance) {
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
@@ -628,6 +628,11 @@ thread_local! {
     /// the draw being bound: (indexed, count, instances, first index / vertex, base vertex) – for the frame trace
     static DRAW_ARGS: std::cell::Cell<(bool, u32, u32, u32, i32)> = const { std::cell::Cell::new((false, 0, 0, 0, 0)) };
 }
+
+#[cfg(test)]
+static LAST_ABI_PSO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static STOP_ABI_LIST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
@@ -647,7 +652,7 @@ pub(super) unsafe fn prepare_indexed_draw(
     base_vertex: i32,
 ) -> Option<ID3D12GraphicsCommandList> {
     DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
-    graphics_bound(this)
+    graphics_bound(this).map(|(list, _)| list)
 }
 
 /// Submit an indexed draw whose translated graphics state has already been prepared.
@@ -665,11 +670,36 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
 /// arguments are bound (None: the draw is skipped – a console pipeline without a
 /// translation, or no unified memory).
-unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
+fn resolve_graphics_pipeline(
+    list: usize,
+    pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
+) -> Option<usize> {
+    match resolution.map(|resolution| resolution.resolve_for_emission()) {
+        Some(super::pso_async::PipelineChoice::Available { raw, generation }) => {
+            super::list_x::record_native_generation(list, Some(generation));
+            Some(raw)
+        }
+        // One-shot pipelines have no generation pin yet. Their address-based resolver retains
+        // the legacy ABA exposure explicitly as transitional/default behavior.
+        Some(super::pso_async::PipelineChoice::Legacy) => Some(super::list_x::resolve_and_record_pipeline_wait(list, pso)),
+        Some(super::pso_async::PipelineChoice::Unavailable) => None,
+        None => Some(pso),
+    }
+}
+
+fn resolve_bound_graphics_pipeline(this: *mut c_void, list: usize) -> Option<(usize, usize)> {
+    let (pso, resolution) = with(this, |s| (s.pso, s.resolution.clone()));
+    resolve_graphics_pipeline(list, pso, resolution).map(|real| (pso, real))
+}
+
+unsafe fn graphics_bound(this: *mut c_void) -> Option<(ID3D12GraphicsCommandList, usize)> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
-    let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    let real = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
+    let Some((pso, real)) = resolve_bound_graphics_pipeline(this, list.as_raw() as usize) else {
+        super::list_x::note_dropped_draw(this);
+        count(DRAWS_SKIPPED);
+        return None;
+    };
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
@@ -693,7 +723,6 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -712,15 +741,15 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
             list.SetGraphicsRootSignature(r);
         }
-        return Some(list);
+        return Some((list, real));
     }
     if super::present::trace_frame() {
-        trace_ui_draw(this, pso);
+        trace_ui_draw(this, pso, real);
     }
-    match bind_abi(this, &list, pso, true) {
+    match bind_abi_resolved(this, &list, real, true) {
         Ok(()) => {
             count(DRAWS);
-            Some(list)
+            Some((list, real))
         }
         Err(e) => {
             super::list_x::note_dropped_draw(this);
@@ -746,7 +775,7 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
     if super::present::activity().0 < 300 {
         return;
     }
-    let Some((vs, ps)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
+    let Some((vs, ps)) = super::real::pso_shaders(pso) else { return };
     let rt = super::present::rt0_resource(this as usize).unwrap_or(0);
     let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.SampleDesc.Count) });
     {
@@ -828,7 +857,7 @@ unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize) {
                 let d = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.Flags.0) });
                 crate::xlog_info!(
                     "frame trace: a draw (shaders {:x?}, {}) reads a watched target {r:#x} {:?} at {addr:x?} (slot {k}), drawing into {rt:#x} {:?}{} – {}",
-                    super::real::pso_shaders(super::pso_async::resolve(pso)),
+                    super::real::pso_shaders(pso),
                     super::list_x::state_summary(this),
                     d(r),
                     d(rt),
@@ -838,7 +867,7 @@ unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize) {
                 let args = DRAW_ARGS.with(|d| d.get());
                 crate::xlog_info!(
                     "frame trace: … that draw: {args:?} (indexed, count, instances, first, base vertex); input layout [{}]; {}",
-                    super::real::pso_layout(super::pso_async::resolve(pso)).unwrap_or_default(),
+                    super::real::pso_layout(pso).unwrap_or_default(),
                     super::list_x::geometry_summary(this, args)
                 );
                 return;
@@ -874,7 +903,7 @@ unsafe fn follow_layer_sources(this: *mut c_void) {
     }
 }
 
-unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
+unsafe fn trace_ui_draw(this: *mut c_void, original: usize, pso: usize) {
     trace_draw_kinds(this, pso);
     trace_reads_of_watched(this, pso);
     follow_layer_sources(this);
@@ -892,20 +921,20 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
         if super::present::activity().0 < 300 || (!super::present::is_presented(rt) && std::env::var_os("XCL_TRACE_UI_ANY").is_none()) {
             return;
         }
-    } else if !super::real::pso_shaders(super::pso_async::resolve(pso)).is_some_and(|(v, p)| wanted.contains(&v) || wanted.contains(&p)) {
+    } else if !super::real::pso_shaders(pso).is_some_and(|(v, p)| wanted.contains(&v) || wanted.contains(&p)) {
         return;
     } else {
         super::present::watch_rt(rt);
     }
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let sh = super::real::pso_shaders(super::pso_async::resolve(pso)).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
-    crate::xlog_info!("frame trace: UI draw (pipeline {pso:#x}, {}): {}", sh.unwrap_or_default(), root_args_summary(this, 16));
+    let sh = super::real::pso_shaders(pso).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
+    crate::xlog_info!("frame trace: UI draw (pipeline {original:#x}, {}): {}", sh.unwrap_or_default(), root_args_summary(this, 16));
     if !wanted.is_empty() {
         // the picked shaders' geometry too (vertices dumped at the next present)
         let args = DRAW_ARGS.with(|d| d.get());
         crate::xlog_info!(
             "frame trace: … that draw: {args:?} (indexed, count, instances, first, base vertex); input layout [{}]; {}",
-            super::real::pso_layout(super::pso_async::resolve(pso)).unwrap_or_default(),
+            super::real::pso_layout(pso).unwrap_or_default(),
             super::list_x::geometry_summary(this, args)
         );
     }
@@ -1209,12 +1238,31 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    bind_abi_with_root(this, list, pso, gfx, 0)
+    let pso = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
+    bind_abi_resolved(this, list, pso, gfx)
 }
 
 unsafe fn bind_abi_with_root(
     this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
 ) -> Result<(), String> {
+    let pso = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
+    bind_abi_with_root_resolved(this, list, pso, gfx, root)
+}
+
+unsafe fn bind_abi_resolved(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    bind_abi_with_root_resolved(this, list, pso, gfx, 0)
+}
+
+unsafe fn bind_abi_with_root_resolved(
+    this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
+) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        if STOP_ABI_LIST.load(Ordering::Acquire) == this as usize {
+            LAST_ABI_PSO.store(pso, Ordering::Release);
+            return Err("stopped after resolved PSO for test".into());
+        }
+    }
     let shared_view_bound = super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
@@ -1226,10 +1274,8 @@ unsafe fn bind_abi_with_root(
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
-    let real = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
-    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
+    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(pso) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
@@ -1248,7 +1294,7 @@ unsafe fn bind_abi_with_root(
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = (root != 0).then_some(root)
-        .or_else(|| super::real::pso_root_signature(real))
+        .or_else(|| super::real::pso_root_signature(pso))
         .or_else(|| super::real::abi_rs_cached().map(|p| p as usize))
         .ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
@@ -1266,8 +1312,8 @@ unsafe fn bind_abi_with_root(
         }
     }
     if root == 0 {
-        let real = real as *mut c_void;
-        let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
+        let pso = pso as *mut c_void;
+        let pc = ID3D12PipelineState::from_raw_borrowed(&pso).ok_or("pipeline")?;
         list.SetPipelineState(pc);
     }
     if shared_view_bound && super::vram::srv_tracking_enabled() {
@@ -1642,6 +1688,134 @@ void main(uint t : SV_GroupIndex) {
         forget(old_list);
         forget(new_list);
         assert_eq!(pso_async::released(pso), 0);
+    }
+
+    #[repr(C)]
+    struct ResolutionPso {
+        vtable: *const usize,
+        refs: AtomicUsize,
+    }
+
+    unsafe extern "system" fn resolution_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut ResolutionPso)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+    }
+
+    unsafe extern "system" fn resolution_release(this: *mut c_void) -> u32 {
+        (*(this as *mut ResolutionPso)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+    }
+
+    #[test]
+    fn graphics_resolution_uses_retained_identity_and_records_its_pin() {
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut old = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let old_raw = &mut old as *mut ResolutionPso as usize;
+        let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let standin = 0x7100_4880usize;
+        let list = 0x7100_4890usize;
+        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || old_raw), false, 0, None);
+        assert_eq!(pso_async::resolve_wait(standin), old_raw);
+        let retained = pso_async::begin_pipeline_resolution(standin).unwrap();
+        assert_eq!(pso_async::released(standin), old_raw);
+        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || replacement_raw), false, 0, None);
+
+        assert_eq!(resolve_graphics_pipeline(list, standin, Some(retained)), Some(old_raw));
+        assert_eq!(list_x::native_generation_count_for_test(list), 1);
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 1, "the reused registry address must not be resolved");
+
+        list_x::clear_segment_state(list);
+        assert_eq!(pso_async::released(standin), 0);
+        assert_eq!(unsafe { resolution_release(old_raw as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn graphics_entrypoints_pass_the_retained_raw_to_the_abi() {
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let list = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let list = &list as *const ResolutionPso as *mut c_void;
+        let mut old = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let old_raw = &mut old as *mut ResolutionPso as usize;
+        let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let standin = 0x7100_4898usize;
+        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || old_raw), false, 0, None);
+        assert_eq!(pso_async::resolve_wait(standin), old_raw);
+        real::register_translated_graphics_for_test(old_raw);
+        set_tracked_pipeline_state(list, standin);
+        assert_eq!(pso_async::released(standin), old_raw);
+        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || replacement_raw), false, 0, None);
+        STOP_ABI_LIST.store(list as usize, Ordering::Release);
+
+        LAST_ABI_PSO.store(0, Ordering::Release);
+        assert!(unsafe { graphics_bound(list) }.is_none());
+        assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), old_raw);
+        LAST_ABI_PSO.store(0, Ordering::Release);
+        assert!(unsafe { prepare_indexed_draw(list, 3, 1, 0, 0) }.is_none());
+        assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), old_raw,
+            "indexed draw must reuse the retained generation, not the title or replacement address");
+
+        STOP_ABI_LIST.store(0, Ordering::Release);
+        forget(list);
+        list_x::clear_segment_state(list as usize);
+        assert_eq!(pso_async::released(standin), 0);
+        real::forget_pso_for_test(old_raw);
+        assert_eq!(unsafe { resolution_release(old_raw as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn graphics_resolution_waits_outside_states_and_selects_only_once() {
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut real = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut real as *mut ResolutionPso as usize;
+        let standin = 0x7100_48A0usize;
+        let list = 0x7100_48B0usize as *mut c_void;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || {
+            assert!(STATES.try_lock().is_ok(), "pipeline build waited under bind::STATES");
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            raw
+        }), false, 0, None);
+        set_tracked_pipeline_state(list, standin);
+
+        assert_eq!(resolve_bound_graphics_pipeline(list, list as usize), Some((standin, raw)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(cpu_rect_expansion(raw));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "downstream draw decisions must reuse the selected raw PSO");
+
+        forget(list);
+        list_x::clear_segment_state(list as usize);
+        assert_eq!(pso_async::released(standin), raw);
+        assert_eq!(unsafe { resolution_release(raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn graphics_resolution_preserves_legacy_and_fails_closed_when_unavailable() {
+        let legacy = 0x7100_48C0usize;
+        let legacy_real = 0x7100_48D0usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        pso_async::submit_lazy(legacy, false, Box::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            legacy_real
+        }), 0);
+        let retained = pso_async::begin_pipeline_resolution(legacy).unwrap();
+        assert_eq!(resolve_graphics_pipeline(0x7100_48E0, legacy, Some(retained)), Some(legacy_real));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "Legacy must use the existing resolver once");
+        assert_eq!(pso_async::released(legacy), legacy_real);
+
+        let unavailable = 0x7100_48F0usize;
+        pso_async::submit_recipe_keyed(unavailable, false, pso_async::Recipe::new(|| panic!("orphan recipe ran")), false, 0, None);
+        let retained = pso_async::begin_pipeline_resolution(unavailable).unwrap();
+        assert_eq!(pso_async::released(unavailable), 0);
+        assert_eq!(resolve_graphics_pipeline(0x7100_4900, unavailable, Some(retained)), None);
+
+        let replacement = 0x7100_4910usize;
+        pso_async::submit_lazy(replacement, false, Box::new(|| panic!("unregistered bind adopted later registry entry")), 0);
+        assert_eq!(resolve_graphics_pipeline(0, replacement, None), Some(replacement));
+        assert_eq!(pso_async::released(replacement), 0);
     }
 
     #[test]
