@@ -101,6 +101,11 @@ fn video_memory(raw: *mut std::ffi::c_void) -> (Option<Segment>, Option<Segment>
     }
 }
 
+/// Adapter-local usage for the pressure sampler, without collecting owner diagnostics.
+pub fn local_segment() -> Option<Segment> {
+    video_memory(super::real::device_raw()).0
+}
+
 pub fn snapshot() -> Snapshot {
     let raw = super::real::device_raw();
     let device = raw as usize;
