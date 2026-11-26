@@ -7598,6 +7598,40 @@ fn split_wave64_meets_once_per_read_run() {
 }
 
 #[test]
+fn split_wave64_reduction_exchange_orders_the_next_lds_access() {
+    let lo: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None);
+    let hi: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 2), ("SRC1", 128)], None);
+    let (n, hlsl) = x64_lds_meets(&prog(&[LDS_W, lo, hi, LDS_R]));
+    assert_eq!(hlsl.matches("xcl_x_meet() ?").count(), 4, "one folded exchange and three prelude calls:\n{hlsl}");
+    assert_eq!(hlsl.matches("= xcl_x_rla_uniform(").count(), 0, "the pair was not folded:\n{hlsl}");
+    assert_eq!(n, 1, "the folded exchange must order the following LDS read:\n{hlsl}");
+}
+
+#[test]
+fn split_wave64_reduction32_exchange_orders_the_next_lds_access() {
+    let read_hi: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None);
+    let reduce: LdsInst = ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None);
+    let read_lo: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None);
+    let (n, hlsl) = x64_lds_meets(&prog(&[LDS_W, read_hi, reduce, read_lo, LDS_R]));
+    assert_eq!(hlsl.matches("xcl_x_meet() ?").count(), 4, "one folded exchange and three prelude calls:\n{hlsl}");
+    assert_eq!(hlsl.matches("= xcl_x_rla_uniform(").count(), 0, "the 32-bit tail was not folded:\n{hlsl}");
+    assert_eq!(n, 1, "the folded 32-bit exchange must order the following LDS read:\n{hlsl}");
+}
+
+#[test]
+fn split_wave64_reduction64_exchange_orders_the_next_lds_access() {
+    let read_hi_lo: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 128 + 32)], None);
+    let read_hi_hi: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 3), ("SRC1", 128 + 32)], None);
+    let reduce: LdsInst = ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", 2), ("SRC1", V + 2)], None);
+    let read_lo_lo: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 128)], None);
+    let read_lo_hi: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 3), ("SRC1", 128)], None);
+    let (n, hlsl) = x64_lds_meets(&prog(&[LDS_W, read_hi_lo, read_hi_hi, reduce, read_lo_lo, read_lo_hi, LDS_R]));
+    assert_eq!(hlsl.matches("= xcl_x_meet();").count(), 1, "the 64-bit tail did not fold to one exchange:\n{hlsl}");
+    assert_eq!(hlsl.matches("= xcl_x_rla_uniform(").count(), 0, "the 64-bit tail was not folded:\n{hlsl}");
+    assert_eq!(n, 2, "one required LDS meet plus the folded 64-bit exchange; the following read must reuse it:\n{hlsl}");
+}
+
+#[test]
 fn split_wave64_lds_local_mask_is_no_meeting() {
     let cmp: LdsInst = ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None);
     let bcnt: LdsInst = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 106)], None);

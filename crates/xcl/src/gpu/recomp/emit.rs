@@ -1165,6 +1165,7 @@ impl Em {
                     self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                     self.line(&format!("xcl_x_put(0u, {t}_m);"));
                     self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                    self.x64_met();
                     self.line(&format!("uint {t}_r1 = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                     self.line(&format!("uint {t}_r2 = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                     self.write32(&dst1, &format!("{t}_r1"));
@@ -1189,6 +1190,7 @@ impl Em {
                             self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                             self.line(&format!("xcl_x_put(0u, {t}_m);"));
                             self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                            self.x64_met();
                             self.line(&format!("uint {r1} = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                             self.line(&format!("uint {r2} = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                             self.write32(&Dst::S(s1), &r1);
@@ -1240,6 +1242,7 @@ impl Em {
                         self.line(&format!("uint {t}_mh = WaveReadLaneAt({vh}, {lane32}u);"));
                         self.line(&format!("xcl_x_put(0u, {t}_ml); xcl_x_put(1u, {t}_mh);"));
                         self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+                        self.x64_met();
                         self.line(&format!("uint {t}_ol = {t}_ok ? xcl_x_get(0u) : 0u;"));
                         self.line(&format!("uint {t}_oh = {t}_ok ? xcl_x_get(1u) : 0u;"));
                         let (h1, h2) = (l1 >> 5, l2 >> 5);
