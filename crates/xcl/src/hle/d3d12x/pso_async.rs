@@ -8,6 +8,7 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
@@ -435,9 +436,54 @@ fn pending_shard_index(key: usize) -> usize {
 
 static PENDING: PendingRegistry<Arc<Pending>> = PendingRegistry::new();
 
-/// Equal compute requests share only while their build is in flight. Weak values neither retain
-/// completed builds nor turn this into another PSO cache.
-static IN_FLIGHT: Mutex<Option<HashMap<Arc<super::real::compute_build_key::ComputeBuildKey>, Weak<Build>>>> = Mutex::new(None);
+const IN_FLIGHT_SHARDS: usize = 64;
+type ComputeBuildKey = super::real::compute_build_key::ComputeBuildKey;
+
+/// Equal compute requests share only while their build is in flight. Weak values do not retain
+/// completed builds; terminal removal normally releases their keys, while a dead weak left by an
+/// interrupted lifecycle is cleaned when its exact key is next encountered. Independent keys do
+/// not queue on one process-wide lock.
+struct InFlightRegistry {
+    shards: [Mutex<Option<HashMap<Arc<ComputeBuildKey>, Weak<Build>>>>; IN_FLIGHT_SHARDS],
+}
+
+impl InFlightRegistry {
+    const fn new() -> Self {
+        Self { shards: [const { Mutex::new(None) }; IN_FLIGHT_SHARDS] }
+    }
+
+    fn shard(&self, key: &ComputeBuildKey) -> &Mutex<Option<HashMap<Arc<ComputeBuildKey>, Weak<Build>>>> {
+        &self.shards[in_flight_shard_index(key)]
+    }
+
+    /// Remove only this exact build. A late completion must not remove a replacement for the key.
+    fn remove_exact(&self, key: &ComputeBuildKey, build: &Weak<Build>, on_removed: impl FnOnce()) -> bool {
+        let removed = {
+            let mut shard = self.shard(key).lock().unwrap();
+            let Some(builds) = shard.as_mut() else { return false };
+            if builds.get(key).is_some_and(|registered| Weak::ptr_eq(registered, build)) {
+                on_removed();
+                builds.remove_entry(key)
+            } else {
+                None
+            }
+        };
+        let found = removed.is_some();
+        drop(removed);
+        found
+    }
+}
+
+#[inline]
+fn in_flight_shard_index(key: &ComputeBuildKey) -> usize {
+    // DefaultHasher::new has fixed keys, unlike HashMap's randomized builder. Hash the canonical
+    // key once so every equal request selects the same shard before the map performs full equality.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() as usize & (IN_FLIGHT_SHARDS - 1)
+}
+
+static IN_FLIGHT: InFlightRegistry = InFlightRegistry::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -2033,12 +2079,8 @@ impl<const E: usize, const R: usize> RestorationQueued<'_, E, R> {
 
 fn forget_in_flight(build: &Arc<Build>) {
     let Some(key) = &build.compute_key else { return };
-    let mut registry = IN_FLIGHT.lock().unwrap();
-    let Some(builds) = registry.as_mut() else { return };
-    if builds.get(key.as_ref()).is_some_and(|weak| Weak::ptr_eq(weak, &Arc::downgrade(build))) {
-        builds.remove(key.as_ref());
-        COALESCING.finished(1);
-    }
+    let build = Arc::downgrade(build);
+    IN_FLIGHT.remove_exact(key, &build, || COALESCING.finished(1));
 }
 
 /// The build is done (`real`: its pipeline, 0 = failed).
@@ -3233,20 +3275,33 @@ fn submit_as(
 ) {
     debug_assert!(compute || compute_key.is_none());
     let build = if let Some(compute_key) = compute_key {
-        let mut registry = IN_FLIGHT.lock().unwrap();
-        let builds = registry.get_or_insert_with(HashMap::new);
-        let before = builds.len();
-        builds.retain(|_, build| build.strong_count() != 0);
-        COALESCING.finished(before - builds.len());
-        if let Some(build) = builds.get(&compute_key).and_then(Weak::upgrade) {
-            let done = build.done.lock().unwrap();
-            if !*done && !build.orphan.load(Ordering::Acquire) {
-                build.owners.fetch_add(1, Ordering::Relaxed);
+        let mut removed = None;
+        let mut retired_build = None;
+        let build = {
+            let mut shard = IN_FLIGHT.shard(&compute_key).lock().unwrap();
+            let builds = shard.get_or_insert_with(HashMap::new);
+            let active = builds.get(&compute_key).and_then(Weak::upgrade).and_then(|build| {
+                let done = build.done.lock().unwrap();
+                let active = !*done && !build.orphan.load(Ordering::Acquire);
+                if active {
+                    build.owners.fetch_add(1, Ordering::Relaxed);
+                }
                 drop(done);
+                if active {
+                    Some(build)
+                } else {
+                    retired_build = Some(build);
+                    None
+                }
+            });
+            if let Some(build) = active {
                 COALESCING.hit();
                 build
             } else {
-                if builds.remove(&compute_key).is_some() {
+                // A dead, completed, or orphaned value is removed only when this exact key is
+                // submitted again. Keep the removed Arc/Weak alive until after unlocking.
+                removed = builds.remove_entry(&compute_key);
+                if removed.is_some() {
                     COALESCING.finished(1);
                 }
                 let compute_key = Arc::new(compute_key);
@@ -3255,13 +3310,10 @@ fn submit_as(
                 COALESCING.unique();
                 build
             }
-        } else {
-            let compute_key = Arc::new(compute_key);
-            let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone()), recipe));
-            builds.insert(compute_key, Arc::downgrade(&build));
-            COALESCING.unique();
-            build
-        }
+        };
+        drop(removed);
+        drop(retired_build);
+        build
     } else {
         Arc::new(Build::new_keyed(job, false, None, recipe))
     };
@@ -6305,6 +6357,96 @@ mod used_tests {
             [tag].into(),
             false,
         )
+    }
+
+    fn compute_key_in_another_shard(key: &ComputeBuildKey) -> ComputeBuildKey {
+        (0..=u8::MAX)
+            .map(compute_key)
+            .find(|candidate| in_flight_shard_index(candidate) != in_flight_shard_index(key))
+            .expect("test keys did not cover another in-flight shard")
+    }
+
+    #[test]
+    fn unrelated_in_flight_shard_does_not_block() {
+        let registry = Arc::new(InFlightRegistry::new());
+        let first = compute_key(0);
+        let second = compute_key_in_another_shard(&first);
+        let held = registry.shard(&first).lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let other_registry = registry.clone();
+        let thread = std::thread::spawn(move || {
+            let _other = other_registry.shard(&second).lock().unwrap();
+            tx.send(()).unwrap();
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(1)).expect("unrelated key waited for the held shard");
+        drop(held);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn old_in_flight_completion_cannot_remove_replacement() {
+        let registry = InFlightRegistry::new();
+        let key = Arc::new(compute_key(0x8A));
+        let old = Arc::new(Build::new_keyed(Box::new(|| 0), false, Some(key.clone()), None));
+        let replacement = Arc::new(Build::new_keyed(Box::new(|| 0), false, Some(key.clone()), None));
+        let old_weak = Arc::downgrade(&old);
+        let replacement_weak = Arc::downgrade(&replacement);
+        let displaced = {
+            let mut shard = registry.shard(&key).lock().unwrap();
+            let builds = shard.get_or_insert_with(HashMap::new);
+            builds.insert(key.clone(), old_weak.clone());
+            builds.insert(key.clone(), replacement_weak.clone())
+        };
+        drop(displaced);
+
+        assert!(!registry.remove_exact(&key, &old_weak, || {}));
+        assert!(registry.shard(&key).lock().unwrap().as_ref().unwrap().get(&key).and_then(Weak::upgrade)
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &replacement)));
+        assert!(registry.remove_exact(&key, &replacement_weak, || {}));
+        assert!(!registry.remove_exact(&key, &replacement_weak, || {}), "one registry entry is finished only once");
+    }
+
+    #[test]
+    fn terminal_retirement_precedes_other_shard_unique_count() {
+        let registry = Arc::new(InFlightRegistry::new());
+        let counters = Arc::new(CoalescingCounters::new());
+        let key = Arc::new(compute_key(0x8B));
+        let other_key = Arc::new(compute_key_in_another_shard(&key));
+        let old_weak = {
+            let old = Arc::new(Build::new_keyed(Box::new(|| 0), false, Some(key.clone()), None));
+            Arc::downgrade(&old)
+        };
+        registry.shard(&key).lock().unwrap().get_or_insert_with(HashMap::new)
+            .insert(key.clone(), old_weak.clone());
+        counters.unique();
+
+        let replacement = Arc::new(Build::new_keyed(Box::new(|| 0), false, Some(other_key.clone()), None));
+        let replacement_weak = Arc::downgrade(&replacement);
+        assert!(registry.remove_exact(&key, &old_weak, || {
+            counters.finished(1);
+            assert_eq!(counters.snapshot().current_in_flight, 0);
+            let (replacement_registry, replacement_counters) = (registry.clone(), counters.clone());
+            let replacement_thread = std::thread::spawn(move || {
+                let displaced = {
+                    let mut shard = replacement_registry.shard(&other_key).lock().unwrap();
+                    let displaced = shard.get_or_insert_with(HashMap::new).insert(other_key, replacement_weak);
+                    replacement_counters.unique();
+                    displaced
+                };
+                drop(displaced);
+            });
+            replacement_thread.join().expect("other-shard replacement was blocked by terminal retirement");
+            assert_eq!(counters.snapshot().current_in_flight, 1);
+        }));
+        assert_eq!(counters.snapshot(), ComputeCoalescingStats {
+            keyed_submissions: 2,
+            coalescing_hits: 0,
+            unique_keyed_builds: 2,
+            current_in_flight: 1,
+            peak_in_flight: 1,
+        });
+        drop(replacement);
     }
 
     fn submit_compute(standin: usize, tag: u8, job: Job) {
