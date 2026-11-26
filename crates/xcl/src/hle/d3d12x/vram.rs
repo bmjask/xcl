@@ -1472,9 +1472,39 @@ unsafe impl Send for Pages {}
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
-fn wait_gates() -> &'static Mutex<HashMap<usize, Arc<Mutex<()>>>> {
-    static GATES: OnceLock<Mutex<HashMap<usize, Arc<Mutex<()>>>>> = OnceLock::new();
+struct BeforeExecuteQueue<D> {
+    serial: Mutex<()>,
+    /// A queue's device is immutable. Cache only a successful, non-null lookup; failures retry.
+    device: OnceLock<D>,
+}
+
+impl<D> Default for BeforeExecuteQueue<D> {
+    fn default() -> Self {
+        Self { serial: Mutex::new(()), device: OnceLock::new() }
+    }
+}
+
+impl<D> BeforeExecuteQueue<D> {
+    /// Called with `serial` held, so the first successful lookup is also the only successful lookup.
+    fn cached_or_try_device(&self, lookup: impl FnOnce() -> Option<D>) -> Option<&D> {
+        if let Some(device) = self.device.get() {
+            return Some(device);
+        }
+        let device = lookup()?;
+        let _ = self.device.set(device);
+        self.device.get()
+    }
+}
+
+type BeforeExecuteGate = BeforeExecuteQueue<ID3D12Device>;
+
+fn wait_gates() -> &'static Mutex<HashMap<usize, Arc<BeforeExecuteGate>>> {
+    static GATES: OnceLock<Mutex<HashMap<usize, Arc<BeforeExecuteGate>>>> = OnceLock::new();
     GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remove_wait_gate<D>(gates: &Mutex<HashMap<usize, Arc<BeforeExecuteQueue<D>>>>, queue: usize) -> Option<Arc<BeforeExecuteQueue<D>>> {
+    gates.lock().unwrap().remove(&queue)
 }
 
 /// CPU time inside the residency work one `XCL_ACTIVITY` look caused. The look owns this
@@ -2282,8 +2312,8 @@ fn device_retire_state(dev_key: usize) -> DeviceRetire {
         .clone()
 }
 
-/// Remove raw queue-address state before a retired queue's final owner can be released. Fence
-/// objects are extracted from both locks and dropped afterward; retirement batches keep clones.
+/// Remove raw queue-address state before a retired queue's final owner can be released. Fence and
+/// cached device objects are extracted from their locks and dropped afterward; batches keep clones.
 pub(super) fn forget_queue(id: super::present::QueueId) {
     let queue = id.raw();
     let page_fences = {
@@ -2293,7 +2323,7 @@ pub(super) fn forget_queue(id: super::present::QueueId) {
             pages.unmap_fences.remove(&queue)
         }).collect::<Vec<_>>()
     };
-    let wait_gate = wait_gates().lock().unwrap().remove(&queue);
+    let wait_gate = remove_wait_gate(wait_gates(), queue);
     let states: Vec<_> = RETIRE.lock().unwrap().as_ref().into_iter().flat_map(|devices| devices.values().cloned()).collect();
     let gone: Vec<_> = states
         .iter()
@@ -2368,21 +2398,16 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let gate_started = measure.then(std::time::Instant::now);
     let queue_key = queue.as_raw() as usize;
     let wait_gate = wait_gates().lock().unwrap().entry(queue_key).or_default().clone();
-    let _queue_serial = wait_gate.lock().unwrap();
+    let _queue_serial = wait_gate.serial.lock().unwrap();
     if let Some(started) = gate_started {
         measured.gate_wait = started.elapsed();
     }
     let device_started = measure.then(std::time::Instant::now);
-    let mut dev: Option<ID3D12Device> = None;
-    if queue.GetDevice(&mut dev).is_err() {
-        if let Some(started) = device_started {
-            measured.device = started.elapsed();
-        }
-        if measure {
-            record_before_execute_timing(measured);
-        }
-        return;
-    }
+    let dev = wait_gate.cached_or_try_device(|| {
+        let mut dev: Option<ID3D12Device> = None;
+        queue.GetDevice(&mut dev).ok()?;
+        dev
+    });
     let Some(dev) = dev else {
         if let Some(started) = device_started {
             measured.device = started.elapsed();
@@ -2447,7 +2472,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     }
     let retire = do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0;
     if retire {
-        retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
+        retire_heaps_and_sweep(dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
     }
     drop(completed_unmaps);
     if let Some(started) = retirement_started {
@@ -2726,6 +2751,132 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn before_execute_queue_caches_only_a_successful_device_lookup() {
+        let state = BeforeExecuteQueue::<u32>::default();
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let _serial = state.serial.lock().unwrap();
+            assert_eq!(state.cached_or_try_device(|| {
+                calls.set(calls.get() + 1);
+                Some(17)
+            }).copied(), Some(17));
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn before_execute_queue_retries_failed_and_null_device_lookups() {
+        let state = BeforeExecuteQueue::<u32>::default();
+        let calls = std::cell::Cell::new(0);
+        let lookup = || {
+            calls.set(calls.get() + 1);
+            (calls.get() == 3).then_some(23)
+        };
+        for expected in [None, None, Some(23), Some(23)] {
+            let _serial = state.serial.lock().unwrap();
+            assert_eq!(state.cached_or_try_device(lookup).copied(), expected);
+        }
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn removing_before_execute_queue_makes_reused_address_fresh() {
+        let gates = Mutex::new(HashMap::<usize, Arc<BeforeExecuteQueue<u32>>>::new());
+        let old = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = old.serial.lock().unwrap();
+            assert_eq!(old.cached_or_try_device(|| Some(29)).copied(), Some(29));
+        }
+        gates.lock().unwrap().insert(5, old);
+        drop(remove_wait_gate(&gates, 5));
+
+        let fresh = gates.lock().unwrap().entry(5).or_default().clone();
+        assert!(fresh.device.get().is_none());
+        let _serial = fresh.serial.lock().unwrap();
+        assert_eq!(fresh.cached_or_try_device(|| Some(31)).copied(), Some(31));
+    }
+
+    struct RegistryLockCheckingOwner {
+        id: usize,
+        gates: Arc<Mutex<HashMap<usize, Arc<BeforeExecuteQueue<RegistryLockCheckingOwner>>>>>,
+        dropped_outside_lock: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for RegistryLockCheckingOwner {
+        fn drop(&mut self) {
+            self.dropped_outside_lock.store(self.gates.try_lock().is_ok(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn removed_before_execute_owner_drops_outside_registry_lock() {
+        let gates: Arc<Mutex<HashMap<usize, Arc<BeforeExecuteQueue<RegistryLockCheckingOwner>>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let dropped_outside_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = state.serial.lock().unwrap();
+            state.cached_or_try_device(|| Some(RegistryLockCheckingOwner {
+                id: 37,
+                gates: gates.clone(),
+                dropped_outside_lock: dropped_outside_lock.clone(),
+            }));
+        }
+        gates.lock().unwrap().insert(7, state);
+        drop(remove_wait_gate(&gates, 7));
+        assert!(dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn retained_before_execute_queue_survives_concurrent_key_reuse() {
+        let gates: Arc<Mutex<HashMap<usize, Arc<BeforeExecuteQueue<RegistryLockCheckingOwner>>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let old_dropped_outside_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let old = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = old.serial.lock().unwrap();
+            old.cached_or_try_device(|| Some(RegistryLockCheckingOwner {
+                id: 41,
+                gates: gates.clone(),
+                dropped_outside_lock: old_dropped_outside_lock.clone(),
+            }));
+        }
+        gates.lock().unwrap().insert(9, old.clone());
+
+        let (retained_tx, retained_rx) = std::sync::mpsc::channel();
+        let (reused_tx, reused_rx) = std::sync::mpsc::channel();
+        let retained = std::thread::spawn(move || {
+            let _serial = old.serial.lock().unwrap();
+            let owner = old.cached_or_try_device(|| None).unwrap();
+            retained_tx.send(owner.id).unwrap();
+            reused_rx.recv().unwrap();
+            assert_eq!(owner.id, 41);
+        });
+
+        assert_eq!(retained_rx.recv().unwrap(), 41);
+        drop(remove_wait_gate(&gates, 9));
+        assert!(!old_dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+
+        let fresh_dropped_outside_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fresh = Arc::new(BeforeExecuteQueue::default());
+        {
+            let _serial = fresh.serial.lock().unwrap();
+            let owner = fresh.cached_or_try_device(|| Some(RegistryLockCheckingOwner {
+                id: 43,
+                gates: gates.clone(),
+                dropped_outside_lock: fresh_dropped_outside_lock.clone(),
+            })).unwrap();
+            assert_eq!(owner.id, 43);
+        }
+        gates.lock().unwrap().insert(9, fresh.clone());
+        reused_tx.send(()).unwrap();
+        retained.join().unwrap();
+        assert!(old_dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+
+        drop(remove_wait_gate(&gates, 9));
+        drop(fresh);
+        assert!(fresh_dropped_outside_lock.load(std::sync::atomic::Ordering::Relaxed));
+    }
 
     #[derive(Clone)]
     struct FakeReceipt {
