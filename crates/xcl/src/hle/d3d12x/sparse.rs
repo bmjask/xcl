@@ -697,6 +697,15 @@ impl Drop for UploadReservation {
     }
 }
 
+/// Private owned stand-in for a future mapped staging allocation. Keeping the copied bytes here
+/// makes it impossible for the record/execute callback to retain a borrowed title-memory view.
+#[allow(dead_code)]
+struct OwnedUploadStaging {
+    range: UploadRingRange,
+    bytes: Box<[u8]>,
+}
+
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreparationOutcome {
     Ready,
