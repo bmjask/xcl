@@ -91,6 +91,9 @@ fn stall_kind_name(kind: crate::stall::StallKind) -> &'static str {
         StallKind::PipelineQueueSpeculative => "pipeline_queue_speculative",
         StallKind::PipelineQueueDemand => "pipeline_queue_demand",
         StallKind::PipelineWait => "pipeline_wait",
+        StallKind::PipelineRestoreDemand => "pipeline_restore_demand",
+        StallKind::PipelineRestoreWait => "pipeline_restore_wait",
+        StallKind::PipelineRestoreReconcile => "pipeline_restore_reconcile",
         StallKind::DriverCompileGate => "driver_compile_gate",
         StallKind::DriverCompile => "driver_compile",
         StallKind::SubmitPreparation => "submit_preparation",
@@ -422,10 +425,13 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_queue_stall_names_are_stable() {
+    fn pipeline_stall_names_are_stable() {
         assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueAdmission), "pipeline_queue_admission");
         assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueSpeculative), "pipeline_queue_speculative");
         assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineQueueDemand), "pipeline_queue_demand");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineRestoreDemand), "pipeline_restore_demand");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineRestoreWait), "pipeline_restore_wait");
+        assert_eq!(stall_kind_name(crate::stall::StallKind::PipelineRestoreReconcile), "pipeline_restore_reconcile");
     }
 
     #[test]

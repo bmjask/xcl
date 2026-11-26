@@ -23,6 +23,9 @@ pub enum StallKind {
     PipelineQueueSpeculative,
     PipelineQueueDemand,
     PipelineWait,
+    PipelineRestoreDemand,
+    PipelineRestoreWait,
+    PipelineRestoreReconcile,
     DriverCompileGate,
     DriverCompile,
     SubmitPreparation,
@@ -43,7 +46,7 @@ pub enum StallKind {
 }
 
 impl StallKind {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 27] = [
         Self::ShaderTranslation,
         Self::DxcQueue,
         Self::DxcCompile,
@@ -51,6 +54,9 @@ impl StallKind {
         Self::PipelineQueueSpeculative,
         Self::PipelineQueueDemand,
         Self::PipelineWait,
+        Self::PipelineRestoreDemand,
+        Self::PipelineRestoreWait,
+        Self::PipelineRestoreReconcile,
         Self::DriverCompileGate,
         Self::DriverCompile,
         Self::SubmitPreparation,
