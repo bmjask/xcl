@@ -8,10 +8,11 @@
 //! binds the ABI root signature, writes the user SGPRs (`io`) and the argument table to
 //! unified memory and dispatches. That memory stays until the list's allocator is reset.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -43,9 +44,60 @@ struct State {
 
 const STATE_SHARDS: usize = 64;
 
-#[derive(Default)]
 struct BindEntry {
+    live: AtomicBool,
     state: Mutex<State>,
+}
+
+impl Default for BindEntry {
+    fn default() -> Self {
+        Self { live: AtomicBool::new(true), state: Mutex::new(State::default()) }
+    }
+}
+
+const STATE_CACHE_ENTRIES: usize = 4;
+
+struct BindStateCache {
+    entries: [Option<(usize, Weak<BindEntry>)>; STATE_CACHE_ENTRIES],
+    next: usize,
+}
+
+impl BindStateCache {
+    fn get(&mut self, key: usize) -> Option<Arc<BindEntry>> {
+        for slot in &mut self.entries {
+            let Some((cached_key, cached)) = slot else { continue };
+            if *cached_key != key {
+                continue;
+            }
+            let entry = cached.upgrade();
+            if entry.as_ref().is_some_and(|entry| entry.live.load(Ordering::Acquire)) {
+                return entry;
+            }
+            *slot = None;
+            return None;
+        }
+        None
+    }
+
+    fn insert(&mut self, key: usize, entry: &Arc<BindEntry>) {
+        if let Some(slot) = self.entries.iter_mut().find(|slot| slot.as_ref().is_some_and(|(cached, _)| *cached == key)) {
+            *slot = Some((key, Arc::downgrade(entry)));
+            return;
+        }
+        if let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some((key, Arc::downgrade(entry)));
+            return;
+        }
+        self.entries[self.next] = Some((key, Arc::downgrade(entry)));
+        self.next = (self.next + 1) % STATE_CACHE_ENTRIES;
+    }
+}
+
+thread_local! {
+    static STATE_CACHE: RefCell<BindStateCache> = const { RefCell::new(BindStateCache {
+        entries: [const { None }; STATE_CACHE_ENTRIES],
+        next: 0,
+    }) };
 }
 
 struct BindStateRegistry {
@@ -73,15 +125,21 @@ impl BindStateRegistry {
 
     #[cfg(feature = "pipeline-resolution-bench")]
     fn insert(&self, key: usize, entry: Arc<BindEntry>) -> Option<Arc<BindEntry>> {
-        self.shards[state_shard_index(key)]
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
-            .insert(key, entry)
+        let mut shard = self.shards[state_shard_index(key)].lock().unwrap();
+        let replaced = shard.get_or_insert_with(HashMap::new).insert(key, entry);
+        if let Some(entry) = &replaced {
+            entry.live.store(false, Ordering::Release);
+        }
+        replaced
     }
 
     fn remove(&self, key: usize) -> Option<Arc<BindEntry>> {
-        self.shards[state_shard_index(key)].lock().unwrap().as_mut()?.remove(&key)
+        let mut shard = self.shards[state_shard_index(key)].lock().unwrap();
+        let removed = shard.as_mut()?.remove(&key);
+        if let Some(entry) = &removed {
+            entry.live.store(false, Ordering::Release);
+        }
+        removed
     }
 }
 
@@ -93,6 +151,15 @@ fn state_shard_index(key: usize) -> usize {
 }
 
 static STATES: BindStateRegistry = BindStateRegistry::new();
+
+fn state_entry(key: usize) -> Arc<BindEntry> {
+    if let Some(entry) = STATE_CACHE.with(|cache| cache.borrow_mut().get(key)) {
+        return entry;
+    }
+    let entry = STATES.get_or_insert(key);
+    STATE_CACHE.with(|cache| cache.borrow_mut().insert(key, &entry));
+    entry
+}
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -122,9 +189,15 @@ fn count(k: usize) {
 }
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
-    let entry = STATES.get_or_insert(list as usize);
-    let mut state = entry.state.lock().unwrap();
-    f(&mut state)
+    loop {
+        let entry = state_entry(list as usize);
+        let mut state = entry.state.lock().unwrap();
+        if !entry.live.load(Ordering::Acquire) {
+            drop(state);
+            continue;
+        }
+        return f(&mut state);
+    }
 }
 
 /// Opaque fixture for measuring the actual retained-pipeline state snapshot without a device.
@@ -157,6 +230,7 @@ impl BindStateBench {
         assert_eq!(lists.len(), workers, "benchmark keys did not cover enough bind shards");
         for (worker, &list) in lists.iter().enumerate() {
             let entry = Arc::new(BindEntry {
+                live: AtomicBool::new(true),
                 state: Mutex::new(State {
                     pso: worker + 1,
                     resolution: Some(resolutions[worker].retained_resolution()),
@@ -1607,6 +1681,89 @@ mod tests {
         old.state.lock().unwrap().pso = 0x7E57_D213;
         assert_eq!(tracked_pso(list), 0x7E57_D212, "orphaned state changed the replacement");
         forget(list);
+    }
+
+    #[test]
+    fn warm_bind_cache_does_not_take_the_registry_shard() {
+        let key = Box::new(0u8);
+        let list = (&*key as *const u8) as usize;
+        reset(list as *mut c_void, 0, 0x7E57_D221);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(with(list as *mut c_void, |state| state.pso), 0x7E57_D221);
+            ready_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            done_tx.send(with(list as *mut c_void, |state| state.pso)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).expect("cache worker did not warm its entry");
+        let shard = STATES.shards[state_shard_index(list)].lock().unwrap();
+        continue_tx.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).expect("warm cache took its registry shard"), 0x7E57_D221);
+        drop(shard);
+        worker.join().unwrap();
+        forget(list as *mut c_void);
+    }
+
+    #[test]
+    fn tls_cache_keeps_four_entries() {
+        let mut cache = BindStateCache { entries: [const { None }; STATE_CACHE_ENTRIES], next: 0 };
+        let entries = (0..=STATE_CACHE_ENTRIES).map(|_| Arc::new(BindEntry::default())).collect::<Vec<_>>();
+        for (key, entry) in entries.iter().take(STATE_CACHE_ENTRIES).enumerate() {
+            cache.insert(key, entry);
+        }
+        for key in 0..STATE_CACHE_ENTRIES {
+            assert!(Arc::ptr_eq(&cache.get(key).unwrap(), &entries[key]));
+        }
+        cache.insert(STATE_CACHE_ENTRIES, &entries[STATE_CACHE_ENTRIES]);
+        assert!(cache.get(0).is_none(), "FIFO cache did not evict its oldest entry");
+        for key in 1..=STATE_CACHE_ENTRIES {
+            assert!(Arc::ptr_eq(&cache.get(key).unwrap(), &entries[key]));
+        }
+    }
+
+    #[test]
+    fn cross_thread_cache_rejects_a_reused_address() {
+        let key = Box::new(0u8);
+        let list = (&*key as *const u8) as usize;
+        reset(list as *mut c_void, 0, 0x7E57_D231);
+        let old = STATES.get(list).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(with(list as *mut c_void, |state| state.pso), 0x7E57_D231);
+            ready_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            with(list as *mut c_void, |state| state.pso)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).expect("cache worker did not warm its entry");
+        forget(list as *mut c_void);
+        reset(list as *mut c_void, 0, 0x7E57_D232);
+        continue_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), 0x7E57_D232, "worker reused its orphaned cache entry");
+        assert!(!old.live.load(Ordering::Acquire));
+        forget(list as *mut c_void);
+    }
+
+    #[test]
+    fn cross_thread_cache_observes_reset_on_the_live_entry() {
+        let key = Box::new(0u8);
+        let list = (&*key as *const u8) as usize;
+        reset(list as *mut c_void, 0, 0x7E57_D241);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(with(list as *mut c_void, |state| state.pso), 0x7E57_D241);
+            ready_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            with(list as *mut c_void, |state| state.pso)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).expect("cache worker did not warm its entry");
+        reset(list as *mut c_void, 0, 0x7E57_D242);
+        continue_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), 0x7E57_D242);
+        forget(list as *mut c_void);
     }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
