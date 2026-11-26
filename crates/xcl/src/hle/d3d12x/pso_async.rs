@@ -4142,6 +4142,90 @@ mod used_tests {
     }
 
     #[test]
+    fn emission_resolves_the_retained_recipe_after_title_address_reuse() {
+        let original = 0x7E57_D013usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let old = structured_pending(build.clone(), false);
+        let resolution = PipelineResolution(classify_retained(original, &old));
+        let replacement = structured_pending(
+            Arc::new(Build::new(Box::new(|| panic!("replacement build ran")), false)), false,
+        );
+        PENDING.insert(original, replacement.clone());
+
+        let PipelineChoice::Available { raw: selected, generation } =
+            resolution.resolve_for_emission() else { panic!("retained recipe was unavailable") };
+        assert_eq!((selected, generation.id()), (raw, 1));
+        assert!(!*replacement.build.done.lock().unwrap(), "replacement build was consumed");
+        assert!(replacement.build.job.lock().unwrap().is_some(), "replacement job was taken");
+
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement));
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(generation); drop(resolution); drop(old); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn emission_ready_choice_keeps_the_bind_generation_after_rebuild() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut second = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let second_raw = &mut second as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        let pending = structured_pending(build.clone(), false);
+        let resolution = PipelineResolution(classify_retained(0x7E57_D014, &pending));
+
+        next.store(second_raw, Ordering::Release);
+        assert_eq!(rebuild_once(&build), Some(RebuildResult::Published { generation: 2 }));
+        let PipelineChoice::Available { raw, generation } = resolution.resolve_for_emission()
+            else { panic!("captured generation was unavailable") };
+        assert_eq!((raw, generation.id()), (first_raw, 1));
+        assert_eq!(first.refs.load(Ordering::Relaxed), 1, "bind pin did not retain generation one");
+
+        drop(generation); drop(resolution);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!(second.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn released_one_shot_initial_is_unavailable_during_concurrent_consumption() {
+        let original = 0x7E57_D015usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        submit_lazy(original, false, Box::new(move || raw), 0);
+        let pending = entry(original).unwrap();
+        let resolution = begin_pipeline_resolution(original).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+        let together = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let releaser = scope.spawn(|| {
+                together.wait();
+                let released_raw = released(original);
+                assert_eq!(released_raw, raw);
+                release(released_raw);
+                released_raw
+            });
+            together.wait();
+            assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Legacy));
+            assert_eq!(releaser.join().unwrap(), raw);
+        });
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0, "an unowned one-shot raw escaped");
+    }
+
+    #[test]
     fn bind_snapshot_defers_evicted_pipeline_without_requesting_restoration() {
         let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
         let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
@@ -4167,6 +4251,7 @@ mod used_tests {
         let resolution = begin_pipeline_resolution(original).expect("registered evicted pipeline");
         assert!(matches!(&resolution.0, StructuredResolve::Deferred { pending: retained, .. }
             if Arc::ptr_eq(retained, &pending)));
+        assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Unavailable));
         assert_eq!(calls.load(Ordering::Relaxed), 1, "bind snapshot ran the rebuild recipe");
         assert!(build.queued.lock().unwrap().is_none(), "bind snapshot queued build work");
         assert!(coordinator.receipts.records(1).is_empty(), "bind snapshot reserved a receipt");
@@ -6916,6 +7001,16 @@ fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator
 #[derive(Clone)]
 pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>);
 
+/// Generation-aware emission result. `Legacy` carries no raw pointer: later integration must use
+/// the existing address-based resolver only for that explicit one-shot case until generalized
+/// native pinning lands. `Unavailable` is fail-closed and must not fall back to that resolver.
+#[allow(dead_code)] // consumed by the later command-list integration stage
+pub(super) enum PipelineChoice {
+    Available { raw: usize, generation: NativeGeneration },
+    Legacy,
+    Unavailable,
+}
+
 /// Wrap one nonblocking decision without exposing coordinator or receipt types to command-list
 /// state. This does not start workers and never runs a queued driver build on the caller.
 #[allow(dead_code)] // activated with the later restoration-request stage
@@ -6933,6 +7028,30 @@ fn begin_pipeline_resolution_on<const E: usize>(
 pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResolution> {
     let pending = entry(original)?;
     Some(PipelineResolution(classify_retained(original, &pending)))
+}
+
+impl PipelineResolution {
+    /// Resolve this bind's retained identity for correctness-critical emission. No branch looks
+    /// up `original` in the registry: an address reused since the bind cannot redirect the wait.
+    /// Restoration states remain fail-closed until a later stage activates their coordinator.
+    #[allow(dead_code)] // consumed by the later command-list integration stage
+    pub(super) fn resolve_for_emission(&self) -> PipelineChoice {
+        match &self.0 {
+            StructuredResolve::Ready { raw, pin: Some(generation), .. } => {
+                PipelineChoice::Available { raw: *raw, generation: generation.clone() }
+            }
+            StructuredResolve::Initial { pending, .. } if pending.build.recipe.is_none() => {
+                PipelineChoice::Legacy
+            }
+            StructuredResolve::Initial { original, pending, .. } => {
+                resolve_retained_recipe_for_emission(*original, pending)
+            }
+            StructuredResolve::Ready { pin: None, .. }
+            | StructuredResolve::Deferred { .. }
+            | StructuredResolve::Restoring { .. }
+            | StructuredResolve::Terminal { .. } => PipelineChoice::Unavailable,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7249,6 +7368,23 @@ fn resolve_wait_bound_and_pin(pso: usize) -> ((usize, bool), Option<NativeGenera
     let choice = (bound, p.bound_unbuilt(pso, bound));
     let (resolved, generation, stale_fallback) = pin_resolved(pso, &p, choice.0, choice.1);
     ((resolved, choice.1 || stale_fallback), generation)
+}
+
+/// Resolve one retained recipe-backed Pending to an exactly owned generation.
+fn resolve_retained_recipe_for_emission(pso: usize, p: &Arc<Pending>) -> PipelineChoice {
+    if p.build.owners.load(Ordering::Acquire) == 0
+        || p.build.orphan.load(Ordering::Acquire)
+    {
+        return PipelineChoice::Unavailable;
+    }
+    p.note_use();
+    let bound = resolve_wait_pending(p, pso, wait_budget());
+    let bound_unbuilt = p.bound_unbuilt(pso, bound);
+    let (raw, generation, _) = pin_resolved(pso, p, bound, bound_unbuilt);
+    match generation {
+        Some(generation) => PipelineChoice::Available { raw, generation },
+        None => PipelineChoice::Unavailable,
+    }
 }
 
 /// The title released stand-in `pso` for good: forget it (its address may come back for
