@@ -301,8 +301,17 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
+#[cfg(test)]
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     let resolution = super::pso_async::begin_pipeline_resolution(pso);
+    install_clear_state(list, pso, resolution);
+}
+
+fn install_clear_state(
+    list: *mut c_void,
+    pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
+) {
     let old_resolution = with(list, |s| {
         s.pso = pso;
         let old_resolution = std::mem::replace(&mut s.resolution, resolution);
@@ -1307,20 +1316,83 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
     put(this, i, 0, &va.to_le_bytes());
 }
 
-/// #25 SetPipelineState: noted, then bound as on the PC
+/// #25 SetPipelineState: retain one title identity for the native bind and later emission.
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
-    set_tracked_pipeline_state(this, pso as usize);
-    super::real::bind_pipeline(this, pso);
+    let pso = pso as usize;
+    let resolution = super::pso_async::begin_pipeline_resolution(pso);
+    set_pipeline_state_retained(this, pso, resolution);
 }
 
+#[cfg(test)]
 fn set_tracked_pipeline_state(this: *mut c_void, pso: usize) {
     let resolution = super::pso_async::begin_pipeline_resolution(pso);
+    install_tracked_pipeline_state(this, pso, resolution);
+}
+
+fn install_tracked_pipeline_state(
+    this: *mut c_void,
+    pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
+) {
     let old_resolution = with(this, |s| {
         s.pso = pso;
         std::mem::replace(&mut s.resolution, resolution)
     });
     drop(old_resolution);
+}
+
+unsafe fn set_pipeline_state_retained(
+    this: *mut c_void,
+    pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
+) {
+    use super::pso_async::{NativePipelineBindMode, NativePipelineChoice};
+    let choice = resolution.as_ref().map(|r| r.select_for_native_bind(NativePipelineBindMode::Lazy));
+    let (raw, generation) = match choice {
+        Some(NativePipelineChoice::Exact { raw, generation }) => (Some(raw), Some(generation)),
+        Some(NativePipelineChoice::InitialFallback { raw, .. }) => (Some(raw), None),
+        Some(NativePipelineChoice::Unavailable) if resolution.as_ref().unwrap().can_omit_unavailable_set() => {
+            (None, None)
+        }
+        Some(NativePipelineChoice::Unavailable) => {
+            // Mesh/raw native consumers can bypass retained draw resolution. Preserve root and
+            // dynamic state, but make Close/submission reject this whole physical recording.
+            super::list_x::poison_recording(this as usize);
+            (None, None)
+        }
+        None => (Some(pso), None),
+    };
+    super::list_x::record_native_generation(this as usize, generation);
+    install_tracked_pipeline_state(this, pso, resolution);
+    if let Some(raw) = raw {
+        super::real::bind_pipeline_exact(this, pso, raw);
+    }
+    super::list_x::on_set_pipeline_state(this, pso);
+}
+
+pub(super) unsafe fn clear_pipeline_state(this: *mut c_void, pso: usize) {
+    let resolution = super::pso_async::begin_pipeline_resolution(pso);
+    clear_pipeline_state_retained(this, pso, resolution);
+}
+
+unsafe fn clear_pipeline_state_retained(
+    this: *mut c_void,
+    pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
+) {
+    use super::pso_async::{NativePipelineBindMode, NativePipelineChoice};
+    let choice = resolution.as_ref().map(|r| r.select_for_native_bind(NativePipelineBindMode::ForBind));
+    let (raw, generation) = match choice {
+        Some(NativePipelineChoice::Exact { raw, generation }) => (raw, Some(generation)),
+        Some(NativePipelineChoice::InitialFallback { raw, .. }) => (raw, None),
+        Some(NativePipelineChoice::Unavailable) => (0, None),
+        None => (pso, None),
+    };
+    super::list_x::record_native_generation(this as usize, generation);
+    super::real::clear_pipeline_exact(this, pso, raw);
+    super::list_x::on_clear_state(this, pso);
+    install_clear_state(this, pso, resolution);
 }
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
@@ -2905,6 +2977,11 @@ void main(uint t : SV_GroupIndex) {
         execute_indirect_calls: AtomicUsize,
     }
 
+    static FAKE_CLEAR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FAKE_CLOSE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FAKE_CLOSED: AtomicBool = AtomicBool::new(false);
+    static FAKE_LAST_CLEAR_PSO: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static FAKE_PIN_COUNT_AT_SET: AtomicUsize = AtomicUsize::new(0);
     unsafe extern "system" fn fake_add_ref(this: *mut c_void) -> u32 {
         (*(this as *const FakeAdoptedList)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
     }
@@ -2919,10 +2996,23 @@ void main(uint t : SV_GroupIndex) {
 
     unsafe extern "system" fn fake_set_pso(this: *mut c_void, pso: *mut c_void) {
         let list = &*(this as *const FakeAdoptedList);
+        FAKE_PIN_COUNT_AT_SET.store(list_x::native_generation_count_for_test(this as usize), Ordering::Release);
         list.set_pso_calls.fetch_add(1, Ordering::Relaxed);
         list.last_pso.store(pso as usize, Ordering::Release);
     }
 
+    unsafe extern "system" fn fake_clear_state(_this: *mut c_void, pso: *mut c_void) {
+        FAKE_CLEAR_CALLS.fetch_add(1, Ordering::Relaxed);
+        FAKE_LAST_CLEAR_PSO.store(pso as usize, Ordering::Release);
+    }
+    unsafe extern "system" fn fake_close(_this: *mut c_void) -> windows::core::HRESULT {
+        FAKE_CLOSE_CALLS.fetch_add(1, Ordering::Relaxed);
+        FAKE_CLOSED.store(true, Ordering::Release);
+        windows::core::HRESULT(0)
+    }
+    unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        if FAKE_CLOSED.swap(false, Ordering::AcqRel) { 0 } else { crate::util::E_FAIL }
+    }
     unsafe extern "system" fn fake_set_compute_rs(this: *mut c_void, _rs: *mut c_void) {
         (*(this as *const FakeAdoptedList)).set_compute_rs_calls.fetch_add(1, Ordering::Relaxed);
     }
@@ -2941,6 +3031,119 @@ void main(uint t : SV_GroupIndex) {
         _count_off: u64,
     ) {
         (*(this as *const FakeAdoptedList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn title_pipeline_binds_use_one_retained_identity_and_fail_closed() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize; orig_vt[2] = fake_release as usize;
+        orig_vt[8] = fake_clear_state as usize; orig_vt[9] = fake_close as usize;
+        orig_vt[10] = fake_reset as usize; orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize; orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0), set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        unsafe { list_x::on_create(list, 0, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut old = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let old_raw = &mut old as *mut ResolutionPso as usize;
+        let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let original = 0x7100_48F8usize;
+        pso_async::submit_lazy(original, true, Box::new(move || old_raw), 0);
+        assert_eq!(pso_async::resolve_wait(original), old_raw);
+        let retained = pso_async::begin_pipeline_resolution(original).unwrap();
+        let retained_identity = retained.identity_for_test();
+        let old_owner = pso_async::released(original);
+        let replacement_calls = Arc::new(AtomicUsize::new(0)); let calls = replacement_calls.clone();
+        pso_async::submit_lazy(original, true, Box::new(move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            replacement_raw
+        }), 0);
+        let alias_calls = Arc::new(AtomicUsize::new(0)); let calls = alias_calls.clone();
+        pso_async::submit_lazy(old_raw, true, Box::new(move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            replacement_raw
+        }), 0);
+        FAKE_PIN_COUNT_AT_SET.store(0, Ordering::Release);
+        unsafe { set_pipeline_state_retained(list, original, Some(retained)) };
+        assert_eq!(fake.last_pso.load(Ordering::Acquire), old_raw);
+        assert_eq!(FAKE_PIN_COUNT_AT_SET.load(Ordering::Acquire), 1, "exact generation was not pinned before native SetPipelineState");
+        assert_eq!(replacement_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(alias_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(list_x::bound_pipeline_for_test(list as usize), original);
+        assert_eq!(with(list, |s| s.resolution.as_ref().unwrap().identity_for_test()), retained_identity);
+        let clear_resolution = with(list, |s| s.resolution.clone());
+        FAKE_CLEAR_CALLS.store(0, Ordering::Release);
+        unsafe { clear_pipeline_state_retained(list, original, clear_resolution) };
+        assert_eq!(FAKE_CLEAR_CALLS.load(Ordering::Acquire), 1);
+        assert_eq!(FAKE_LAST_CLEAR_PSO.load(Ordering::Acquire), old_raw);
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 1, "Set and Clear duplicated the exact generation pin");
+        assert_eq!(replacement_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(alias_calls.load(Ordering::Relaxed), 0);
+        let unavailable = pso_async::pipeline_resolution_for_compute_test(original, || {})
+            .unavailable_for_test();
+        let (before_sets, before_clears) = (fake.set_pso_calls.load(Ordering::Relaxed), FAKE_CLEAR_CALLS.load(Ordering::Relaxed));
+        unsafe { set_pipeline_state_retained(list, original, Some(unavailable)) };
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), before_sets, "unavailable SetPipelineState rebound the prior native pipeline");
+        assert_eq!(FAKE_CLEAR_CALLS.load(Ordering::Relaxed), before_clears, "eligible omission reset logical root state");
+        assert!(!list_x::recording_poisoned(list as usize));
+        unsafe {
+            dispatch_flags(list, 1, 1, 1, 0);
+            execute_indirect_retained(
+                list, 1, 1, 0, 0, 0, 0, IndirectSignatureInfo::new(true, false, None),
+            );
+        }
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0, "unavailable Dispatch executed the preceding PSO");
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0, "unavailable ExecuteIndirect executed the preceding PSO");
+
+        let unavailable = pso_async::pipeline_resolution_for_test(original, || {}).unavailable_for_test();
+        let (before_sets, before_clears) = (fake.set_pso_calls.load(Ordering::Relaxed), FAKE_CLEAR_CALLS.load(Ordering::Relaxed));
+        unsafe { set_pipeline_state_retained(list, original, Some(unavailable)) };
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), before_sets);
+        assert_eq!(FAKE_CLEAR_CALLS.load(Ordering::Relaxed), before_clears, "poisoning reset physical state");
+        assert!(list_x::recording_poisoned(list as usize));
+        FAKE_CLOSE_CALLS.store(0, Ordering::Release);
+        FAKE_CLOSED.store(false, Ordering::Release);
+        assert!(unsafe { real::close_for_test(list) } < 0);
+        assert_eq!(FAKE_CLOSE_CALLS.load(Ordering::Acquire), 1, "poisoned Close did not close natively");
+        assert!(real::submission_rejected_for_test(&[list]), "poisoned recording passed submission guard");
+
+        let (parent, bundle) = (0x7100_48FAusize, 0x7100_48FBusize);
+        unsafe {
+            list_x::on_create(parent as *mut c_void, 0, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            list_x::on_create(bundle as *mut c_void, 0, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE);
+        }
+        list_x::poison_recording(bundle);
+        list_x::on_execute_bundle(parent, bundle); list_x::on_execute_bundle(parent, bundle);
+        assert!(real::submission_rejected_for_test(&[parent as *mut c_void]));
+        list_x::on_release(parent); list_x::on_release(bundle);
+
+        let unavailable = pso_async::pipeline_resolution_for_test(original, || {}).unavailable_for_test();
+        FAKE_LAST_CLEAR_PSO.store(usize::MAX, Ordering::Release);
+        unsafe { clear_pipeline_state_retained(list, original, Some(unavailable)) };
+        assert_eq!(FAKE_LAST_CLEAR_PSO.load(Ordering::Acquire), 0, "unavailable ClearState did not send NULL");
+        assert_eq!(with(list, |s| s.pso), original);
+        assert_eq!(list_x::bound_pipeline_for_test(list as usize), original);
+        assert!(list_x::recording_poisoned(list as usize), "ClearState must not unpoison a recording");
+        assert_eq!(unsafe { list_x::reset_pc(list, 0, 0) }, 0);
+        assert!(!list_x::recording_poisoned(list as usize), "successful Reset must clear poison");
+
+        forget(list);
+        list_x::clear_segment_state(list as usize);
+        list_x::on_release(list as usize);
+        assert_eq!(pso_async::released(original), 0);
+        assert_eq!(pso_async::released(old_raw), 0);
+        assert_eq!(unsafe { resolution_release(old_owner as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
     }
 
     /// `DispatchX` with thread dimensions (flag 0x20, as the BVH builder's rehydration passes
