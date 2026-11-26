@@ -41,7 +41,58 @@ struct State {
     limits: [u32; 3],
 }
 
-static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+const STATE_SHARDS: usize = 64;
+
+#[derive(Default)]
+struct BindEntry {
+    state: Mutex<State>,
+}
+
+struct BindStateRegistry {
+    shards: [Mutex<Option<HashMap<usize, Arc<BindEntry>>>>; STATE_SHARDS],
+}
+
+impl BindStateRegistry {
+    const fn new() -> Self {
+        Self { shards: [const { Mutex::new(None) }; STATE_SHARDS] }
+    }
+
+    fn get(&self, key: usize) -> Option<Arc<BindEntry>> {
+        self.shards[state_shard_index(key)].lock().unwrap().as_ref()?.get(&key).cloned()
+    }
+
+    fn get_or_insert(&self, key: usize) -> Arc<BindEntry> {
+        self.shards[state_shard_index(key)]
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_default()
+            .clone()
+    }
+
+    #[cfg(feature = "pipeline-resolution-bench")]
+    fn insert(&self, key: usize, entry: Arc<BindEntry>) -> Option<Arc<BindEntry>> {
+        self.shards[state_shard_index(key)]
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(key, entry)
+    }
+
+    fn remove(&self, key: usize) -> Option<Arc<BindEntry>> {
+        self.shards[state_shard_index(key)].lock().unwrap().as_mut()?.remove(&key)
+    }
+}
+
+#[inline]
+fn state_shard_index(key: usize) -> usize {
+    let mut mixed = (key >> 4).wrapping_mul(0x9E37_79B1);
+    mixed ^= mixed >> 16;
+    mixed & (STATE_SHARDS - 1)
+}
+
+static STATES: BindStateRegistry = BindStateRegistry::new();
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -71,7 +122,9 @@ fn count(k: usize) {
 }
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
-    f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+    let entry = STATES.get_or_insert(list as usize);
+    let mut state = entry.state.lock().unwrap();
+    f(&mut state)
 }
 
 /// Opaque fixture for measuring the actual retained-pipeline state snapshot without a device.
@@ -90,19 +143,27 @@ impl BindStateBench {
         let resolutions = (0..workers)
             .map(|_| super::pso_async::PipelineResolutionBench::new())
             .collect::<Vec<_>>();
-        let keys = (0..workers).map(|index| Box::new(index as u8)).collect::<Vec<_>>();
-        let lists = keys.iter().map(|key| (&**key as *const u8) as usize).collect::<Vec<_>>();
-        {
-            let mut states = STATES.lock().unwrap();
-            let states = states.get_or_insert_with(HashMap::new);
-            assert!(lists.iter().all(|list| !states.contains_key(list)));
-            for (worker, &list) in lists.iter().enumerate() {
-                states.insert(list, State {
+        let keys = (0..workers * STATE_SHARDS).map(|index| Box::new(index as u8)).collect::<Vec<_>>();
+        let mut used_shards = [false; STATE_SHARDS];
+        let lists = keys
+            .iter()
+            .map(|key| (&**key as *const u8) as usize)
+            .filter(|&list| {
+                let shard = state_shard_index(list);
+                !std::mem::replace(&mut used_shards[shard], true)
+            })
+            .take(workers)
+            .collect::<Vec<_>>();
+        assert_eq!(lists.len(), workers, "benchmark keys did not cover enough bind shards");
+        for (worker, &list) in lists.iter().enumerate() {
+            let entry = Arc::new(BindEntry {
+                state: Mutex::new(State {
                     pso: worker + 1,
                     resolution: Some(resolutions[worker].retained_resolution()),
                     ..Default::default()
-                });
-            }
+                }),
+            });
+            assert!(STATES.insert(list, entry).is_none());
         }
         Self { _resolutions: resolutions, lists, _keys: keys }
     }
@@ -131,11 +192,7 @@ impl BindStateBench {
 #[cfg(feature = "pipeline-resolution-bench")]
 impl Drop for BindStateBench {
     fn drop(&mut self) {
-        let removed = {
-            let mut states = STATES.lock().unwrap();
-            let Some(states) = states.as_mut() else { return };
-            self.lists.iter().filter_map(|list| states.remove(list)).collect::<Vec<_>>()
-        };
+        let removed = self.lists.iter().filter_map(|&list| STATES.remove(list)).collect::<Vec<_>>();
         drop(removed);
     }
 }
@@ -246,9 +303,9 @@ pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize
 /// Install a preflighted split state without cloning or growing the state map.
 pub(super) fn install_prepared_split(prepared: PreparedSplit) {
     let PreparedSplit { to, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution } = prepared;
+    let entry = STATES.get(to).expect("prepared split destination state");
     let old_resolution = {
-        let mut states = STATES.lock().unwrap();
-        let s = states.as_mut().and_then(|m| m.get_mut(&to)).expect("prepared split destination state");
+        let mut s = entry.state.lock().unwrap();
         debug_assert_eq!(s.allocator, 0);
         debug_assert!(s.uma.is_empty());
         s.allocator = allocator;
@@ -280,12 +337,15 @@ pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    let removed = {
-        STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)))
-    };
-    if let Some(s) = removed {
+    if let Some(s) = take_state(list as usize) {
         console_list::hold_until_reset(s.allocator, s.uma);
     }
+}
+
+fn take_state(list: usize) -> Option<State> {
+    let entry = STATES.remove(list)?;
+    let state = std::mem::take(&mut *entry.state.lock().unwrap());
+    Some(state)
 }
 
 #[cfg(test)]
@@ -308,7 +368,7 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
-    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    drop(take_state(list as usize));
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -1458,19 +1518,96 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
 
 #[cfg(test)]
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
-    STATES
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&(list as usize)))
-        .map_or(0, |s| s.pso)
+    let Some(entry) = STATES.get(list as usize) else { return 0 };
+    let pso = entry.state.lock().unwrap().pso;
+    pso
+}
+
+#[cfg(test)]
+fn state_locks_available_for_test(list: usize) -> bool {
+    let shard = match STATES.shards[state_shard_index(list)].try_lock() {
+        Ok(shard) => shard,
+        Err(_) => return false,
+    };
+    let entry = shard.as_ref().and_then(|states| states.get(&list)).cloned();
+    drop(shard);
+    let Some(entry) = entry else { return true };
+    let available = entry.state.try_lock().is_ok();
+    available
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn aligned_list_addresses_reach_many_bind_shards() {
+        let shards = (0..256).map(|index| state_shard_index(0x7100_0000 + index * 16)).collect::<HashSet<_>>();
+        assert!(shards.len() >= STATE_SHARDS / 2, "aligned list addresses reached only {} shards", shards.len());
+    }
+
+    #[test]
+    fn busy_bind_shard_does_not_block_an_unrelated_shard() {
+        let first = 0x7E57_BA00usize;
+        let second = (1..STATE_SHARDS)
+            .map(|index| first + index * 16)
+            .find(|&key| state_shard_index(key) != state_shard_index(first))
+            .expect("shard mixer did not distribute aligned keys");
+        let shard = STATES.shards[state_shard_index(first)].lock().unwrap();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            drop(STATES.get_or_insert(second));
+            sent.send(()).unwrap();
+        });
+        received.recv_timeout(Duration::from_secs(1)).expect("unrelated bind shard blocked");
+        worker.join().unwrap();
+        drop(shard);
+        drop(STATES.remove(second));
+    }
+
+    #[test]
+    fn busy_list_state_does_not_block_another_list_in_the_same_shard() {
+        let keys = (0..256).map(|index| Box::new(index as u8)).collect::<Vec<_>>();
+        let mut seen = HashMap::new();
+        let (first, second) = keys
+            .iter()
+            .map(|key| (&**key as *const u8) as usize)
+            .find_map(|key| seen.insert(state_shard_index(key), key).map(|first| (first, key)))
+            .expect("allocator did not provide two keys in one shard");
+        let first_entry = STATES.get_or_insert(first);
+        drop(STATES.get_or_insert(second));
+        let state = first_entry.state.lock().unwrap();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            with(second as *mut c_void, |state| state.pso = 0x7E57_D201);
+            sent.send(()).unwrap();
+        });
+        received.recv_timeout(Duration::from_secs(1)).expect("unrelated list state blocked");
+        worker.join().unwrap();
+        drop(state);
+        drop(STATES.remove(first));
+        drop(STATES.remove(second));
+    }
+
+    #[test]
+    fn forget_then_same_address_create_uses_a_fresh_entry() {
+        let key = Box::new(0u8);
+        let list = (&*key as *const u8) as *mut c_void;
+        reset(list, 0, 0x7E57_D211);
+        let old = STATES.get(list as usize).unwrap();
+        forget(list);
+        reset(list, 0, 0x7E57_D212);
+        let new = STATES.get(list as usize).unwrap();
+        assert!(!Arc::ptr_eq(&old, &new));
+        old.state.lock().unwrap().pso = 0x7E57_D213;
+        assert_eq!(tracked_pso(list), 0x7E57_D212, "orphaned state changed the replacement");
+        forget(list);
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
@@ -1739,12 +1876,18 @@ void main(uint t : SV_GroupIndex) {
         forget(list);
     }
 
-    fn probed_resolution(list: usize, original: usize, dropped: Arc<AtomicBool>)
+    fn probed_resolution(
+        list: usize,
+        original: usize,
+        entry: std::sync::Weak<BindEntry>,
+        dropped: Arc<AtomicBool>,
+    )
         -> pso_async::PipelineResolution {
         pso_async::pipeline_resolution_for_test(original, move || {
-            assert!(STATES.try_lock().is_ok(), "pipeline resolution dropped under bind::STATES");
+            assert!(state_locks_available_for_test(list), "pipeline resolution dropped under bind-state locks");
+            let entry = entry.upgrade().expect("old bind entry disappeared before its resolution");
+            assert!(entry.state.try_lock().is_ok(), "pipeline resolution dropped under its old entry lock");
             dropped.store(true, Ordering::Release);
-            let _ = list;
         })
     }
 
@@ -1938,10 +2081,11 @@ void main(uint t : SV_GroupIndex) {
         let mut native = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let raw = &mut native as *mut ResolutionPso as usize;
         let standin = 0x7100_489Dusize;
+        let list_key = list as usize;
         let calls = Arc::new(AtomicUsize::new(0));
         let build_calls = calls.clone();
         pso_async::submit_lazy(standin, true, Box::new(move || {
-            assert!(STATES.try_lock().is_ok(), "Dispatch waited for its build under bind::STATES");
+            assert!(state_locks_available_for_test(list_key), "Dispatch waited for its build under bind-state locks");
             build_calls.fetch_add(1, Ordering::Relaxed);
             real::register_translated_compute_for_test(raw);
             raw
@@ -2015,10 +2159,11 @@ void main(uint t : SV_GroupIndex) {
         let raw = &mut real as *mut ResolutionPso as usize;
         let standin = 0x7100_48A0usize;
         let list = 0x7100_48B0usize as *mut c_void;
+        let list_key = list as usize;
         let calls = Arc::new(AtomicUsize::new(0));
         let build_calls = calls.clone();
         pso_async::submit_recipe_keyed(standin, false, pso_async::Recipe::new(move || {
-            assert!(STATES.try_lock().is_ok(), "pipeline build waited under bind::STATES");
+            assert!(state_locks_available_for_test(list_key), "pipeline build waited under bind-state locks");
             build_calls.fetch_add(1, Ordering::Relaxed);
             raw
         }), false, 0, None);
@@ -2087,10 +2232,18 @@ void main(uint t : SV_GroupIndex) {
         for (n, replace) in cases.into_iter().enumerate() {
             let list = (0x7100_5100usize + n) as *mut c_void;
             let dropped = Arc::new(AtomicBool::new(false));
-            let resolution = probed_resolution(list as usize, 0x7100_5200 + n, dropped.clone());
+            with(list, |_| {});
+            let old_entry = STATES.get(list as usize).unwrap();
+            let resolution = probed_resolution(
+                list as usize,
+                0x7100_5200 + n,
+                Arc::downgrade(&old_entry),
+                dropped.clone(),
+            );
             with(list, |s| s.resolution = Some(resolution));
             replace(list);
             assert!(dropped.load(Ordering::Acquire), "case {n} retained the replaced resolution");
+            drop(old_entry);
             if n + 1 != cases.len() {
                 forget(list);
             }
