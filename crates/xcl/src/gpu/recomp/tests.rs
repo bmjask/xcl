@@ -2474,6 +2474,115 @@ fn spill_slots(slot: fn(u32) -> u32) -> Vec<u8> {
     code
 }
 
+/// The compiler's whole-wave reduction: wave64 adds the upper half through lane 32.
+fn whole_reduction(op: &str, identity: u64, out: u64, wave64: bool, saved_mask: bool, upper_lane: u64, clobber: Option<u64>) -> Vec<u8> {
+    let width = if wave64 { "B64" } else { "B32" };
+    let mut c = vec![ins(&format!("S_OR_SAVEEXEC_{width}"), "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None)];
+    if clobber == Some(30) {
+        c.push(ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None));
+    } else if clobber == Some(31) {
+        c.push(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 31), ("SSRC0", 193)], None));
+    } else if clobber == Some(203) {
+        c.push(ins("S_ANDN2_WREXEC_B64", "ENC_SOP1", &[("SDST", 40), ("SSRC0", 42)], None));
+    }
+    c.push(ins(
+        &format!("S_AND_{width}"),
+        "ENC_SOP2",
+        &[("SDST", 10), ("SSRC0", 18), ("SSRC1", if saved_mask { 30 } else { 20 })],
+        None,
+    ));
+    if clobber == Some(10) {
+        c.push(ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 193)], None));
+    } else if clobber == Some(11) {
+        c.push(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 193)], None));
+    }
+    c.push(ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + 13), ("SRC2", 10)], None));
+    if clobber == Some(126) {
+        c.push(ins("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 6)], None));
+    }
+    let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
+    for (step, mut sel) in [[1u64, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]].into_iter().enumerate() {
+        if clobber == Some(200) && step == 0 {
+            sel[0] = 0;
+        }
+        let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
+        f.extend(names.iter().copied().zip(sel));
+        c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
+    }
+    let mut cross = vec![("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)];
+    if clobber == Some(201) {
+        cross.push(("NEG", 1));
+    }
+    c.extend([
+        ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", 0x140), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ins("V_PERMLANEX16_B32", "ENC_VOP3", &cross, None),
+        ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
+    ]);
+    if wave64 {
+        c.extend([
+            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + upper_lane)], None),
+            ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", if clobber == Some(202) { 11 } else { 10 }), ("VSRC1", 6)], None),
+        ]);
+    }
+    c.extend([
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", out), ("SRC0", V + 6), ("SRC1", 128)], None),
+        ins(&format!("S_MOV_{width}"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+    ]);
+    c.concat()
+}
+
+#[test]
+fn graphics_whole_reductions_use_wave_ops() {
+    let translated = |code: &[u8], wave64: bool, mode| translate(code, &Options { mode, wave64, ..Default::default() }).unwrap().hlsl;
+    for (op, identity, name) in [
+        ("V_OR_B32", 128, "or"),
+        ("V_MAX_U32", 128, "max"),
+        ("V_AND_B32", 193, "and"),
+        ("V_MIN_U32", 193, "min"),
+    ] {
+        let code = program_of(&[whole_reduction(op, identity, 40, true, true, 32, None)]);
+        let hlsl = translated(&code, true, Mode::Pixel(draw_psi()));
+        let call = format!("= xcl_red64_{name}(xcl_seed_");
+        let p = hlsl.find(&call).unwrap_or_else(|| panic!("{op}:\n{hlsl}"));
+        assert!(hlsl[p..hlsl.len().min(p + 300)].contains("v6 = select("), "{op}: accumulator not repaired:\n{hlsl}");
+    }
+    let code32 = program_of(&[whole_reduction("V_MIN_U32", 193, 40, false, true, 32, None)]);
+    let hlsl32 = translated(&code32, false, Mode::Pixel(draw_psi()));
+    assert!(hlsl32.contains("= xcl_red_min(xcl_seed_") && !hlsl32.contains("= xcl_red64_min(xcl_seed_"), "{hlsl32}");
+
+    let min64 = program_of(&[whole_reduction("V_MIN_U32", 193, 40, true, true, 32, None)]);
+    let vs = translated(&min64, true, Mode::Vertex(draw_vsi()));
+    assert!(vs.contains("= xcl_red64_min(xcl_seed_"), "{vs}");
+    for bad in [
+        whole_reduction("V_MIN_U32", 193, 40, true, false, 32, None),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 31, None),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(30)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(31)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(10)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(11)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(126)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(200)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(201)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(202)),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, Some(203)),
+        whole_reduction("V_ADD_NC_U32", 128, 40, true, true, 32, None),
+    ] {
+        let hlsl = translated(&program_of(&[bad]), true, Mode::Pixel(draw_psi()));
+        assert!(!hlsl.contains("= xcl_red64_"), "{hlsl}");
+    }
+
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let e = crate::gpu::dxil::kernel::translate_pixel(&min64, o, &draw_psi()).err().expect("direct DXIL accepted a partial-wave reduction");
+    assert!(e.contains("graphics whole-wave reduction needs the HLSL path"), "{e}");
+    let trivial = program_of(&[ins(
+        "EXP",
+        "ENC_EXP",
+        &[("TGT", 0), ("EN", 0xf), ("VSRC0", 2), ("VSRC1", 3), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)],
+        None,
+    )]);
+    crate::gpu::dxil::kernel::translate_pixel(&trivial, o, &draw_psi()).expect("a non-reduction PS must stay on direct DXIL");
+}
+
 /// The whole-wave reduction of the retail pixel shaders (`upper_lanes`), run as a wave64 PS:
 /// identity into the lanes outside the mask, DPP8 xor 1 / 2 / 4, row_mirror, the other row
 /// through `v_permlanex16`, `v_readlane` 32 for the upper half's result, `v_readlane` 0 for
@@ -2489,29 +2598,6 @@ fn gpu_wave64_ps_whole_wave_reductions() {
     if !gpu_ready() {
         return;
     }
-    let reduce = |op: &str, identity: u64, out: u64| -> Vec<u8> {
-        let mut c = vec![
-            ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None),
-            ins("S_AND_B64", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 18), ("SSRC1", 30)], None),
-            ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + 13), ("SRC2", 10)], None),
-        ];
-        let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
-        for sel in [[1u64, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]] {
-            let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
-            f.extend(names.iter().copied().zip(sel));
-            c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
-        }
-        c.extend([
-            ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", 0x140), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
-            ins("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)], None),
-            ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
-            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + 32)], None),
-            ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", 10), ("VSRC1", 6)], None),
-            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", out), ("SRC0", V + 6), ("SRC1", 128)], None),
-            ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
-        ]);
-        c.concat()
-    };
     let code = program_of(&[
         // v12 = pixel number y·16 + x, v13 = v12 + 1, s[18:19] = the odd pixels
         ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
@@ -2525,8 +2611,8 @@ fn gpu_wave64_ps_whole_wave_reductions() {
         ins("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 62), ("SRC0", V + 12)], None),
         ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", 128)], None),
         ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", V + 15)], None),
-        reduce("V_MIN_U32", 193, 40),
-        reduce("V_ADD_NC_U32", 128, 41),
+        whole_reduction("V_MIN_U32", 193, 40, true, true, 32, None),
+        whole_reduction("V_ADD_NC_U32", 128, 41, true, true, 32, None),
         ins("S_AND_B64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 18), ("SSRC1", 126)], None),
         ins("S_FF1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 0)], None),
         ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 43), ("SRC0", V + 13), ("SRC1", 0)], None),
@@ -2557,6 +2643,11 @@ fn gpu_wave64_ps_whole_wave_reductions() {
             let got = [p[0] as u32, p[1] as u32, p[2] as u32];
             assert_eq!(got, want, "pixel {id} (lane {lane}, wave of pixel {first}): min / sum over the odd pixels, waterfall read");
         }
+    }
+    // Six covered pixels in three quads, with the rest of the hardware wave unlaunched.
+    let small = draw_console(None, Some(&code), &[[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]);
+    for i in [0usize, 1, 2, 16, 17, 32] {
+        assert_eq!(small[i][0] as u32, 2, "pixel {i}, partial wave: min over odd covered pixels");
     }
 }
 

@@ -17,7 +17,7 @@ pub(super) enum Flow {
 }
 
 pub(super) struct Em {
-    /// whole-wave reductions (`wave32_reductions`)
+    /// whole-wave reductions (`graphics_reductions`)
     pub reductions: super::Reductions,
     opt: Options,
     out: String,
@@ -4128,9 +4128,11 @@ impl Em {
             }
             "v_readlane_b32" => {
                 let t = self.t();
-                // the end of a whole-wave reduction (`wave32_reductions`)
-                if let Some((seed, op)) = self.reductions.reads.get(&d.pc) {
-                    self.line(&format!("uint {t} = xcl_red_{op}(xcl_seed_{seed:x});"));
+                // the end of a compiler whole-wave reduction (`graphics_reductions`)
+                if let Some(red) = self.reductions.reads.get(&d.pc).copied() {
+                    let scope = if red.scope == super::ReductionScope::Whole64 { "64" } else { "" };
+                    self.line(&format!("uint {t} = xcl_red{scope}_{}(xcl_seed_{:x});", red.op, red.seed));
+                    self.write32(&Dst::V(red.accum), &t);
                     self.write32(&dst, &t);
                     return Ok(());
                 }
@@ -6401,12 +6403,13 @@ void xcl_s_barrier() {
 }
 "#;
 
-/// Whole-wave reductions of wave32 VS / PS programs (`wave32_reductions`). The console's combine
+/// Whole-wave reductions of graphics programs (`graphics_reductions`). The console combines
 /// the lanes through DPP and permlane steps that pass partial results through lanes that were
 /// never launched (`s_or_saveexec -1` runs them); here those lanes do not exist and the steps
 /// read 0 from them, so a wave that is not full lost the words of live lanes. The lanes of each
-/// half of a 64-lane wave are a console wave of their own. A helper lane is in no wave
-/// operation and gets the result of a live lane of its quad (every quad has one).
+/// half of a 64-lane hardware wave is a wave32 console wave of its own; a wave64 program reduces
+/// the launched hardware wave once. A helper lane is in no wave operation and gets the result of
+/// a live lane of its quad (every quad has one).
 const PRELUDE_REDUCE: &str = r#"
 uint xcl_red_share(uint r) {
 #ifdef XCL_PIXEL
@@ -6434,6 +6437,10 @@ uint xcl_red_min(uint x) {
     uint a = WaveActiveMin(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveMin(select(xcl_half == 0u, 0xFFFFFFFFu, x));
     return xcl_red_share(select(xcl_half == 0u, a, b));
 }
+uint xcl_red64_or(uint x) { return xcl_red_share(WaveActiveBitOr(x)); }
+uint xcl_red64_max(uint x) { return xcl_red_share(WaveActiveMax(x)); }
+uint xcl_red64_and(uint x) { return xcl_red_share(WaveActiveBitAnd(x)); }
+uint xcl_red64_min(uint x) { return xcl_red_share(WaveActiveMin(x)); }
 "#;
 
 /// Pixel shaders: masks hold the helper lanes (#105). After `s_wqm` the helper pixels of a
