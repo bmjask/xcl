@@ -4500,8 +4500,10 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
     let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
     let from_disk = cached.is_none();
+    let mut loaded = None;
     if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        loaded = disk.as_deref().and_then(driver_cache::load);
+        cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
     }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
@@ -4520,7 +4522,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         // a blob the driver does not take (another root signature at the same address…): compiled
         forget_compute_blob(key);
         if from_disk {
-            driver_cache::note(false, disk.as_deref());
+            driver_cache::note(false, loaded.take());
         }
         if mode == ComputeBuild::CachedWhole {
             return (hr, in_driver, false);
@@ -4543,7 +4545,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
             driver_cache::keep(p, &b, in_driver);
         }
     } else if reused && from_disk {
-        driver_cache::note(true, None);
+        driver_cache::note(true, loaded.take());
     }
     (hr, in_driver, reused)
 }
@@ -4560,7 +4562,11 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
 /// and the program compiled as before). Off by default on AMD; `XCL_PSO_DISK_CACHE=1` forces
 /// it on, and `XCL_PSO_DISK_CACHE=0` turns it off everywhere.
 pub(crate) mod driver_cache {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// builds shorter than this are not worth a file
@@ -4644,22 +4650,77 @@ pub(crate) mod driver_cache {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(hash, bytes)))
     }
 
-    pub fn load(p: &Path) -> Option<Vec<u8>> {
-        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
-        std::fs::read(p).ok().filter(|b| !b.is_empty())
+    /// Bytes read from one exact cache-file generation. Keeping its handle open lets a later
+    /// refusal dispose that file object without touching a replacement at the same pathname.
+    pub struct LoadedBlob {
+        bytes: Arc<Vec<u8>>,
+        /// `None` when the blob was readable but the cache entry could not be opened for deletion.
+        file: Option<std::fs::File>,
     }
 
-    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
-    pub fn note(ok: bool, p: Option<&Path>) {
+    impl LoadedBlob {
+        #[cfg(test)]
+        fn bytes(&self) -> &[u8] { &self.bytes }
+        pub fn shared(&self) -> Arc<Vec<u8>> { self.bytes.clone() }
+
+        /// Remove the exact file object that supplied these bytes. If that operation is not
+        /// available, leave the stale entry rather than remove a pathname that may name another
+        /// process's newer replacement.
+        pub fn invalidate(self) -> bool {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FileDispositionInfoEx, SetFileInformationByHandle,
+                FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+                FILE_DISPOSITION_INFO_EX,
+            };
+            let Some(file) = self.file else { return false };
+            let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let ex = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            unsafe {
+                SetFileInformationByHandle(
+                    handle,
+                    FileDispositionInfoEx,
+                    (&ex as *const FILE_DISPOSITION_INFO_EX).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+                ) != 0
+            }
+        }
+    }
+
+    pub fn load(p: &Path) -> Option<LoadedBlob> {
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let open = |access| {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::OpenOptions::new()
+                .read(true)
+                .access_mode(access)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(p)
+        };
+        let (mut file, invalidatable) = open(GENERIC_READ | DELETE).map(|f| (f, true))
+            .or_else(|_| open(GENERIC_READ).map(|f| (f, false))).ok()?;
+        let mut bytes = Vec::new();
+        {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            file.read_to_end(&mut bytes).ok()?;
+        }
+        (!bytes.is_empty()).then(|| LoadedBlob { bytes: Arc::new(bytes), file: invalidatable.then_some(file) })
+    }
+
+    /// A pipeline was made from a kept blob (`ok`), or the driver refused that exact blob: dropped.
+    pub fn note(ok: bool, loaded: Option<LoadedBlob>) {
         if ok {
             let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 crate::xlog_info!("D3D12.X: {n} pipelines made from the driver's blob of an earlier run (kept on disk)");
             }
         } else {
-            if let Some(p) = p {
-                let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
-                let _ = std::fs::remove_file(p);
+            if let Some(loaded) = loaded {
+                let _ = loaded.invalidate();
             }
             if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
                 crate::xlog_info!("D3D12.X: a driver blob kept on disk was refused (another driver or adapter?) – such pipelines are compiled again");
@@ -4732,6 +4793,10 @@ pub(crate) mod driver_cache {
     mod tests {
         use super::*;
 
+        fn load_bytes(p: &Path) -> Option<Vec<u8>> {
+            load(p).map(|b| b.bytes().to_vec())
+        }
+
         struct Directory(PathBuf);
         impl Drop for Directory {
             fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -4767,20 +4832,77 @@ pub(crate) mod driver_cache {
         fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
             let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
             let p = dir.join("driver").join(name(b"program", 0));
-            assert_eq!(load(&p), None, "nothing kept yet");
+            assert_eq!(load_bytes(&p), None, "nothing kept yet");
             assert!(!write(&p, &[]), "an empty blob is not kept");
             keep(&p, &[1, 2, 3], std::time::Duration::from_millis(10));
-            assert_eq!(load(&p), None, "a build of milliseconds is not kept");
+            assert_eq!(load_bytes(&p), None, "a build of milliseconds is not kept");
             keep(&p, &[1, 2, 3], std::time::Duration::from_secs(1));
-            assert_eq!(load(&p).as_deref(), Some(&[1u8, 2, 3][..]));
+            assert_eq!(load_bytes(&p).as_deref(), Some(&[1u8, 2, 3][..]));
             // no half file under the temporary name
             assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
             // the driver took the blob: it stays; it refused it: gone, the program is compiled again
-            note(true, Some(&p));
+            note(true, load(&p));
             assert!(p.exists());
-            note(false, Some(&p));
-            assert_eq!(load(&p), None);
+            note(false, load(&p));
+            assert_eq!(load_bytes(&p), None);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_older_process_cannot_remove_a_replacement_blob() {
+            const CHILD: &str = "XCL_DRIVER_CACHE_REPLACEMENT_CHILD";
+            let bytes = b"same bytes in both generations";
+            if let Some(path) = std::env::var_os(CHILD) {
+                assert!(write(&PathBuf::from(path), bytes), "replace the still-open old generation directly");
+                return;
+            }
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-replace-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let p = dir.join("program.pso");
+            // Identical bytes make pathname/content comparisons unable to distinguish the two
+            // generations: the open file object is the identity that must protect the second.
+            assert!(write(&p, bytes));
+            let delayed_reader = load(&p).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::real::driver_cache::tests::an_older_process_cannot_remove_a_replacement_blob", "--nocapture"])
+                .env(CHILD, &p)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "replacement process failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(delayed_reader.invalidate(), "the old generation can be disposed through its handle");
+            assert_eq!(load_bytes(&p).as_deref(), Some(bytes.as_slice()));
+        }
+
+        #[test]
+        fn a_blob_without_delete_access_fails_closed() {
+            let loaded = LoadedBlob { bytes: Arc::new(vec![1]), file: None };
+            assert!(!loaded.invalidate());
+        }
+
+        #[test]
+        fn a_cache_symlink_never_disposes_its_target() {
+            use std::os::windows::fs::symlink_file;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-link-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let target = dir.join("outside.pso");
+            let link = dir.join("cache.pso");
+            std::fs::write(&target, b"not the cache entry").unwrap();
+            if symlink_file(&target, &link).is_err() {
+                return; // creating symlinks can require Developer Mode or an elevated token
+            }
+            if let Some(loaded) = load(&link) {
+                let _ = loaded.invalidate();
+            }
+            assert_eq!(std::fs::read(&target).unwrap(), b"not the cache entry");
         }
 
         #[test]
@@ -4794,11 +4916,11 @@ pub(crate) mod driver_cache {
             let (_other_tmp, mut other) = create_staging_file(&p).unwrap();
             let complete = b"complete second blob";
             assert!(write(&p, complete));
-            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()));
+            assert_eq!(load_bytes(&p).as_deref(), Some(complete.as_slice()));
             // Resuming the older writer must not change a file already published by this
             // invocation, even when the older payload is shorter than the newer one.
             other.write_all(b"old").unwrap();
-            assert_eq!(load(&p).as_deref(), Some(complete.as_slice()), "published bytes must not alias another writer's staging file");
+            assert_eq!(load_bytes(&p).as_deref(), Some(complete.as_slice()), "published bytes must not alias another writer's staging file");
         }
 
         #[test]
@@ -4817,7 +4939,7 @@ pub(crate) mod driver_cache {
             file.write_all(b"ours").unwrap();
             drop(file);
             std::fs::rename(&tmp, &p).unwrap();
-            assert_eq!(load(&p).as_deref(), Some(b"ours".as_slice()));
+            assert_eq!(load_bytes(&p).as_deref(), Some(b"ours".as_slice()));
             assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
         }
     }
@@ -5412,8 +5534,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
     let from_disk = cached.is_none();
+    let mut loaded = None;
     if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        loaded = disk.as_deref().and_then(driver_cache::load);
+        cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
     }
     let build = create_graphics_pso_cached(
         &mut copy,
@@ -5424,7 +5548,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
                 forget_graphics_blob(gkey, blob);
             }
             if from_disk {
-                driver_cache::note(false, disk.as_deref());
+                driver_cache::note(false, loaded.take());
             }
         },
         |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
@@ -5437,7 +5561,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             driver_cache::keep(p, &b, build.in_driver);
         }
     } else if build.reused && from_disk {
-        driver_cache::note(true, None);
+        driver_cache::note(true, loaded.take());
     }
     if hr < 0 {
         note_translation_error(format!(
@@ -6194,9 +6318,13 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         two_pass_identity::two_pass_stream_key(&stream.0, ps_samplers, driver, crate::gpu::recomp::pso::mem_windows())
     });
     let gdisk = gkey.and_then(|(hash, bytes)| driver_cache::graphics_path(hash, bytes));
-    let gram = gkey.and_then(graphics_blob);
-    let gfrom_disk = gram.is_none();
-    let gcached = gram.or_else(|| gdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new));
+    let mut gcached = gkey.and_then(graphics_blob);
+    let gfrom_disk = gcached.is_none();
+    let mut gloaded = None;
+    if gfrom_disk {
+        gloaded = gdisk.as_deref().and_then(driver_cache::load);
+        gcached = gloaded.as_ref().map(driver_cache::LoadedBlob::shared);
+    }
 
     let bytes = mesh_bytes + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
@@ -6238,10 +6366,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if let Some((key, blob)) = gkey.zip(gcached.as_ref()).filter(|_| hr < 0 || mesh_pso.is_none()) {
         drop(mesh_pso.take());
         if gfrom_disk || forget_graphics_blob(key, blob) {
-            let rejected_path = gdisk.as_deref().filter(|p| {
-                gfrom_disk || driver_cache::load(p).as_deref() == Some(blob.as_ref())
-            });
-            driver_cache::note(false, rejected_path);
+            driver_cache::note(false, gloaded.take());
         }
         take_cold_slot();
         (hr, mesh_pso, gin_driver) = create_mesh("mesh pass retry", None);
@@ -6255,7 +6380,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         if greused {
             if let Some(blob) = gcached.filter(|_| gfrom_disk) {
                 remember_graphics_blob(key, blob);
-                driver_cache::note(true, None);
+                driver_cache::note(true, gloaded.take());
             }
         } else {
             let slow = driver_cache::worth_keeping(gin_driver);
@@ -6280,8 +6405,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut ccached = compute_blob(ckey);
     let cdisk = driver_cache::path(&tp.cs, 0);
     let cfrom_disk = ccached.is_none();
+    let mut cloaded = None;
     if cfrom_disk {
-        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        cloaded = cdisk.as_deref().and_then(driver_cache::load);
+        ccached = cloaded.as_ref().map(driver_cache::LoadedBlob::shared);
     }
     if let Some(b) = &ccached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
@@ -6296,7 +6423,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if hc < 0 && ccached.is_some() {
         forget_compute_blob(ckey);
         if cfrom_disk {
-            driver_cache::note(false, cdisk.as_deref());
+            driver_cache::note(false, cloaded.take());
         }
         take_cold_slot();
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
@@ -6314,7 +6441,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             driver_cache::keep(p, &b, cin_driver);
         }
     } else if creused && cfrom_disk {
-        driver_cache::note(true, None);
+        driver_cache::note(true, cloaded.take());
     }
     drop(slot);
     if hc < 0 || compute.is_null() {
