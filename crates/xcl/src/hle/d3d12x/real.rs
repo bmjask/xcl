@@ -785,6 +785,34 @@ struct Class {
 static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
 static EXTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(super) struct TestCommandListClass {
+    ext: usize,
+}
+
+#[cfg(test)]
+impl Drop for TestCommandListClass {
+    fn drop(&mut self) {
+        CLASSES.lock().unwrap().retain(|c| c.ext != self.ext);
+    }
+}
+
+/// Register the synthetic adopted command-list vtable used by unit tests that call helpers whose
+/// method slots are normally populated by `adopt`.
+#[cfg(test)]
+pub(super) fn test_command_list_class(orig: usize, ext: usize) -> TestCommandListClass {
+    let iface = layout::find("ID3D12GraphicsCommandList").expect("command-list layout");
+    CLASSES.lock().unwrap().push(Class {
+        orig,
+        kind: Kind::CommandList,
+        ext,
+        iface,
+        public: iface.methods.len(),
+        scanned: iface.methods.len(),
+    });
+    TestCommandListClass { ext }
+}
+
 unsafe fn vt(obj: *mut c_void) -> *const usize {
     *(obj as *const *const usize)
 }
@@ -8911,6 +8939,15 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
     cl_set_pipeline_state(this, pso)
+}
+
+/// Bind an already-selected exact native generation without sending its raw pointer back through
+/// the title-address resolver. Used by direct Dispatch after its retained bind is consumed.
+pub(super) unsafe fn bind_pipeline_exact(this: *mut c_void, original: usize, raw: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "SetPipelineState")));
+    f(this, raw as *mut c_void);
+    super::dred::mark_pipeline(this, original, raw);
 }
 
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {

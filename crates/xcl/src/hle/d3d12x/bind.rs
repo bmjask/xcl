@@ -658,6 +658,8 @@ thread_local! {
 static LAST_ABI_PSO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static STOP_ABI_LIST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static STOP_ABI_TEST: Mutex<()> = Mutex::new(());
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
@@ -692,10 +694,9 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
-/// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
-/// arguments are bound (None: the draw is skipped – a console pipeline without a
-/// translation, or no unified memory).
-fn resolve_graphics_pipeline(
+/// Resolve one retained bind for correctness-critical draw or dispatch emission and record its
+/// exact generation before native commands can consume it. None is fail-closed.
+fn resolve_pipeline(
     list: usize,
     pso: usize,
     resolution: Option<super::pso_async::PipelineResolution>,
@@ -712,7 +713,7 @@ fn resolve_graphics_pipeline(
 
 fn resolve_bound_graphics_pipeline(this: *mut c_void, list: usize) -> Option<(usize, usize)> {
     let (pso, resolution) = with(this, |s| (s.pso, s.resolution.clone()));
-    resolve_graphics_pipeline(list, pso, resolution).map(|real| (pso, real))
+    resolve_pipeline(list, pso, resolution).map(|real| (pso, real))
 }
 
 unsafe fn graphics_bound(this: *mut c_void) -> Option<(ID3D12GraphicsCommandList, usize)> {
@@ -1086,22 +1087,31 @@ fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], 
     Some((groups, limits))
 }
 
+fn skip_untranslated_dispatch(pso: usize) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
+    }
+    count(DISPATCHES_SKIPPED);
+}
+
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
-    let pso = with(this, |s| s.pso);
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, pso, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
-        return;
+    let (bound_pso, resolution) = with(this, |s| (s.pso, s.resolution.clone()));
+    if let Some(resolution) = &resolution {
+        if super::list_x::defer_retained(this, resolution, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
+            return;
+        }
     }
-    let pso = super::list_x::resolve_and_record_pipeline_wait(this as usize, pso);
+    let Some(pso) = resolve_pipeline(this as usize, bound_pso, resolution) else {
+        skip_untranslated_dispatch(bound_pso);
+        return;
+    };
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
-        }
-        count(DISPATCHES_SKIPPED);
+        skip_untranslated_dispatch(pso);
         return;
     }
     let Some((groups, limits)) = dispatch_groups(pso, [x, y, z], flags) else {
@@ -1129,7 +1139,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         }
     }
     with(this, |s| s.limits = limits);
-    let done = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
+    let done = translated_dispatch(this, list, bound_pso, pso, groups[0], groups[1], groups[2]);
     with(this, |s| s.limits = [0; 3]);
     match done {
         Ok(()) => count(DISPATCHES),
@@ -1248,11 +1258,19 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
-unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
+unsafe fn translated_dispatch(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    original: usize,
+    pso: usize,
+    x: u32,
+    y: u32,
+    z: u32,
+) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    bind_abi(this, list, pso, false)?;
+    bind_compute_abi_resolved(this, list, original, pso)?;
     super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
 
@@ -1268,15 +1286,25 @@ unsafe fn bind_abi_with_root(
     this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
 ) -> Result<(), String> {
     let pso = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
-    bind_abi_with_root_resolved(this, list, pso, gfx, root)
+    bind_abi_with_root_resolved(this, list, pso, gfx, root, None)
 }
 
 unsafe fn bind_abi_resolved(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    bind_abi_with_root_resolved(this, list, pso, gfx, 0)
+    bind_abi_with_root_resolved(this, list, pso, gfx, 0, None)
+}
+
+unsafe fn bind_compute_abi_resolved(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    original: usize,
+    pso: usize,
+) -> Result<(), String> {
+    bind_abi_with_root_resolved(this, list, pso, false, 0, Some(original))
 }
 
 unsafe fn bind_abi_with_root_resolved(
     this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
+    exact_original: Option<usize>,
 ) -> Result<(), String> {
     #[cfg(test)]
     {
@@ -1336,7 +1364,11 @@ unsafe fn bind_abi_with_root_resolved(
     if root == 0 {
         let pso = pso as *mut c_void;
         let pc = ID3D12PipelineState::from_raw_borrowed(&pso).ok_or("pipeline")?;
-        list.SetPipelineState(pc);
+        if let Some(original) = exact_original {
+            super::real::bind_pipeline_exact(this, original, pso as usize);
+        } else {
+            list.SetPipelineState(pc);
+        }
     }
     if shared_view_bound && super::vram::srv_tracking_enabled() {
         super::list_x::note_shared_view_heap_use(this);
@@ -1741,7 +1773,7 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(pso_async::released(standin), old_raw);
         pso_async::submit_lazy(standin, false, Box::new(move || replacement_raw), 0);
 
-        assert_eq!(resolve_graphics_pipeline(list, standin, Some(retained)), Some(old_raw));
+        assert_eq!(resolve_pipeline(list, standin, Some(retained)), Some(old_raw));
         assert_eq!(list_x::native_generation_count_for_test(list), 1);
         assert_eq!(replacement.refs.load(Ordering::Relaxed), 1, "the reused registry address must not be resolved");
 
@@ -1753,6 +1785,7 @@ void main(uint t : SV_GroupIndex) {
 
     #[test]
     fn graphics_entrypoints_pass_the_retained_raw_to_the_abi() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
         let list = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let list = &list as *const ResolutionPso as *mut c_void;
@@ -1784,6 +1817,129 @@ void main(uint t : SV_GroupIndex) {
         real::forget_pso_for_test(old_raw);
         assert_eq!(unsafe { resolution_release(old_raw as *mut c_void) }, 0);
         assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn dispatch_entrypoint_uses_the_retained_generation_after_address_reuse() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let list_object = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let list = &list_object as *const ResolutionPso as *mut c_void;
+        let mut original = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let original_raw = &mut original as *mut ResolutionPso as usize;
+        let replacement_raw = &mut replacement as *mut ResolutionPso as usize;
+        let standin = 0x7100_489Cusize;
+
+        pso_async::submit_lazy(standin, true, Box::new(move || original_raw), 0);
+        assert_eq!(pso_async::resolve_wait(standin), original_raw);
+        real::register_translated_compute_for_test(original_raw);
+        set_tracked_pipeline_state(list, standin);
+        let original_owner = pso_async::released(standin);
+        assert_eq!(original_owner, original_raw);
+
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let replacement_build_calls = replacement_calls.clone();
+        pso_async::submit_lazy(standin, true, Box::new(move || {
+            replacement_build_calls.fetch_add(1, Ordering::Relaxed);
+            replacement_raw
+        }), 0);
+        STOP_ABI_LIST.store(list as usize, Ordering::Release);
+        for _ in 0..2 {
+            LAST_ABI_PSO.store(0, Ordering::Release);
+            unsafe { dispatch_flags(list, 1, 1, 1, 0) };
+            assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), original_raw);
+        }
+        assert_eq!(replacement_calls.load(Ordering::Relaxed), 0, "Dispatch ran the replacement build");
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 1, "Dispatch retained the replacement generation");
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 1, "repeated Dispatch duplicated its exact pin");
+
+        STOP_ABI_LIST.store(0, Ordering::Release);
+        forget(list);
+        list_x::clear_segment_state(list as usize);
+        assert_eq!(pso_async::released(standin), 0);
+        real::forget_pso_for_test(original_raw);
+        assert_eq!(unsafe { resolution_release(original_owner as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn dispatch_waits_outside_states_and_selects_the_build_once() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let list_object = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let list = &list_object as *const ResolutionPso as *mut c_void;
+        let mut native = ResolutionPso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut ResolutionPso as usize;
+        let standin = 0x7100_489Dusize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        pso_async::submit_lazy(standin, true, Box::new(move || {
+            assert!(STATES.try_lock().is_ok(), "Dispatch waited for its build under bind::STATES");
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            real::register_translated_compute_for_test(raw);
+            raw
+        }), 0);
+        set_tracked_pipeline_state(list, standin);
+        STOP_ABI_LIST.store(list as usize, Ordering::Release);
+
+        LAST_ABI_PSO.store(0, Ordering::Release);
+        unsafe { dispatch_flags(list, 1, 1, 1, 0) };
+        assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), raw);
+        LAST_ABI_PSO.store(0, Ordering::Release);
+        unsafe { dispatch_flags(list, 1, 1, 1, 0) };
+        assert_eq!(LAST_ABI_PSO.load(Ordering::Acquire), raw);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "repeated Dispatch consumed the build more than once");
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 1);
+
+        STOP_ABI_LIST.store(0, Ordering::Release);
+        forget(list);
+        list_x::clear_segment_state(list as usize);
+        let raw_owner = pso_async::released(standin);
+        real::forget_pso_for_test(raw);
+        assert_eq!(unsafe { resolution_release(raw_owner as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn exact_compute_bind_bypasses_a_registry_alias_and_preserves_title_state() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let _class = real::test_command_list_class(
+            orig_vt.as_ptr() as usize,
+            unsafe { ext_vt.as_ptr().add(1) } as usize,
+        );
+        let original = 0x7100_489Eusize;
+        let exact_raw = 0x7100_489Fusize;
+        let replacement = 0x7100_48A1usize;
+        unsafe { list_x::on_set_pipeline_state(list, original) };
+        assert_eq!(list_x::bound_pipeline_for_test(list as usize), original);
+        pso_async::submit_lazy(exact_raw, false, Box::new(move || replacement), 0);
+        assert_eq!(pso_async::resolve_wait(exact_raw), replacement);
+
+        unsafe { real::bind_pipeline_exact(list, original, exact_raw) };
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.last_pso.load(Ordering::Acquire), exact_raw, "exact raw was re-resolved through its alias");
+        assert_eq!(list_x::bound_pipeline_for_test(list as usize), original, "internal compute bind replaced title-visible state");
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 0, "internal exact bind pinned the alias generation");
+
+        assert_eq!(pso_async::released(exact_raw), replacement);
+        list_x::on_release(list as usize);
     }
 
     #[test]
@@ -1827,8 +1983,8 @@ void main(uint t : SV_GroupIndex) {
         }), 0);
         let retained = pso_async::begin_pipeline_resolution(one_shot).unwrap();
         let list = 0x7100_48E0;
-        assert_eq!(resolve_graphics_pipeline(list, one_shot, Some(retained.clone())), Some(one_shot_real));
-        assert_eq!(resolve_graphics_pipeline(list, one_shot, Some(retained)), Some(one_shot_real));
+        assert_eq!(resolve_pipeline(list, one_shot, Some(retained.clone())), Some(one_shot_real));
+        assert_eq!(resolve_pipeline(list, one_shot, Some(retained)), Some(one_shot_real));
         assert_eq!(calls.load(Ordering::Relaxed), 1, "one-shot build must be consumed once");
         assert_eq!(list_x::native_generation_count_for_test(list), 1);
         assert_eq!(real.refs.load(Ordering::Relaxed), 2, "repeated draws retained more than one COM owner");
@@ -1839,18 +1995,18 @@ void main(uint t : SV_GroupIndex) {
         let failed = 0x7100_48E8usize;
         pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
         let retained = pso_async::begin_pipeline_resolution(failed).unwrap();
-        assert_eq!(resolve_graphics_pipeline(0x7100_48E9, failed, Some(retained)), None);
+        assert_eq!(resolve_pipeline(0x7100_48E9, failed, Some(retained)), None);
         assert_eq!(pso_async::released(failed), 0);
 
         let unavailable = 0x7100_48F0usize;
         pso_async::submit_recipe_keyed(unavailable, false, pso_async::Recipe::new(|| panic!("orphan recipe ran")), false, 0, None);
         let retained = pso_async::begin_pipeline_resolution(unavailable).unwrap();
         assert_eq!(pso_async::released(unavailable), 0);
-        assert_eq!(resolve_graphics_pipeline(0x7100_4900, unavailable, Some(retained)), None);
+        assert_eq!(resolve_pipeline(0x7100_4900, unavailable, Some(retained)), None);
 
         let replacement = 0x7100_4910usize;
         pso_async::submit_lazy(replacement, false, Box::new(|| panic!("unregistered bind adopted later registry entry")), 0);
-        assert_eq!(resolve_graphics_pipeline(0, replacement, None), Some(replacement));
+        assert_eq!(resolve_pipeline(0, replacement, None), Some(replacement));
         assert_eq!(pso_async::released(replacement), 0);
     }
 
@@ -2029,6 +2185,7 @@ void main(uint t : SV_GroupIndex) {
         set_compute_rs_calls: AtomicUsize,
         set_compute_uav_calls: AtomicUsize,
         set_pso_calls: AtomicUsize,
+        last_pso: AtomicUsize,
         execute_indirect_calls: AtomicUsize,
     }
 
@@ -2044,8 +2201,10 @@ void main(uint t : SV_GroupIndex) {
         (*(this as *const FakeAdoptedList)).dispatch_calls.fetch_add(1, Ordering::Relaxed);
     }
 
-    unsafe extern "system" fn fake_set_pso(this: *mut c_void, _pso: *mut c_void) {
-        (*(this as *const FakeAdoptedList)).set_pso_calls.fetch_add(1, Ordering::Relaxed);
+    unsafe extern "system" fn fake_set_pso(this: *mut c_void, pso: *mut c_void) {
+        let list = &*(this as *const FakeAdoptedList);
+        list.set_pso_calls.fetch_add(1, Ordering::Relaxed);
+        list.last_pso.store(pso as usize, Ordering::Release);
     }
 
     unsafe extern "system" fn fake_set_compute_rs(this: *mut c_void, _rs: *mut c_void) {
@@ -2147,6 +2306,7 @@ void main(uint t : SV_GroupIndex) {
             set_compute_rs_calls: AtomicUsize::new(0),
             set_compute_uav_calls: AtomicUsize::new(0),
             set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0),
             execute_indirect_calls: AtomicUsize::new(0),
         });
         let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
@@ -2281,6 +2441,7 @@ void main(uint t : SV_GroupIndex) {
             set_compute_rs_calls: AtomicUsize::new(0),
             set_compute_uav_calls: AtomicUsize::new(0),
             set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0),
             execute_indirect_calls: AtomicUsize::new(0),
         });
         let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
