@@ -935,25 +935,16 @@ pub(super) fn resolve_and_record_pipeline_wait(list: usize, pso: usize) -> usize
 /// Snapshot bundle descriptor and PSO-generation use before the bundle may be reset.
 pub(super) fn on_execute_bundle(parent: usize, bundle: usize) {
     let track_descriptors = super::vram::srv_tracking_enabled();
-    let track_generations = super::pso_async::rebuild_recipes_enabled();
-    if !track_descriptors && !track_generations {
-        return;
-    }
     let mut g = LISTS.lock().unwrap();
     let Some(m) = g.as_mut() else { return };
-    let pins = if track_generations {
-        m.get(&bundle).map(|s| s.native_generations.clone()).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let pins = m.get(&bundle).map(|s| s.native_generations.clone()).unwrap_or_default();
+    if !track_descriptors && pins.is_empty() { return }
     if track_descriptors {
         propagate_bundle_shared_view_use(m, parent, bundle);
     }
-    if track_generations {
-        let parent = m.entry(parent).or_default();
-        for pin in pins {
-            parent.pin_native_generation(pin);
-        }
+    let parent = m.entry(parent).or_default();
+    for pin in pins {
+        parent.pin_native_generation(pin);
     }
 }
 
@@ -1281,7 +1272,7 @@ impl<'a> SubmissionChunk<'a> {
     }
 }
 
-/// Submit one exact title chunk, adding one shared retirement receipt when an opt-in recording
+/// Submit one exact title chunk, adding one shared retirement receipt when a recording
 /// can read the shared view heap or owns native pipeline generation pins. The ordinary path stays
 /// on `SubmissionGate::submit`, avoiding a marker, allocation or lock when neither applies.
 pub(super) unsafe fn submit_title_chunk<'a>(
@@ -1309,6 +1300,22 @@ pub(super) unsafe fn submit_title_chunk<'a>(
         },
         execute,
     );
+    finish_title_submission(
+        submitted,
+        epoch,
+        protect_shared_view,
+        protect_native_generations,
+        native_generations,
+    )
+}
+
+fn finish_title_submission<'a>(
+    submitted: super::alloc_pool::ReceiptedSubmission,
+    epoch: Option<super::vram::SharedViewEpoch>,
+    protect_shared_view: bool,
+    protect_native_generations: bool,
+    native_generations: impl Iterator<Item = &'a super::pso_async::NativeGeneration>,
+) -> bool {
     match submitted {
         super::alloc_pool::ReceiptedSubmission::NotExecuted => {
             if let Some(epoch) = epoch {
@@ -1537,7 +1544,9 @@ pub(super) fn on_release(list: usize) {
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
     trace_list(list, ListEvent::Reset);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+    let old_generations = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&list)) else { return };
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.segment_write_producers.clear();
@@ -1552,8 +1561,9 @@ pub(super) fn clear_segment_state(list: usize) {
         s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.deferred = None;
-        s.native_generations.clear();
-    }
+        std::mem::take(&mut s.native_generations)
+    };
+    drop(old_generations);
 }
 
 #[cfg(test)]
@@ -3731,11 +3741,6 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
     let pred_buf = &carry.pred_buf;
     let bindings = &carry.bindings;
 
-    let (init_pso, init_generation) = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
-        (0, None)
-    } else {
-        super::pso_async::resolve_and_pin_if_enabled_lazy(bound_pso)
-    };
     let dev = device_of(list)?;
     let dev_raw = dev.as_raw() as usize;
     if !super::title_list::prepare_split(wrapper, extra_segments) {
@@ -3770,10 +3775,15 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
         None
     };
     let mut continuation_state = carry.continuation_state(ty);
+    let next_bindings = super::bind::prepare_split(list, next_pc, alloc);
+    let (init_pso, init_generation) = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
+        (0, None)
+    } else {
+        next_bindings.initial_pipeline()
+    };
     if let Some(generation) = init_generation {
         continuation_state.pin_native_generation(generation);
     }
-    let next_bindings = super::bind::prepare_split(list, next_pc, alloc);
     let deferred_bindings = deferred.as_ref().map(|(seg, _)| super::bind::prepare_split(list, *seg, alloc));
 
     // Commit starts here: all allocation is complete and the continuation exists closed.
@@ -4184,19 +4194,16 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
         return;
     }
     let clear_predication = PREDICATION_USED.load(Ordering::Acquire);
-    let clear_generations = super::pso_async::rebuild_recipes_enabled();
-    if !clear_predication && !clear_generations {
-        return;
-    }
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-        if clear_generations {
-            s.native_generations.clear();
-        }
+    let old_generations = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else { return };
         if clear_predication {
             s.predication = None;
             s.pred_in_state = false;
         }
-    }
+        std::mem::take(&mut s.native_generations)
+    };
+    drop(old_generations);
 }
 
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
@@ -4400,7 +4407,6 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let mut wait_after_cpu_write = false;
     let mut gate = super::alloc_pool::SubmissionGate::default();
     let track_shared_view_epochs = super::vram::srv_tracking_enabled();
-    let track_native_generation_receipts = super::pso_async::rebuild_recipes_enabled();
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             let plan = submission_plan(prior);
@@ -4414,7 +4420,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                         q_raw,
                         lists,
                         track_shared_view_epochs && chunk.uses_shared_view_heap(),
-                        track_native_generation_receipts && chunk.has_native_generations(),
+                        chunk.has_native_generations(),
                         chunk.native_generations(),
                         || {},
                         || exec(q_raw, lists.len() as u32, lists.as_ptr()),
@@ -4450,7 +4456,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             q_raw,
             &one,
             track_shared_view_epochs && uses_shared_view_heap,
-            track_native_generation_receipts && !native_generations.is_empty(),
+            !native_generations.is_empty(),
             native_generations.iter(),
             || {},
             || exec(q_raw, 1, one.as_ptr()),
@@ -4493,33 +4499,39 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             clear_segment_state(seg);
             super::alloc_pool::retire_recording(seg);
         }
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
-            s.allocator = alloc;
-            s.bound_pso = bound_pso;
-            s.depth_bias = depth_bias;
-            s.index_buffer = index_buffer;
-            s.depth_bounds = depth_bounds;
-            s.predication = predication;
-            s.pred_buf = pred_buf_obj;
-            s.pred_in_state = false;
-            s.occlusion = Occlusion { active: None, ended_early };
-            s.written_ranges.clear();
-            s.segment_write_producers.clear();
-            s.clear_sparse_writes();
-            s.clear_write64_signals();
-            s.clear_waits();
-            s.texture_writes.clear();
-            s.cpu_writes.clear();
-            s.native_generations.clear();
-            s.bindings = bindings_copy;
-        }
+        let old_generations = {
+            let mut g = LISTS.lock().unwrap();
+            if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
+                s.allocator = alloc;
+                s.bound_pso = bound_pso;
+                s.depth_bias = depth_bias;
+                s.index_buffer = index_buffer;
+                s.depth_bounds = depth_bounds;
+                s.predication = predication;
+                s.pred_buf = pred_buf_obj;
+                s.pred_in_state = false;
+                s.occlusion = Occlusion { active: None, ended_early };
+                s.written_ranges.clear();
+                s.segment_write_producers.clear();
+                s.clear_sparse_writes();
+                s.clear_write64_signals();
+                s.clear_waits();
+                s.texture_writes.clear();
+                s.cpu_writes.clear();
+                s.bindings = bindings_copy;
+                std::mem::take(&mut s.native_generations)
+            } else {
+                Vec::new()
+            }
+        };
+        drop(old_generations);
         primary
     } else {
         this
     };
 
     let ext_closed = *(target as *const usize);
-    let (init_pso, init_generation) = super::pso_async::resolve_and_pin_if_enabled(bound_pso);
+    let (init_pso, init_generation) = super::bind::initial_pipeline(target);
     let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
@@ -5243,7 +5255,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
 
     reset_copy_scratch(this);
     reset_own_alloc(this);
-    let is_bundle = {
+    let (is_bundle, old_generations) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
@@ -5264,12 +5276,13 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.texture_transitions.clear();
         s.uses_shared_view_heap = false;
         s.cpu_writes.clear();
-        s.native_generations.clear();
+        let old_generations = std::mem::take(&mut s.native_generations);
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
-        s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+        (s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE), old_generations)
     };
+    drop(old_generations);
     record_native_generation(this as usize, generation);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
@@ -5786,6 +5799,111 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[repr(C)]
+    struct ReentrantGenerationPso {
+        vtable: *const usize,
+        refs: AtomicUsize,
+        release_outside_lists: *const AtomicBool,
+    }
+
+    unsafe extern "system" fn generation_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut ReentrantGenerationPso)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+    }
+
+    unsafe extern "system" fn generation_release(this: *mut c_void) -> u32 {
+        let n = (*(this as *mut ReentrantGenerationPso)).refs.fetch_sub(1, Ordering::Relaxed) - 1;
+        let probe = (*(this as *mut ReentrantGenerationPso)).release_outside_lists;
+        if n == 0 && !probe.is_null() {
+            (*probe).store(LISTS.try_lock().is_ok(), Ordering::Release);
+        }
+        n as u32
+    }
+
+    #[test]
+    fn bundle_generations_propagate_and_final_release_runs_outside_lists() {
+        let release_outside_lists = Box::leak(Box::new(AtomicBool::new(false)));
+        let standin = 0x7E57_B017usize;
+        let bundle = 0x7E57_B018usize;
+        let parent = 0x7E57_B019usize;
+        let vtable = Box::leak(Box::new([0usize, generation_add_ref as usize, generation_release as usize]));
+        let native = Box::leak(Box::new(ReentrantGenerationPso {
+            vtable: vtable.as_ptr(), refs: AtomicUsize::new(1), release_outside_lists,
+        }));
+        let raw = native as *mut ReentrantGenerationPso as usize;
+        super::super::pso_async::submit_lazy(standin, false, Box::new(move || raw), 0);
+        assert_eq!(super::super::pso_async::resolve_wait(standin), raw);
+        let resolution = super::super::pso_async::begin_pipeline_resolution(standin).unwrap();
+        let super::super::pso_async::PipelineChoice::Available { generation, .. } = resolution.resolve_for_emission()
+            else { panic!("completed one-shot generation unavailable") };
+        record_native_generation(bundle, Some(generation));
+        drop(resolution);
+
+        on_execute_bundle(parent, bundle);
+        assert_eq!(native_generation_count_for_test(parent), 1, "bundle generation did not reach its parent");
+        let raw_owner = super::super::pso_async::released(standin);
+        assert_eq!(raw_owner, raw);
+        super::super::pso_async::release(raw_owner);
+        clear_segment_state(bundle);
+        assert!(!release_outside_lists.load(Ordering::Acquire), "bundle clear released the parent's generation");
+        clear_segment_state(parent);
+        assert!(release_outside_lists.load(Ordering::Acquire), "final COM Release ran under LISTS");
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn title_submission_without_protected_state_uses_the_ordinary_fast_path() {
+        let prepared = AtomicBool::new(false);
+        let executed = AtomicBool::new(false);
+        let mut gate = super::super::alloc_pool::SubmissionGate::default();
+        assert!(unsafe {
+            submit_title_chunk(
+                &mut gate,
+                std::ptr::null_mut(),
+                &[],
+                false,
+                false,
+                std::iter::empty::<&super::super::pso_async::NativeGeneration>(),
+                || prepared.store(true, Ordering::Release),
+                || executed.store(true, Ordering::Release),
+            )
+        });
+        assert!(prepared.load(Ordering::Acquire));
+        assert!(executed.load(Ordering::Acquire));
+        assert!(!gate.failed());
+    }
+
+    #[test]
+    fn receipted_title_submission_retires_the_exact_generation_on_completion() {
+        let standin = 0x7E57_B027usize;
+        let vtable = Box::leak(Box::new([0usize, generation_add_ref as usize, generation_release as usize]));
+        let native = Box::leak(Box::new(ReentrantGenerationPso {
+            vtable: vtable.as_ptr(), refs: AtomicUsize::new(1), release_outside_lists: std::ptr::null(),
+        }));
+        let raw = native as *mut ReentrantGenerationPso as usize;
+        super::super::pso_async::submit_lazy(standin, false, Box::new(move || raw), 0);
+        assert_eq!(super::super::pso_async::resolve_wait(standin), raw);
+        let resolution = super::super::pso_async::begin_pipeline_resolution(standin).unwrap();
+        let super::super::pso_async::PipelineChoice::Available { generation, .. } = resolution.resolve_for_emission()
+            else { panic!("completed one-shot generation unavailable") };
+        let (receipt, completed) = super::super::alloc_pool::submission_receipt_for_test(0, 1);
+        assert!(finish_title_submission(
+            super::super::alloc_pool::ReceiptedSubmission::Executed(receipt),
+            None,
+            false,
+            true,
+            std::iter::once(&generation),
+        ));
+        drop(generation);
+        drop(resolution);
+        let raw_owner = super::super::pso_async::released(standin);
+        super::super::pso_async::release(raw_owner);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 1, "in-flight receipt released its generation");
+
+        completed.store(1, Ordering::Release);
+        super::super::pso_async::sweep_native_generations_for_test();
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0, "completed receipt retained its generation");
+    }
 
     #[test]
     fn generation_capture_deduplicates_and_survives_recording_reset() {
