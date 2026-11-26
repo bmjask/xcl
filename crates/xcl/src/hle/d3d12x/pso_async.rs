@@ -60,6 +60,9 @@ struct Build {
     /// the real pipeline state (one owned raw pointer shared by all `Pending`s), 0 until built
     /// or when building failed
     real: AtomicUsize,
+    /// Lazily retained exact owner for an ordinary one-shot result. Creation and removal are
+    /// serialized by `done`, so a title release cannot cross the first exact pin.
+    one_shot_generation: Mutex<Option<Arc<Generation<ID3D12PipelineState>>>>,
     /// Last frame in which any owner resolved this build, for `XCL_ACTIVITY` retention ages.
     last_use_frame: AtomicU64,
     /// Frame in which `real` became retained; age never begins before the build completed.
@@ -308,6 +311,7 @@ impl Build {
             tracked: AtomicBool::new(false),
             queue_state: AtomicU8::new(QUEUE_IDLE),
             real: AtomicUsize::new(0),
+            one_shot_generation: Mutex::new(None),
             last_use_frame: AtomicU64::new(super::present::presents()),
             completed_frame: AtomicU64::new(0),
             candidate_queued: AtomicBool::new(false),
@@ -2484,6 +2488,29 @@ impl NativeGeneration {
     }
 }
 
+impl Build {
+    /// Pin a completed one-shot result while the caller holds `done`. The extra COM owner and
+    /// allocation are paid only when a retained bind snapshot first selects the pipeline.
+    fn pin_one_shot(&self, raw: usize) -> Option<NativeGeneration> {
+        if raw == 0 || self.recipe.is_some() {
+            return None;
+        }
+        let mut cached = self.one_shot_generation.lock().unwrap();
+        let generation = match cached.as_ref() {
+            Some(generation) if generation.raw == raw => generation.clone(),
+            Some(_) => return None,
+            None => {
+                let p = raw as *mut std::ffi::c_void;
+                let owner = unsafe { ID3D12PipelineState::from_raw_borrowed(&p) }?.clone();
+                let generation = Arc::new(Generation { id: 1, raw, _owner: owner });
+                *cached = Some(generation.clone());
+                generation
+            }
+        };
+        Some(NativeGeneration { generation, recipe: Weak::new() })
+    }
+}
+
 struct GenerationRetirements<G, R> {
     pending: Vec<(R, Vec<G>)>,
     poisoned: Vec<G>,
@@ -2574,7 +2601,8 @@ pub(super) fn poison_native_generations<'a>(pins: impl Iterator<Item = &'a Nativ
 
 /// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
 /// same operation; retaining it does not by itself schedule or run more work. Its existing opt-in
-/// allocation also owns the native generation, so ordinary one-shot builds allocate no new state.
+/// allocation also owns the native generation; one-shot builds instead allocate an owner lazily
+/// when a retained bind snapshot first selects them.
 #[derive(Clone)]
 pub(super) struct Recipe(Arc<RecipeInner>);
 
@@ -4169,6 +4197,74 @@ mod used_tests {
     }
 
     #[test]
+    fn completed_one_shot_resolution_owns_one_exact_generation_after_address_reuse() {
+        let original = 0x7E57_D016usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        submit_lazy(original, false, Box::new(move || raw), 0);
+        assert_eq!(resolve_wait(original), raw);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 1, "completion or ordinary resolution eagerly created an exact owner");
+        let pending = entry(original).unwrap();
+
+        let resolution = begin_pipeline_resolution(original).expect("completed one-shot pipeline");
+        assert_eq!(native.refs.load(Ordering::Relaxed), 2, "first exact selection owns one COM reference");
+        let PipelineChoice::Available { raw: first_raw, generation: first } = resolution.resolve_for_emission()
+            else { panic!("completed one-shot was unavailable") };
+        let PipelineChoice::Available { raw: second_raw, generation: second } = resolution.resolve_for_emission()
+            else { panic!("repeated one-shot selection was unavailable") };
+        assert_eq!((first_raw, second_raw), (raw, raw));
+        assert!(first.same(&second), "repeated selection allocated another generation identity");
+        assert_eq!(native.refs.load(Ordering::Relaxed), 2, "repeated selection changed the steady COM refcount");
+
+        let raw_owner = released(original);
+        assert_eq!(raw_owner, raw);
+        assert!(pending.build.one_shot_generation.lock().unwrap().is_none(), "last title owner kept the build cache");
+        submit_lazy(original, false, Box::new(|| panic!("replacement address was resolved")), 0);
+        let PipelineChoice::Available { raw: retained_raw, generation: retained } = resolution.resolve_for_emission()
+            else { panic!("retained one-shot generation was lost") };
+        assert_eq!(retained_raw, raw);
+        assert!(first.same(&retained));
+
+        assert_eq!(released(original), 0);
+        release(raw_owner);
+        drop(retained); drop(second); drop(first); drop(resolution); drop(pending);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn coalesced_one_shot_owners_share_one_generation_until_final_release() {
+        let first_address = 0x7E57_D017usize;
+        let second_address = 0x7E57_D018usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let build = Arc::new(Build::new(Box::new(move || raw), false));
+        build.owners.store(2, Ordering::Release);
+        PENDING.insert(first_address, structured_pending(build.clone(), false));
+        PENDING.insert(second_address, structured_pending(build.clone(), false));
+        assert_eq!(resolve_wait(first_address), raw);
+
+        let first_resolution = begin_pipeline_resolution(first_address).unwrap();
+        let second_resolution = begin_pipeline_resolution(second_address).unwrap();
+        let PipelineChoice::Available { generation: first, .. } = first_resolution.resolve_for_emission()
+            else { panic!("first coalesced owner was unavailable") };
+        let PipelineChoice::Available { generation: second, .. } = second_resolution.resolve_for_emission()
+            else { panic!("second coalesced owner was unavailable") };
+        assert!(first.same(&second));
+        assert_eq!(native.refs.load(Ordering::Relaxed), 2, "coalesced bind allocated another COM owner");
+
+        assert_eq!(released(first_address), 0);
+        assert!(build.one_shot_generation.lock().unwrap().is_some(), "non-final owner cleared the cache");
+        let raw_owner = released(second_address);
+        assert_eq!(raw_owner, raw);
+        assert!(build.one_shot_generation.lock().unwrap().is_none(), "final owner retained the cache");
+        release(raw_owner);
+        drop(second); drop(first); drop(second_resolution); drop(first_resolution); drop(build);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn emission_ready_choice_keeps_the_bind_generation_after_rebuild() {
         let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
         let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
@@ -4199,7 +4295,7 @@ mod used_tests {
     }
 
     #[test]
-    fn released_one_shot_initial_is_unavailable_during_concurrent_consumption() {
+    fn released_one_shot_initial_never_exposes_an_unowned_raw() {
         let original = 0x7E57_D015usize;
         let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
         let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
@@ -4219,9 +4315,17 @@ mod used_tests {
                 released_raw
             });
             together.wait();
-            assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Legacy));
+            match resolution.resolve_for_emission() {
+                PipelineChoice::Available { raw: selected, generation } => {
+                    assert_eq!(selected, raw);
+                    assert!(native.refs.load(Ordering::Relaxed) > 0, "available choice lost its COM owner");
+                    drop(generation);
+                }
+                PipelineChoice::Unavailable => {}
+            }
             assert_eq!(releaser.join().unwrap(), raw);
         });
+        drop(resolution);
         assert_eq!(native.refs.load(Ordering::Relaxed), 0, "an unowned one-shot raw escaped");
     }
 
@@ -5634,7 +5738,9 @@ mod used_tests {
     #[test]
     fn capture_preserves_lazy_for_bind_wait_and_identity_choices() {
         let standin = 0x7E57_C130usize;
-        let real = 0x7E57_C131usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let real = &mut native as *mut RebuildFakePso as usize;
         let (go_tx, go_rx) = mpsc::channel();
         let (started_tx, started_rx) = mpsc::channel();
         submit_lazy(standin, true, Box::new(move || {
@@ -5657,14 +5763,24 @@ mod used_tests {
             go_tx.send(()).unwrap();
         });
         assert_eq!(result_rx.recv().unwrap(), real);
-        assert_eq!(resolve_and_pin_mode(standin, ResolveMode::Wait).0, real);
-        assert_eq!(released(standin), real);
+        let (waited, pin) = resolve_and_pin_mode(standin, ResolveMode::Wait);
+        assert_eq!(waited, real);
+        let pin = pin.expect("completed one-shot wait must own its exact generation");
+        assert_eq!(pin.raw(), real);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 2);
+        let raw_owner = released(standin);
+        assert_eq!(raw_owner, real);
+        release(raw_owner);
+        drop(pin);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn capture_never_resolves_against_a_reused_pending_address() {
         let standin = 0x7E57_C138usize;
-        let old_real = 0x7E57_C139usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let old_real = &mut native as *mut RebuildFakePso as usize;
         submit_lazy(standin, false, Box::new(move || old_real), 0);
         let old = entry(standin).unwrap();
         let job = old.build.job.lock().unwrap().take().unwrap();
@@ -5674,11 +5790,19 @@ mod used_tests {
         submit_lazy(standin, false, Box::new(|| 0x7E57_C13Ausize), 0);
         let (chosen, pin) = resolve_and_pin_pending(standin, &old, ResolveMode::Lazy);
         assert_eq!(chosen, old_real, "selection must use the retained Pending, not its reused map slot");
-        assert!(pin.is_none());
+        let pin = pin.expect("completed one-shot selection must own its exact generation");
+        assert_eq!(pin.raw(), old_real);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 2);
 
         assert_eq!(released(standin), 0);
+        PENDING.insert(standin, removed.clone());
+        let raw_owner = released(standin);
+        assert_eq!(raw_owner, old_real);
+        release(raw_owner);
+        drop(pin);
         drop(removed);
         drop(old);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -6932,10 +7056,10 @@ pub fn resolve_for_bind(pso: usize) -> usize {
     }
 }
 
-/// Resolve and strongly pin the exact recipe-backed native generation as one operation. The
+/// Resolve and strongly pin the exact native generation as one operation. The
 /// generation is chosen while holding `Build.done`, the same lock that publishes it and that
-/// `released` uses before giving up the original raw owner. Ordinary one-shot builds keep their
-/// existing resolution path and return no generation pin.
+/// `released` uses before giving up the original raw owner. Recipe-backed and one-shot builds
+/// therefore return the same generation-owned result.
 pub(super) fn resolve_and_pin_for_bind(pso: usize) -> (usize, Option<NativeGeneration>) {
     resolve_and_pin_mode(pso, ResolveMode::ForBind)
 }
@@ -7001,13 +7125,11 @@ fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator
 #[derive(Clone)]
 pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>);
 
-/// Generation-aware emission result. `Legacy` carries no raw pointer: later integration must use
-/// the existing address-based resolver only for that explicit one-shot case until generalized
-/// native pinning lands. `Unavailable` is fail-closed and must not fall back to that resolver.
+/// Generation-aware emission result. `Unavailable` is fail-closed: emission must never recover
+/// by looking up the title address again after this retained identity was selected.
 #[allow(dead_code)] // consumed by the later command-list integration stage
 pub(super) enum PipelineChoice {
     Available { raw: usize, generation: NativeGeneration },
-    Legacy,
     Unavailable,
 }
 
@@ -7040,11 +7162,8 @@ impl PipelineResolution {
             StructuredResolve::Ready { raw, pin: Some(generation), .. } => {
                 PipelineChoice::Available { raw: *raw, generation: generation.clone() }
             }
-            StructuredResolve::Initial { pending, .. } if pending.build.recipe.is_none() => {
-                PipelineChoice::Legacy
-            }
             StructuredResolve::Initial { original, pending, .. } => {
-                resolve_retained_recipe_for_emission(*original, pending)
+                resolve_retained_for_emission(*original, pending)
             }
             StructuredResolve::Ready { pin: None, .. }
             | StructuredResolve::Deferred { .. }
@@ -7187,8 +7306,11 @@ fn classify_retained<const R: usize>(original: usize, pending: &Arc<Pending>) ->
         };
     }
     let Some(recipe) = pending.build.recipe.as_ref() else {
-        return StructuredResolve::Initial {
-            original, pending: pending.clone(), fallback, bound_unbuilt: false,
+        return match pending.build.pin_one_shot(raw) {
+            Some(pin) => StructuredResolve::Ready { original, raw, pin: Some(pin) },
+            None => StructuredResolve::Initial {
+                original, pending: pending.clone(), fallback, bound_unbuilt: false,
+            },
         };
     };
     let (pin, residency) = recipe.pin_with_residency(raw);
@@ -7226,9 +7348,10 @@ fn classify_structured_on<const E: usize, const R: usize>(
             return Snapshot::Initial(fallback, true);
         }
         let Some(recipe) = pending.build.recipe.as_ref() else {
-            // A one-shot Build has no independent native pin. Leave its current resolution to
-            // the existing resolver instead of carrying an ownerless raw pointer across release.
-            return Snapshot::Initial(fallback, false);
+            return match pending.build.pin_one_shot(raw) {
+                Some(pin) => Snapshot::Ready(raw, Some(pin)),
+                None => Snapshot::Initial(fallback, false),
+            };
         };
         let (pin, residency) = recipe.pin_with_residency(raw);
         match (pin, residency) {
@@ -7310,14 +7433,21 @@ fn resolve_and_pin_pending(pso: usize, p: &Arc<Pending>, mode: ResolveMode) -> (
 }
 
 fn pin_resolved(pso: usize, p: &Pending, resolved: usize, bound_unbuilt: bool) -> (usize, Option<NativeGeneration>, bool) {
-    let Some(recipe) = p.build.recipe.as_ref() else { return (resolved, None, false) };
-    note_eviction_candidate(&p.build);
+    let recipe = p.build.recipe.as_ref();
+    if recipe.is_some() {
+        note_eviction_candidate(&p.build);
+    }
     let _done = p.build.done.lock().unwrap();
     let current = p.build.real.load(Ordering::Acquire);
     if current == resolved {
-        let (generation, residency) = recipe.pin_with_residency(resolved);
-        let unavailable = generation.is_none() && matches!(residency, Residency::Evicted | Residency::Rebuilding);
-        return (resolved, generation, unavailable);
+        return match recipe {
+            Some(recipe) => {
+                let (generation, residency) = recipe.pin_with_residency(resolved);
+                let unavailable = generation.is_none() && matches!(residency, Residency::Evicted | Residency::Rebuilding);
+                (resolved, generation, unavailable)
+            }
+            None => (resolved, p.build.pin_one_shot(resolved), false),
+        };
     }
     // Preserve a resolver's deliberate stand-in choice. If an eventual rebuild replaced a
     // native generation between resolution and this lock, select and pin the current publication.
@@ -7326,6 +7456,15 @@ fn pin_resolved(pso: usize, p: &Pending, resolved: usize, bound_unbuilt: bool) -
     if bound_unbuilt {
         return (resolved, None, false);
     }
+    let Some(recipe) = recipe else {
+        return match p.build.pin_one_shot(current) {
+            Some(generation) => (current, Some(generation), false),
+            None => {
+                let stand = p.stand(pso);
+                (stand, None, resolved != stand)
+            }
+        };
+    };
     let (generation, residency) = recipe.pin_with_residency(current);
     match generation {
         Some(generation) => (current, Some(generation), false),
@@ -7370,8 +7509,9 @@ fn resolve_wait_bound_and_pin(pso: usize) -> ((usize, bool), Option<NativeGenera
     ((resolved, choice.1 || stale_fallback), generation)
 }
 
-/// Resolve one retained recipe-backed Pending to an exactly owned generation.
-fn resolve_retained_recipe_for_emission(pso: usize, p: &Arc<Pending>) -> PipelineChoice {
+/// Resolve one retained Pending to an exactly owned generation without consulting its title
+/// address. One-shot and recipe-backed builds share the same wait policy at this boundary.
+fn resolve_retained_for_emission(pso: usize, p: &Arc<Pending>) -> PipelineChoice {
     if p.build.owners.load(Ordering::Acquire) == 0
         || p.build.orphan.load(Ordering::Acquire)
     {
@@ -7394,24 +7534,34 @@ fn resolve_retained_recipe_for_emission(pso: usize, p: &Arc<Pending>) -> Pipelin
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.remove(pso) else { return 0 };
     let mut orphaned = false;
-    {
+    let mut dropped_generation = None;
+    let released = {
         let done = p.build.done.lock().unwrap();
         let owners = p.build.owners.fetch_sub(1, Ordering::Relaxed) - 1;
         if *done {
-            return if owners == 0 { p.build.real.swap(0, Ordering::AcqRel) } else { 0 };
+            if owners == 0 {
+                dropped_generation = p.build.one_shot_generation.lock().unwrap().take();
+                p.build.real.swap(0, Ordering::AcqRel)
+            } else {
+                0
+            }
+        } else {
+            if owners == 0 {
+                // the worker stores its result into a Build nobody will read: mark it orphaned
+                p.build.orphan.store(true, Ordering::Release);
+                p.build.finish_queued();
+                orphaned = true;
+            }
+            0
         }
-        if owners == 0 {
-            // the worker stores its result into a Build nobody will read: mark it orphaned
-            p.build.orphan.store(true, Ordering::Release);
-            p.build.finish_queued();
-            orphaned = true;
-        }
-    }
+    };
+    // COM destruction can re-enter pipeline bookkeeping; never drop this owner under `done`.
+    drop(dropped_generation);
     if orphaned {
         forget_in_flight(&p.build);
         drop_unstarted_job(&p.build);
     }
-    0
+    released
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.
