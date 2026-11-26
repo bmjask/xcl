@@ -914,6 +914,11 @@ pub(super) fn native_generation_count_for_test(list: usize) -> usize {
     LISTS.lock().unwrap().as_ref().and_then(|lists| lists.get(&list)).map_or(0, |state| state.native_generations.len())
 }
 
+#[cfg(test)]
+pub(super) fn bound_pipeline_for_test(list: usize) -> usize {
+    LISTS.lock().unwrap().as_ref().and_then(|lists| lists.get(&list)).map_or(0, |state| state.bound_pso)
+}
+
 pub(super) fn resolve_and_record_pipeline(list: usize, pso: usize) -> usize {
     let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(pso);
     record_native_generation(list, generation);
@@ -3583,11 +3588,28 @@ fn wait_target_after_split(list: *mut c_void, placement: WaitPlacement, continua
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, pso: usize, what: Deferred) -> bool {
+    defer_with(list, what, || super::pso_async::need_by_submit(pso))
+}
+
+/// Defer a direct dispatch against the bind's retained pipeline identity. Address reuse after
+/// SetPipelineState cannot redirect either the demand or the later exact emission.
+pub(super) unsafe fn defer_retained(
+    list: *mut c_void,
+    resolution: &super::pso_async::PipelineResolution,
+    what: Deferred,
+) -> bool {
+    if !resolution.initial_build_pending() {
+        return false;
+    }
+    defer_with(list, what, || resolution.need_initial_by_submit())
+}
+
+unsafe fn defer_with(list: *mut c_void, what: Deferred, demand: impl FnOnce()) -> bool {
     // A bounded bind records now and waits for the same bound. Deferring it only adds a segment;
     // thousands of these exhausted command-list memory in a retail title with a 1 ms budget.
     if !defer_pipeline_wait(
         super::pso_async::waits_bounded(),
-        || super::pso_async::need_by_submit(pso),
+        demand,
         || split_recording(list, SegmentReason::DeferredDispatch(what)).is_some(),
     ) {
         return false;
