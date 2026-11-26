@@ -52,9 +52,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::thread::sleep(std::time::Duration::from_secs(10));
         crate::hle::d3d12x::real::log_dispatch_chain_counts();
     });
-    // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
-    if crate::hle::d3d12x::memory_report::enabled() {
-        let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
+    // Activity diagnostics and pressure policy share one bounded two-second sampler. Pressure-only
+    // mode queries only adapter-local usage; it does not enable the activity hot-path probes.
+    let activity = crate::hle::d3d12x::memory_report::enabled();
+    let pressure = crate::hle::d3d12x::pso_async::pressure_sampling_enabled();
+    if activity || pressure {
+        let name = if activity { "xcl-activity" } else { "xcl-pso-pressure" };
+        let sampler = std::thread::Builder::new().name(name.into()).spawn(move || {
             let snap = || {
                 let (p, e) = crate::hle::d3d12x::present::activity();
                 let (d, x) = crate::hle::d3d12x::bind::activity();
@@ -62,28 +66,36 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (r, b, fail) = crate::hle::dstorage::counters();
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
-            let mut last = snap();
-            let mut last_looks = crate::hle::d3d12x::sparse::look_counters();
+            let mut last = activity.then(snap);
+            let mut last_looks = activity.then(crate::hle::d3d12x::sparse::look_counters);
             let mut pressure_turn = 0u64;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                let owner = activity.then(crate::hle::d3d12x::memory_report::snapshot);
+                if pressure {
+                    pressure_turn = pressure_turn.wrapping_add(1);
+                    let local = owner.as_ref().map_or_else(
+                        crate::hle::d3d12x::memory_report::local_segment,
+                        |owner| owner.local,
+                    );
+                    if let Some(line) = crate::hle::d3d12x::pso_async::observe_pressure_turn(pressure_turn, local) {
+                        crate::xlog_info!("{line}");
+                    }
+                }
+                if !activity { continue }
                 let now = snap();
-                let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
+                let d: Vec<u64> = now.iter().zip(last.take().unwrap()).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
                 let looks = crate::hle::d3d12x::sparse::look_counters();
                 crate::xlog_info!("{}", crate::hle::d3d12x::sparse::look_line(
-                    crate::hle::d3d12x::sparse::look_delta(looks, last_looks), 2,
+                    crate::hle::d3d12x::sparse::look_delta(looks, last_looks.unwrap()), 2,
                 ));
-                last_looks = looks;
+                last_looks = Some(looks);
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
-                let owner = crate::hle::d3d12x::memory_report::snapshot();
-                pressure_turn = pressure_turn.wrapping_add(1);
-                if let Some(line) = crate::hle::d3d12x::pso_async::observe_pressure_turn(pressure_turn, owner.local) {
-                    crate::xlog_info!("{line}");
-                }
+                let owner = owner.unwrap();
                 let private = owner.commit.unwrap_or(0);
                 let local = owner.local.map_or(0, |s| s.usage);
                 let non_local = owner.non_local.map_or(0, |s| s.usage);
@@ -126,9 +138,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         pct
                     );
                 }
-                last = now;
+                last = Some(now);
             }
         });
+        if let Err(e) = sampler {
+            crate::xlog_warn!("D3D12.X: could not start the activity/pressure sampler: {e}");
+        }
     }
     // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title), and
     // which title fences and XCL queue waits are behind then
