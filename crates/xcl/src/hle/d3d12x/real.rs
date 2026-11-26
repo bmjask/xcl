@@ -3389,19 +3389,26 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot!(this, "Reset")));
-    let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(initial_state as usize);
-    let resolved = resolved as *mut c_void;
-    let hr = f(this, allocator, resolved);
+    let prepared = super::bind::PreparedNativePipeline::new(initial_state as usize);
+    let resolved = prepared.raw();
+    let hr = f(this, allocator, resolved as *mut c_void);
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
-        super::list_x::record_native_generation(this as usize, generation);
+        prepared.record_generation(this as usize);
         super::dred::reset(this);
-        if !initial_state.is_null() {
-            super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
+        if !initial_state.is_null() && resolved != 0 {
+            super::dred::mark_pipeline(this, initial_state as usize, resolved);
         }
     }
     hr
+}
+
+#[cfg(test)]
+pub(super) unsafe fn reset_for_test(
+    list: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void,
+) -> HRESULT {
+    cl_reset(list, allocator, initial_state)
 }
 
 /// The PC size of a CheckFeatureSupport structure.

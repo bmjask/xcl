@@ -104,14 +104,15 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
-        let (resolved_pso, generation) = super::pso_async::resolve_and_pin_if_enabled(pso);
+        let prepared = super::bind::PreparedNativePipeline::new(pso);
+        let resolved_pso = prepared.raw();
         let pc_alloc = active_list_allocator(alloc);
         let hr = real::dev_create_command_list(this, node, ty, pc_alloc, resolved_pso, riid, ppv);
         if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
             super::list_x::on_create_with_backing(*ppv, alloc, pc_alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
-            super::list_x::record_native_generation(*ppv as usize, generation);
+            prepared.commit(*ppv, alloc);
             super::dred::reset(*ppv);
-            if pso != 0 {
+            if pso != 0 && resolved_pso != 0 {
                 super::dred::mark_pipeline(*ppv, pso, resolved_pso);
             }
         }
@@ -126,7 +127,6 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     // the title's inline D3D12.X code writes into the list object: it gets one of the
     // console's shape (`title_list`)
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::console_list::enabled() {
-        super::bind::reset(*ppv, alloc, pso);
         *ppv = super::title_list::wrap(*ppv);
     }
     hr

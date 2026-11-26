@@ -282,6 +282,15 @@ fn native_backing(list: *mut c_void, allocator: usize) -> usize {
 /// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let resolution = super::pso_async::begin_pipeline_resolution(initial_pso);
+    install_reset(list, allocator, initial_pso, resolution);
+}
+
+fn install_reset(
+    list: *mut c_void,
+    allocator: usize,
+    initial_pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
+) {
     let backing = native_backing(list, allocator);
     let (old, blocks, old_resolution) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
@@ -297,6 +306,54 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     });
     console_list::hold_until_reset(old, blocks);
     drop(old_resolution);
+}
+
+pub(super) struct PreparedNativePipeline {
+    original: usize,
+    raw: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
+    generation: Option<super::pso_async::NativeGeneration>,
+    poison_on_commit: bool,
+}
+
+impl PreparedNativePipeline {
+    pub(super) fn new(original: usize) -> Self {
+        Self::from_resolution(original, super::pso_async::begin_pipeline_resolution(original))
+    }
+
+    fn from_resolution(
+        original: usize,
+        resolution: Option<super::pso_async::PipelineResolution>,
+    ) -> Self {
+        use super::pso_async::{NativePipelineBindMode, NativePipelineChoice};
+        let choice = resolution.as_ref().map(|r| r.select_for_native_bind(NativePipelineBindMode::ForBind));
+        let (raw, generation, poison_on_commit) = match choice {
+            Some(NativePipelineChoice::Exact { raw, generation }) => (raw, Some(generation), false),
+            Some(NativePipelineChoice::InitialFallback { raw, .. }) => (raw, None, false),
+            Some(NativePipelineChoice::Unavailable) => {
+                (0, None, !resolution.as_ref().unwrap().unavailable_is_emission_guarded())
+            }
+            None => (original, None, false),
+        };
+        Self { original, raw, resolution, generation, poison_on_commit }
+    }
+
+    pub(super) fn raw(&self) -> usize { self.raw }
+
+    pub(super) fn record_generation(self, list: usize) {
+        super::list_x::record_native_generation(list, self.generation);
+        if self.poison_on_commit {
+            super::list_x::poison_recording(list);
+        }
+    }
+
+    pub(super) fn commit(self, list: *mut c_void, allocator: usize) {
+        super::list_x::record_native_generation(list as usize, self.generation);
+        install_reset(list, allocator, self.original, self.resolution);
+        if self.poison_on_commit {
+            super::list_x::poison_recording(list as usize);
+        }
+    }
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -1352,7 +1409,7 @@ unsafe fn set_pipeline_state_retained(
     let (raw, generation) = match choice {
         Some(NativePipelineChoice::Exact { raw, generation }) => (Some(raw), Some(generation)),
         Some(NativePipelineChoice::InitialFallback { raw, .. }) => (Some(raw), None),
-        Some(NativePipelineChoice::Unavailable) if resolution.as_ref().unwrap().can_omit_unavailable_set() => {
+        Some(NativePipelineChoice::Unavailable) if resolution.as_ref().unwrap().unavailable_is_emission_guarded() => {
             (None, None)
         }
         Some(NativePipelineChoice::Unavailable) => {
@@ -2992,6 +3049,8 @@ void main(uint t : SV_GroupIndex) {
     static FAKE_CLEAR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FAKE_CLOSE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FAKE_CLOSED: AtomicBool = AtomicBool::new(false);
+    static FAKE_RESET_FAIL: AtomicBool = AtomicBool::new(false);
+    static FAKE_LAST_RESET_PSO: AtomicUsize = AtomicUsize::new(0);
     static FAKE_LAST_CLEAR_PSO: AtomicUsize = AtomicUsize::new(usize::MAX);
     static FAKE_PIN_COUNT_AT_SET: AtomicUsize = AtomicUsize::new(0);
     unsafe extern "system" fn fake_add_ref(this: *mut c_void) -> u32 {
@@ -3022,8 +3081,11 @@ void main(uint t : SV_GroupIndex) {
         FAKE_CLOSED.store(true, Ordering::Release);
         windows::core::HRESULT(0)
     }
-    unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
-        if FAKE_CLOSED.swap(false, Ordering::AcqRel) { 0 } else { crate::util::E_FAIL }
+    unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, pso: usize) -> i32 {
+        FAKE_LAST_RESET_PSO.store(pso, Ordering::Release);
+        if FAKE_RESET_FAIL.load(Ordering::Acquire) || !FAKE_CLOSED.swap(false, Ordering::AcqRel) {
+            crate::util::E_FAIL
+        } else { 0 }
     }
     unsafe extern "system" fn fake_set_compute_rs(this: *mut c_void, _rs: *mut c_void) {
         (*(this as *const FakeAdoptedList)).set_compute_rs_calls.fetch_add(1, Ordering::Relaxed);
@@ -3160,6 +3222,99 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(pso_async::released(old_raw), 0);
         assert_eq!(unsafe { resolution_release(old_owner as *mut c_void) }, 0);
         assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+    }
+
+    #[test]
+    fn prepared_initial_pipeline_commits_only_after_create_or_reset_success() {
+        let _stop_abi = STOP_ABI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize; orig_vt[2] = fake_release as usize;
+        orig_vt[10] = fake_reset as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize; ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0), set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let _class = real::test_command_list_class(
+            orig_vt.as_ptr() as usize,
+            unsafe { ext_vt.as_ptr().add(1) } as usize,
+        );
+        unsafe { list_x::on_create(list, 0, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        let fallback = PreparedNativePipeline::from_resolution(
+            0x7100_4900, Some(pso_async::pipeline_resolution_for_test(0x7100_4900, || {})),
+        );
+        assert_eq!(fallback.raw(), 0x7100_4900); drop(fallback);
+        let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut exact = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let (exact_raw, replacement_raw) = (&mut exact as *mut ResolutionPso as usize, &mut replacement as *mut ResolutionPso as usize);
+        let original = 0x7100_4901usize;
+        pso_async::submit_lazy(original, false, Box::new(move || exact_raw), 0);
+        assert_eq!(pso_async::resolve_wait(original), exact_raw);
+        let failed_create = PreparedNativePipeline::from_resolution(
+            original, pso_async::begin_pipeline_resolution(original),
+        );
+        assert_eq!(failed_create.raw(), exact_raw); drop(failed_create);
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 0);
+        let retained = pso_async::begin_pipeline_resolution(original).unwrap();
+        let identity = retained.identity_for_test();
+        let prepared = PreparedNativePipeline::from_resolution(original, Some(retained));
+        assert_eq!(prepared.raw(), exact_raw);
+        let exact_owner = pso_async::released(original);
+        let replacement_calls = Arc::new(AtomicUsize::new(0)); let calls = replacement_calls.clone();
+        pso_async::submit_lazy(original, false, Box::new(move || { calls.fetch_add(1, Ordering::Relaxed); replacement_raw }), 0);
+        prepared.commit(list, 0);
+        assert_eq!(with(list, |s| s.resolution.as_ref().unwrap().identity_for_test()), identity);
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 1);
+        assert_eq!(replacement_calls.load(Ordering::Relaxed), 0);
+
+        let unavailable = pso_async::pipeline_resolution_for_compute_test(0x7100_4902, || {}).unavailable_for_test();
+        let prepared = PreparedNativePipeline::from_resolution(0x7100_4902, Some(unavailable));
+        assert_eq!(prepared.raw(), 0); prepared.commit(list, 0);
+        assert!(!list_x::recording_poisoned(list as usize));
+        let unavailable = pso_async::pipeline_resolution_for_test(0x7100_4903, || {}).unavailable_for_test();
+        PreparedNativePipeline::from_resolution(0x7100_4903, Some(unavailable)).commit(list, 0);
+        assert!(list_x::recording_poisoned(list as usize));
+        let old_identity = with(list, |s| s.resolution.as_ref().unwrap().identity_for_test());
+        drop(PreparedNativePipeline::from_resolution(
+            0x7100_4904, Some(pso_async::pipeline_resolution_for_test(0x7100_4904, || {})),
+        ));
+        assert_eq!(with(list, |s| s.resolution.as_ref().unwrap().identity_for_test()), old_identity);
+        assert!(list_x::recording_poisoned(list as usize));
+
+        let mut reset_exact = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let reset_raw = &mut reset_exact as *mut ResolutionPso as usize;
+        let reset_original = 0x7100_4906usize;
+        pso_async::submit_lazy(reset_original, false, Box::new(move || reset_raw), 0);
+        assert_eq!(pso_async::resolve_wait(reset_original), reset_raw);
+        FAKE_CLOSED.store(true, Ordering::Release); FAKE_RESET_FAIL.store(true, Ordering::Release);
+        assert!(unsafe { real::reset_for_test(list, std::ptr::null_mut(), reset_original as *mut c_void) } < 0);
+        assert_eq!(FAKE_LAST_RESET_PSO.load(Ordering::Acquire), reset_raw);
+        assert!(list_x::recording_poisoned(list as usize));
+        assert_eq!(with(list, |s| s.resolution.as_ref().unwrap().identity_for_test()), old_identity);
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 1);
+        FAKE_RESET_FAIL.store(false, Ordering::Release);
+        FAKE_CLOSED.store(true, Ordering::Release);
+        assert_eq!(unsafe { real::reset_for_test(list, std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
+        assert_eq!(FAKE_LAST_RESET_PSO.load(Ordering::Acquire), 0);
+        assert!(!list_x::recording_poisoned(list as usize));
+
+        FAKE_CLOSED.store(true, Ordering::Release);
+        assert_eq!(unsafe { list_x::reset_pc(list, 0, reset_original) }, 0);
+        assert_eq!(FAKE_LAST_RESET_PSO.load(Ordering::Acquire), reset_raw);
+        assert_eq!(tracked_pso(list), reset_original);
+        assert_eq!(list_x::native_generation_count_for_test(list as usize), 1);
+        let reset_owner = pso_async::released(reset_original);
+
+        forget(list); list_x::clear_segment_state(list as usize); list_x::on_release(list as usize);
+        assert_eq!(pso_async::released(original), 0);
+        assert_eq!(unsafe { resolution_release(exact_owner as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(replacement_raw as *mut c_void) }, 0);
+        assert_eq!(unsafe { resolution_release(reset_owner as *mut c_void) }, 0);
     }
 
     /// `DispatchX` with thread dimensions (flag 0x20, as the BVH builder's rehydration passes
