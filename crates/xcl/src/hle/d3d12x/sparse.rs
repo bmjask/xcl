@@ -3711,7 +3711,7 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-const LOOK_FIELDS: usize = 35;
+const LOOK_FIELDS: usize = 37;
 const ACTIVE_US: usize = 0;
 const REFRESH_WAIT_US: usize = 1;
 const WATCH_US: usize = 2;
@@ -3743,10 +3743,12 @@ const VRAM_UNMAP_POLL_US: usize = 27;
 const VRAM_STATE_US: usize = 28;
 const VRAM_QUEUE_WAIT_US: usize = 29;
 const VRAM_RETIREMENT_US: usize = 30;
-const VRAM_CALLS: usize = 31;
-const VRAM_MAPPING_WAITS: usize = 32;
-const VRAM_RECLAIM_PASSES: usize = 33;
-const VRAM_RETIREMENT_PASSES: usize = 34;
+const VRAM_DEVICE_CACHE_HITS: usize = 31;
+const VRAM_DEVICE_QUERIES: usize = 32;
+const VRAM_CALLS: usize = 33;
+const VRAM_MAPPING_WAITS: usize = 34;
+const VRAM_RECLAIM_PASSES: usize = 35;
+const VRAM_RETIREMENT_PASSES: usize = 36;
 
 /// One complete `XCL_ACTIVITY` look. It is built without shared updates, then published once so
 /// the reporting thread cannot split one look across adjacent intervals.
@@ -3823,6 +3825,8 @@ fn note_vram_before_execute(sample: &mut LookSample, timing: super::vram::Before
     sample.add_time(VRAM_STATE_US, timing.state);
     sample.add_time(VRAM_QUEUE_WAIT_US, timing.queue_wait);
     sample.add_time(VRAM_RETIREMENT_US, timing.retirement);
+    sample.add(VRAM_DEVICE_CACHE_HITS, timing.device_cache_hits as u64);
+    sample.add(VRAM_DEVICE_QUERIES, timing.device_queries as u64);
     sample.add(VRAM_CALLS, timing.calls as u64);
     sample.add(VRAM_MAPPING_WAITS, timing.mapping_waits as u64);
     sample.add(VRAM_RECLAIM_PASSES, timing.reclaim_passes as u64);
@@ -3856,7 +3860,8 @@ pub fn look_line(d: [u64; LOOK_FIELDS], secs: u64) -> String {
         readback_gate_hold, readback_gate_released, texture_select_wait, texture_select_hold,
         textures_visited, texture_dirty_tests, texture_matches, textures_retained,
         vram_gate_wait, vram_device, vram_unmap_poll, vram_state, vram_queue_wait, vram_retirement,
-        vram_calls, vram_mapping_waits, vram_reclaim_passes, vram_retirement_passes,
+        vram_device_cache_hits, vram_device_queries, vram_calls, vram_mapping_waits,
+        vram_reclaim_passes, vram_retirement_passes,
     ] = d;
     let ms = |us: u64| us / 1000;
     let sparse = queue_wait.saturating_add(maintenance).saturating_add(scan).saturating_add(upload).saturating_add(upload_wait);
@@ -3868,7 +3873,7 @@ pub fn look_line(d: [u64; LOOK_FIELDS], secs: u64) -> String {
         .saturating_add(vram_queue_wait)
         .saturating_add(vram_retirement);
     format!(
-        "looks before submits ({secs} s): {looks} looks did {} ms active work ({:.1} % of the time) after {} ms waiting for the refresh turn: write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); texture select wait/hold {}/{} ms ({textures_visited} visited, {texture_dirty_tests} dirty-tested, {texture_matches} matched, {textures_retained} retained); sparse queue wait/fence+state/scan/upload/ownership wait {}/{}/{}/{}/{} ms ({runs} runs, {:.1} MB zero/dirty bytes); VRAM gate/device/unmap poll/state/queue wait/retire {}/{}/{}/{}/{}/{} ms ({vram_calls} calls, {vram_mapping_waits} mapping waits, {vram_reclaim_passes} reclaim passes, {vram_retirement_passes} retirement passes); upload gate submit wait/hold {}/{} ms, readback wait/hold/released wait+reacquire {}/{}/{} ms; other active work {} ms",
+        "looks before submits ({secs} s): {looks} looks did {} ms active work ({:.1} % of the time) after {} ms waiting for the refresh turn: write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); texture select wait/hold {}/{} ms ({textures_visited} visited, {texture_dirty_tests} dirty-tested, {texture_matches} matched, {textures_retained} retained); sparse queue wait/fence+state/scan/upload/ownership wait {}/{}/{}/{}/{} ms ({runs} runs, {:.1} MB zero/dirty bytes); VRAM gate/device/unmap poll/state/queue wait/retire {}/{}/{}/{}/{}/{} ms ({vram_calls} calls, {vram_device_cache_hits} device-cache hits, {vram_device_queries} GetDevice queries, {vram_mapping_waits} mapping waits, {vram_reclaim_passes} reclaim passes, {vram_retirement_passes} retirement passes); upload gate submit wait/hold {}/{} ms, readback wait/hold/released wait+reacquire {}/{}/{} ms; other active work {} ms",
         ms(active),
         active as f64 / (secs.max(1) * 10_000) as f64,
         ms(refresh_wait),
@@ -4396,6 +4401,8 @@ mod tests {
             4_000,
             5_000,
             6_000,
+            237,
+            3,
             240,
             8,
             2,
@@ -4405,7 +4412,7 @@ mod tests {
         assert!(line.contains("write-watch 610 ms (1641.0 MB in 69.0 ranges/look, 4800 pages written)"), "{line}");
         assert!(line.contains("texture select wait/hold 7/13 ms (24000 visited, 8000 dirty-tested, 1200 matched, 1190 retained)"), "{line}");
         assert!(line.contains("sparse queue wait/fence+state/scan/upload/ownership wait 10/30/40/40/20 ms (90 runs, 96.0 MB zero/dirty bytes)"), "{line}");
-        assert!(line.contains("VRAM gate/device/unmap poll/state/queue wait/retire 1/2/3/4/5/6 ms (240 calls, 8 mapping waits, 2 reclaim passes, 1 retirement passes)"), "{line}");
+        assert!(line.contains("VRAM gate/device/unmap poll/state/queue wait/retire 1/2/3/4/5/6 ms (240 calls, 237 device-cache hits, 3 GetDevice queries, 8 mapping waits, 2 reclaim passes, 1 retirement passes)"), "{line}");
         assert!(line.contains("upload gate submit wait/hold 5/105 ms, readback wait/hold/released wait+reacquire 3/70/12 ms; other active work 39 ms"), "{line}");
         let idle = look_line([0; LOOK_FIELDS], 2);
         assert!(idle.contains("0 looks did 0 ms active work (0.0 % of the time) after 0 ms waiting"), "{idle}");
@@ -4442,12 +4449,16 @@ mod tests {
             state: std::time::Duration::from_micros(4),
             queue_wait: std::time::Duration::from_micros(5),
             retirement: std::time::Duration::from_micros(6),
-            calls: 7,
-            mapping_waits: 8,
-            reclaim_passes: 9,
-            retirement_passes: 10,
+            device_cache_hits: 7,
+            device_queries: 8,
+            calls: 9,
+            mapping_waits: 10,
+            reclaim_passes: 11,
+            retirement_passes: 12,
         });
-        assert_eq!(sample.0[VRAM_GATE_WAIT_US..=VRAM_RETIREMENT_PASSES], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(sample.0[VRAM_GATE_WAIT_US..=VRAM_RETIREMENT_PASSES], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let line = look_line(sample.0, 2);
+        assert!(line.contains("9 calls, 7 device-cache hits, 8 GetDevice queries"), "{line}");
     }
 
     #[test]
