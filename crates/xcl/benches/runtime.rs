@@ -333,7 +333,7 @@ fn bind_state_benches(c: &mut Criterion) {
     let pool = BindWorkers::new(fixture.clone(), workers);
     // This is one retained-pipeline snapshot, not a whole draw or dispatch; those take STATES
     // several more times while preparing their root arguments and ABI memory.
-    let mut group = c.benchmark_group("runtime/emission_bookkeeping/bind_pipeline_snapshot");
+    let mut group = c.benchmark_group("runtime/emission_bookkeeping/warm_bind_pipeline_snapshot");
     group.throughput(Throughput::Elements((workers * EMISSION_BATCH) as u64));
     group.bench_function(&format!("distinct_lists_serial_{workers}"), |b| {
         b.iter(|| black_box(&fixture).snapshot_workers_serial(workers, EMISSION_BATCH));
