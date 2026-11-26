@@ -843,6 +843,25 @@ fn watched_texture_span(src: usize, bytes: u64) -> Option<(usize, usize)> {
     Some((src & !0xFFF, end))
 }
 
+#[inline(always)]
+fn texture_needs_upload(
+    cpu_backed: bool,
+    pending: bool,
+    gpu_written: bool,
+    dirty_overlap: impl FnOnce() -> bool,
+) -> bool {
+    if !cpu_backed {
+        return false;
+    }
+    if pending {
+        return true;
+    }
+    if gpu_written {
+        return false;
+    }
+    dirty_overlap()
+}
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma, measure: bool) -> Arc<WatchRanges> {
     let key = (
         super::sparse::mapped_gen(),
@@ -1083,20 +1102,18 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
             if measure_selection {
                 visited += 1;
             }
-            if !e.cpu_backed {
-                continue;
+            if measure_selection && e.cpu_backed && !e.pending && !e.gpu_written {
+                dirty_tests += 1;
             }
-            let selected = if e.pending {
-                true
-            } else if e.gpu_written {
-                false
-            } else {
-                if measure_selection {
-                    dirty_tests += 1;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            };
+            let selected = texture_needs_upload(
+                e.cpu_backed,
+                e.pending,
+                e.gpu_written,
+                || {
+                    let i = dirty.partition_point(|&p| p + page as usize <= e.src);
+                    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                },
+            );
             if !selected {
                 continue;
             }
@@ -1128,6 +1145,102 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
     seed_stream_recheck(&todo, &ranges.ranges, recheck_frame);
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
     super::sparse::PreparationOutcome::Ready
+}
+
+#[cfg(feature = "texture-selection-bench")]
+#[derive(Clone, Copy)]
+pub enum TextureSelectionScenario {
+    Empty,
+    SparsePending,
+    AllPending,
+    AllGpuWritten,
+    OneDirty,
+    SparseDirty,
+    DenseDirty,
+    MixedAliases,
+}
+
+#[cfg(feature = "texture-selection-bench")]
+struct TextureSelectionBenchEntry {
+    src: usize,
+    size: usize,
+    cpu_backed: bool,
+    pending: bool,
+    gpu_written: bool,
+}
+
+/// CPU-only model of the exact selection predicate and table lock. It deliberately excludes COM
+/// retention and uploads: the benchmark separates scan/convoy cost from those Windows operations.
+#[cfg(feature = "texture-selection-bench")]
+pub struct TextureSelectionBench {
+    entries: Mutex<BTreeMap<usize, TextureSelectionBenchEntry>>,
+    dirty: Vec<usize>,
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "texture-selection-bench")]
+impl TextureSelectionBench {
+    const PAGE: usize = 0x1000;
+
+    pub fn new(count: usize, scenario: TextureSelectionScenario) -> Self {
+        let base = 0x1000_0000usize;
+        let mut entries = BTreeMap::new();
+        let mut pending = 0;
+        for i in 0..count {
+            let aliased = matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 16 == 1;
+            let alias_group = i - aliased as usize;
+            let src = base + alias_group * 2 * Self::PAGE;
+            let cpu_backed = !matches!(scenario, TextureSelectionScenario::MixedAliases) || i % 8 != 4;
+            let is_pending = matches!(scenario, TextureSelectionScenario::AllPending)
+                || matches!(scenario, TextureSelectionScenario::SparsePending) && i % 64 == 0
+                || matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 127 == 0;
+            let gpu_written = matches!(scenario, TextureSelectionScenario::AllGpuWritten)
+                || matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 11 == 0;
+            pending += is_pending as usize;
+            entries.insert(i + 1, TextureSelectionBenchEntry {
+                src,
+                size: Self::PAGE + (alias_group % 3) * Self::PAGE,
+                cpu_backed,
+                pending: is_pending,
+                gpu_written,
+            });
+        }
+        let pages = match scenario {
+            TextureSelectionScenario::Empty | TextureSelectionScenario::SparsePending | TextureSelectionScenario::AllPending => 0,
+            TextureSelectionScenario::OneDirty => 1,
+            TextureSelectionScenario::AllGpuWritten | TextureSelectionScenario::SparseDirty | TextureSelectionScenario::MixedAliases => 64,
+            TextureSelectionScenario::DenseDirty => 4096,
+        };
+        let stride = if matches!(scenario, TextureSelectionScenario::DenseDirty) { 1 } else { 31 };
+        let mut dirty: Vec<_> = (0..pages).map(|i| base + i * stride * Self::PAGE).collect();
+        dirty.sort_unstable();
+        Self { entries: Mutex::new(entries), dirty, pending: std::sync::atomic::AtomicUsize::new(pending) }
+    }
+
+    #[inline(never)]
+    pub fn scan(&self) -> (usize, usize) {
+        if self.dirty.is_empty() && self.pending.load(Ordering::Relaxed) == 0 {
+            return (0, 0);
+        }
+        let entries = self.entries.lock().unwrap();
+        let mut matches = 0usize;
+        let mut checksum = 0usize;
+        for (&resource, entry) in entries.iter() {
+            if texture_needs_upload(
+                entry.cpu_backed,
+                entry.pending,
+                entry.gpu_written,
+                || {
+                    let i = self.dirty.partition_point(|&p| p + Self::PAGE <= entry.src);
+                    self.dirty.get(i).is_some_and(|&p| p < entry.src + entry.size)
+                },
+            ) {
+                matches += 1;
+                checksum ^= resource;
+            }
+        }
+        (matches, checksum)
+    }
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -3737,6 +3850,73 @@ mod tests {
         assert_eq!(watched_texture_span(0x1234, 0), None);
         assert_eq!(watched_texture_span(usize::MAX - 0xFFF, 0x1000), None);
         assert_eq!(watched_texture_span(usize::MAX - 0x800, 1), None);
+    }
+
+    #[test]
+    fn texture_upload_selection_preserves_flag_and_page_boundaries() {
+        const PAGE: usize = 0x1000;
+        let dirty = [0x1000usize, 0x4000];
+        for cpu_backed in [false, true] {
+            for pending in [false, true] {
+                for gpu_written in [false, true] {
+                    let selected = texture_needs_upload(cpu_backed, pending, gpu_written, || {
+                        let i = dirty.partition_point(|&p| p + PAGE <= 0x1800);
+                        dirty.get(i).is_some_and(|&p| p < 0x1800 + PAGE)
+                    });
+                    assert_eq!(selected, cpu_backed && (pending || !gpu_written), "cpu {cpu_backed}, pending {pending}, GPU-written {gpu_written}");
+                }
+            }
+        }
+        let overlap = |src: usize, dirty: &[usize]| {
+            let i = dirty.partition_point(|&p| p + PAGE <= src);
+            dirty.get(i).is_some_and(|&p| p < src + PAGE)
+        };
+        assert!(!texture_needs_upload(true, false, false, || overlap(0x2000, &[0x1000])), "page end equals texture start");
+        assert!(!texture_needs_upload(true, false, false, || overlap(0x1000, &[0x2000])), "page start equals texture end");
+        assert!(texture_needs_upload(true, false, false, || overlap(0x1800, &[0x1000])), "half-open ranges overlap");
+    }
+
+    #[test]
+    fn texture_upload_selection_reads_dirty_overlap_only_when_needed() {
+        let calls = std::cell::Cell::new(0);
+        let selected = |cpu_backed, pending, gpu_written| {
+            texture_needs_upload(cpu_backed, pending, gpu_written, || {
+                calls.set(calls.get() + 1);
+                true
+            })
+        };
+        assert!(!selected(false, true, false));
+        assert!(selected(true, true, true));
+        assert!(!selected(true, false, true));
+        assert_eq!(calls.get(), 0, "an excluded or pending entry evaluated its dirty range");
+        assert!(selected(true, false, false));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[cfg(feature = "texture-selection-bench")]
+    #[test]
+    fn texture_selection_fixture_keeps_empty_gate_and_exact_aliases() {
+        assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::Empty).scan(), (0, 0));
+        assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::AllPending).scan().0, 128);
+        assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::AllGpuWritten).scan().0, 0);
+        let mixed = TextureSelectionBench::new(32, TextureSelectionScenario::MixedAliases);
+        {
+            let entries = mixed.entries.lock().unwrap();
+            assert_eq!((entries[&1].src, entries[&1].size), (entries[&2].src, entries[&2].size), "alias fixture ranges differ");
+        }
+        let entry = |src| TextureSelectionBenchEntry {
+            src,
+            size: TextureSelectionBench::PAGE,
+            cpu_backed: true,
+            pending: false,
+            gpu_written: false,
+        };
+        let aliases = TextureSelectionBench {
+            entries: Mutex::new(BTreeMap::from([(1, entry(0x1000)), (2, entry(0x1000))])),
+            dirty: vec![0x1000],
+            pending: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert_eq!(aliases.scan(), (2, 3), "exact-range aliases remain distinct candidates");
     }
 
     #[test]
