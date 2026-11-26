@@ -180,6 +180,94 @@ fn pipeline_resolution_benches(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "pipeline-resolution-bench")]
+const EMISSION_BATCH: usize = 1_024;
+
+#[cfg(feature = "pipeline-resolution-bench")]
+struct EmissionWorkers {
+    start: Arc<Barrier>,
+    done: Arc<Barrier>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl EmissionWorkers {
+    fn new(
+        fixture: Arc<xcl::hle::d3d12x::list_x::EmissionBookkeepingBench>,
+        workers: usize,
+    ) -> Self {
+        let start = Arc::new(Barrier::new(workers + 1));
+        let done = Arc::new(Barrier::new(workers + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = (0..workers)
+            .map(|worker| {
+                let fixture = fixture.clone();
+                let start = start.clone();
+                let done = done.clone();
+                let stop = stop.clone();
+                std::thread::Builder::new()
+                    .name(format!("emission-bench-{worker}"))
+                    .spawn(move || loop {
+                        start.wait();
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        for _ in 0..EMISSION_BATCH {
+                            fixture.record_worker(worker);
+                        }
+                        done.wait();
+                    })
+                    .expect("emission benchmark worker")
+            })
+            .collect();
+        Self { start, done, stop, threads }
+    }
+
+    fn run(&self) {
+        self.start.wait();
+        self.done.wait();
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl Drop for EmissionWorkers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.start.wait();
+        for thread in self.threads.drain(..) {
+            thread.join().expect("emission benchmark worker panicked");
+        }
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+fn emission_bookkeeping_benches(c: &mut Criterion) {
+    let workers = std::thread::available_parallelism().map_or(4, |count| count.get())
+        .saturating_sub(1).clamp(2, 8);
+    let fixture = Arc::new(xcl::hle::d3d12x::list_x::EmissionBookkeepingBench::new(workers));
+
+    let mut group = c.benchmark_group("runtime/emission_bookkeeping/record_existing");
+    group.throughput(Throughput::Elements(1));
+    for (slot, depth) in [1usize, 16, 64, 256].into_iter().enumerate() {
+        group.bench_with_input(BenchmarkId::from_parameter(depth), &slot, |b, &slot| {
+            b.iter(|| black_box(&fixture).record_at_depth(black_box(slot)));
+        });
+    }
+    group.finish();
+
+    let pool = EmissionWorkers::new(fixture.clone(), workers);
+    let mut group = c.benchmark_group("runtime/emission_bookkeeping/contention");
+    group.throughput(Throughput::Elements((workers * EMISSION_BATCH) as u64));
+    group.bench_function(&format!("distinct_lists_serial_{workers}"), |b| {
+        b.iter(|| black_box(&fixture).record_workers_serial(workers, EMISSION_BATCH));
+    });
+    group.bench_function(&format!("distinct_lists_parallel_{workers}"), |b| {
+        b.iter(|| pool.run());
+    });
+    group.finish();
+}
+
 fn utility_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("runtime/util");
     for (name, pattern, value) in [
@@ -335,5 +423,7 @@ fn main() {
         allocator_benches,
         #[cfg(feature = "pipeline-resolution-bench")]
         pipeline_resolution_benches,
+        #[cfg(feature = "pipeline-resolution-bench")]
+        emission_bookkeeping_benches,
     ]);
 }

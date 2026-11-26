@@ -929,6 +929,79 @@ pub(super) fn record_native_generation(list: usize, generation: Option<super::ps
     }
 }
 
+/// Opaque fixture for measuring the actual exact-generation recording path without a device.
+#[cfg(feature = "pipeline-resolution-bench")]
+#[doc(hidden)]
+pub struct EmissionBookkeepingBench {
+    generations: super::pso_async::NativeGenerationBenchSet,
+    depth_lists: [usize; 4],
+    worker_lists: Vec<usize>,
+    _keys: Vec<Box<u8>>,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl EmissionBookkeepingBench {
+    pub fn new(workers: usize) -> Self {
+        assert!(workers != 0);
+        let generations = super::pso_async::NativeGenerationBenchSet::new(256);
+        let keys = (0..4 + workers).map(|index| Box::new(index as u8)).collect::<Vec<_>>();
+        let lists = keys.iter().map(|key| (&**key as *const u8) as usize).collect::<Vec<_>>();
+        let depth_lists = [lists[0], lists[1], lists[2], lists[3]];
+        let worker_lists = lists[4..].to_vec();
+        assert!(LISTS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|states| lists.iter().all(|list| !states.contains_key(list))));
+        for (slot, depth) in [1usize, 16, 64, 256].into_iter().enumerate() {
+            for index in 0..depth {
+                record_native_generation(depth_lists[slot], Some(generations.get(index)));
+            }
+        }
+        for (worker, &list) in worker_lists.iter().enumerate() {
+            record_native_generation(list, Some(generations.get(worker)));
+        }
+        Self { generations, depth_lists, worker_lists, _keys: keys }
+    }
+
+    /// Depth one hits the last-pin shortcut. Larger depths hit the identity index with an
+    /// existing non-last generation.
+    #[inline(never)]
+    pub fn record_at_depth(&self, slot: usize) {
+        record_native_generation(self.depth_lists[slot], Some(self.generations.get(0)));
+    }
+
+    #[inline(never)]
+    pub fn record_worker(&self, worker: usize) {
+        record_native_generation(self.worker_lists[worker], Some(self.generations.get(worker)));
+    }
+
+    #[inline(never)]
+    pub fn record_workers_serial(&self, workers: usize, batch: usize) {
+        for worker in 0..workers {
+            for _ in 0..batch {
+                self.record_worker(worker);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl Drop for EmissionBookkeepingBench {
+    fn drop(&mut self) {
+        let removed = {
+            let mut lists = LISTS.lock().unwrap();
+            let Some(lists) = lists.as_mut() else { return };
+            self.depth_lists
+                .iter()
+                .chain(&self.worker_lists)
+                .filter_map(|list| lists.remove(list))
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
+    }
+}
+
 #[cfg(test)]
 pub(super) fn native_generation_count_for_test(list: usize) -> usize {
     LISTS.lock().unwrap().as_ref().and_then(|lists| lists.get(&list)).map_or(0, |state| state.native_generations.len())
