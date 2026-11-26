@@ -4758,6 +4758,72 @@ mod used_tests {
     }
 
     #[test]
+    fn abandoned_terminal_demand_is_swept_before_the_next_exact_request() {
+        let _global = pipeline_restoration_test_guard();
+        let coordinator = pipeline_restoration_coordinator();
+        reconcile_pipeline_restorations();
+
+        let abandoned_build = ledger_build();
+        let abandoned_evicted = coordinator.install_eviction(
+            &abandoned_build, ledger_native(73),
+        ).unwrap().commit();
+        assert!(coordinator.refuse_rehydrate(&abandoned_evicted));
+        let abandoned_attempt = coordinator.receipts.records(PIPELINE_RESOLUTION_RECEIPTS)
+            .into_iter().find(|record| record.token.evicted.exact(&abandoned_evicted))
+            .expect("refused exact attempt was not recorded").token;
+        let abandoned: RestorationDemand<PIPELINE_RESOLUTION_RECEIPTS> =
+            RestorationDemand::new(abandoned_evicted.clone());
+        assert!(abandoned.requested.set(DeferredDemand::Failed(
+            StructuredResolveFailure::Refused,
+        )).is_ok());
+        drop(abandoned);
+        assert!(coordinator.receipts.records(PIPELINE_RESOLUTION_RECEIPTS)
+            .iter().any(|record| record.token.exact(&abandoned_attempt)),
+            "demand destruction swept global restoration state");
+
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(
+            recipe.initial_job(), false, None, Some(recipe.clone()),
+        ));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        let pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin);
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+        let pending = structured_pending(build.clone(), true);
+        let demand: RestorationDemand<PIPELINE_RESOLUTION_RECEIPTS> =
+            RestorationDemand::new(evicted);
+        let requested = demand.request(&pending);
+
+        assert!(!coordinator.receipts.records(PIPELINE_RESOLUTION_RECEIPTS)
+            .iter().any(|record| record.token.exact(&abandoned_attempt)),
+            "the next exact request did not sweep the abandoned terminal attempt");
+        let generation = match requested {
+            DeferredDemand::Ready(generation) => Some(generation),
+            DeferredDemand::Restoring(ticket) => ticket.wait_and_take_pin().ok(),
+            DeferredDemand::Failed(_) => None,
+        };
+        reconcile_pipeline_restorations();
+
+        assert!(abandoned_build.clear_eviction_token(&abandoned_evicted));
+        assert!(coordinator.evicted.finish(&abandoned_evicted, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&abandoned_evicted));
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(generation); drop(demand); drop(pending); drop(build); drop(recipe);
+        release(raw_owner);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
     fn restoration_coordinator_reuses_its_bounded_eviction_capacity() {
         let coordinator = RestorationCoordinator::<2, PIPELINE_RESOLUTION_RECEIPTS>::new(510).unwrap();
         let first_build = ledger_build();
@@ -7793,14 +7859,6 @@ enum DeferredDemand<const R: usize> {
 impl<const R: usize> RestorationDemand<R> {
     fn new(evicted: EvictedBuildToken) -> Self {
         Self { evicted, demanded: AtomicBool::new(false), requested: OnceLock::new() }
-    }
-}
-
-impl<const R: usize> Drop for RestorationDemand<R> {
-    fn drop(&mut self) {
-        // Bind-state replacements are dropped outside their list locks. This bounded sweep retires
-        // an already-terminal abandoned attempt; an in-flight one is swept before the next request.
-        reconcile_pipeline_restorations();
     }
 }
 
