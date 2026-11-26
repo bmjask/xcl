@@ -728,6 +728,8 @@ struct ListState {
     last_queue: Option<usize>,
     /// Title's currently bound PSO (before dynamic depth-bias override)
     bound_pso: usize,
+    /// An unavailable non-evictable SetPipelineState made this recording unsafe to submit.
+    poisoned: bool,
     /// Recipe-backed native generations referenced by this physical recording.
     native_generations: Vec<super::pso_async::NativeGeneration>,
     /// Allocation identities parallel to `native_generations`, for constant-time deduplication.
@@ -1017,6 +1019,28 @@ pub(super) fn bound_pipeline_for_test(list: usize) -> usize {
     LISTS.lock().unwrap().as_ref().and_then(|lists| lists.get(&list)).map_or(0, |state| state.bound_pso)
 }
 
+pub(super) fn poison_recording(list: usize) {
+    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().poisoned = true;
+    POISONED_EVER.store(true, Ordering::Release);
+}
+
+pub(super) fn recording_poisoned(list: usize) -> bool {
+    if !POISONED_EVER.load(Ordering::Acquire) {
+        return false;
+    }
+    LISTS.lock().unwrap().as_ref().and_then(|lists| lists.get(&list)).is_some_and(|s| s.poisoned)
+}
+
+pub(super) fn any_recording_poisoned(lists: &[*mut c_void]) -> bool {
+    if !POISONED_EVER.load(Ordering::Acquire) {
+        return false;
+    }
+    let states = LISTS.lock().unwrap();
+    states.as_ref().is_some_and(|states| {
+        lists.iter().any(|list| states.get(&(*list as usize)).is_some_and(|s| s.poisoned))
+    })
+}
+
 pub(super) fn resolve_and_record_pipeline(list: usize, pso: usize) -> usize {
     let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(pso);
     record_native_generation(list, generation);
@@ -1040,7 +1064,11 @@ pub(super) fn on_execute_bundle(parent: usize, bundle: usize) {
     let track_descriptors = super::vram::srv_tracking_enabled();
     let mut g = LISTS.lock().unwrap();
     let Some(m) = g.as_mut() else { return };
-    let pins = m.get(&bundle).map(|s| s.native_generations.clone()).unwrap_or_default();
+    let (pins, poisoned) = m.get(&bundle)
+        .map(|s| (s.native_generations.clone(), s.poisoned)).unwrap_or_default();
+    if poisoned {
+        m.entry(parent).or_default().poisoned = true;
+    }
     if !track_descriptors && pins.is_empty() { return }
     if track_descriptors {
         propagate_bundle_shared_view_use(m, parent, bundle);
@@ -1216,6 +1244,7 @@ struct QueueInfo {
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
+static POISONED_EVER: AtomicBool = AtomicBool::new(false);
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
 static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(0);
 /// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
@@ -1380,6 +1409,9 @@ pub(super) unsafe fn submit_title_chunk<'a>(
     prepare: impl FnOnce(),
     execute: impl FnOnce(),
 ) -> bool {
+    if any_recording_poisoned(lists) {
+        return false;
+    }
     if !protect_shared_view && !protect_native_generations {
         return gate.submit(queue, lists, prepare, execute);
     }
@@ -1685,10 +1717,8 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     let sync_target = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
-        // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO.
-        if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve(s.bound_pso) != pso {
-            s.bound_pso = pso;
-        }
+        // XCL-owned exact binds bypass this hook, so every call here is title-visible.
+        s.bound_pso = pso;
         let effective = s.bound_pso;
         s.using_fallback_pso = false;
         let is_bundle = s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE);
@@ -3683,6 +3713,9 @@ pub(super) unsafe fn defer_retained(
     resolution: &super::pso_async::PipelineResolution,
     what: Deferred,
 ) -> bool {
+    if recording_poisoned(list as usize) {
+        return false;
+    }
     if !resolution.submit_demand_pending() {
         return false;
     }
@@ -3830,6 +3863,9 @@ unsafe fn reset_own_alloc(list: *mut c_void) {
 
 /// Ends `list`'s segment and opens the next, carrying its recording state across the boundary.
 pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -> Option<*mut c_void> {
+    if recording_poisoned(list as usize) {
+        return None;
+    }
     let wrapper = super::title_list::wrapper_of(list)?;
     let ty = list_type(list);
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
@@ -4316,6 +4352,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
     let old_generations = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else { return };
+        s.poisoned = false;
         if clear_predication {
             s.predication = None;
             s.pred_in_state = false;
@@ -4416,6 +4453,13 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
 pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     static NO_QUEUE: AtomicU64 = AtomicU64::new(0);
     static ERR: AtomicU64 = AtomicU64::new(0);
+    let mut physical = Vec::new();
+    if !super::title_list::wrapper_of(this).is_some_and(|wrapper| super::title_list::push_segments(wrapper, &mut physical)) {
+        physical.push(this);
+    }
+    if any_recording_poisoned(&physical) {
+        return warn(&ERR, "KickoffX", format_args!("recording is poisoned by an unavailable pipeline bind"));
+    }
     let ty = list_type(this);
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return;
@@ -5379,6 +5423,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
         s.bound_pso = pso;
+        s.poisoned = false;
         s.depth_bias = None;
         s.native_bias = DepthBias::ZERO;
         s.pso_dirty = false;
