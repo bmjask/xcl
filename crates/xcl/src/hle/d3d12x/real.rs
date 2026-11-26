@@ -165,6 +165,9 @@ pub struct D3d12Stats {
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
+    /// Opt-in compute-pipeline pressure lifecycle totals.
+    #[serde(default)]
+    pub pipeline_pressure: super::pso_async::PipelinePressureStats,
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
@@ -557,6 +560,7 @@ pub fn stats() -> D3d12Stats {
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
+        pipeline_pressure: super::pso_async::pipeline_pressure_stats(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
         submissions: submission_timing.submissions,
         slowest_submission_ms: submission_timing.slowest_ns as f64 / 1_000_000.0,
@@ -9834,6 +9838,30 @@ mod cache_report_tests {
             decoded.dxil_cache,
             crate::gpu::recomp::dxc::CacheStats::default()
         );
+    }
+
+    #[test]
+    fn pipeline_pressure_statistics_have_a_backward_compatible_shape() {
+        let mut stats = D3d12Stats::default();
+        stats.pipeline_pressure = super::super::pso_async::PipelinePressureStats {
+            publications_detached: 1,
+            policy_owner_retirements: 2,
+            generation_owners_released: 3,
+            restoration_attempts: 4,
+            restoration_succeeded: 5,
+            restoration_failed: 6,
+        };
+        let mut json = serde_json::to_value(stats).unwrap();
+        assert_eq!(json["pipeline_pressure"]["publications_detached"], 1);
+        assert_eq!(json["pipeline_pressure"]["policy_owner_retirements"], 2);
+        assert_eq!(json["pipeline_pressure"]["generation_owners_released"], 3);
+        assert_eq!(json["pipeline_pressure"]["restoration_attempts"], 4);
+        assert_eq!(json["pipeline_pressure"]["restoration_succeeded"], 5);
+        assert_eq!(json["pipeline_pressure"]["restoration_failed"], 6);
+
+        json.as_object_mut().unwrap().remove("pipeline_pressure");
+        let decoded: D3d12Stats = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.pipeline_pressure, Default::default());
     }
 
     #[test]
