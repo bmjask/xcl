@@ -3673,7 +3673,7 @@ fn wait_target_after_split(list: *mut c_void, placement: WaitPlacement, continua
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, pso: usize, what: Deferred) -> bool {
-    defer_with(list, what, || super::pso_async::need_by_submit(pso))
+    defer_with(list, what, super::pso_async::waits_bounded(), || { super::pso_async::need_by_submit(pso); })
 }
 
 /// Defer a direct dispatch against the bind's retained pipeline identity. Address reuse after
@@ -3683,17 +3683,25 @@ pub(super) unsafe fn defer_retained(
     resolution: &super::pso_async::PipelineResolution,
     what: Deferred,
 ) -> bool {
-    if !resolution.initial_build_pending() {
+    if !resolution.submit_demand_pending() {
         return false;
     }
-    defer_with(list, what, || resolution.need_initial_by_submit())
+    // A configured initial-build timeout may record immediately, but an evicted exact generation
+    // has no legal stand-in. Always install its retained ticket before splitting for submit.
+    if resolution.is_deferred_restoration() {
+        return resolution.need_by_submit()
+            && defer_with(list, what, exact_restoration_waits_bounded(super::pso_async::waits_bounded()), || {});
+    }
+    defer_with(list, what, super::pso_async::waits_bounded(), || { let _ = resolution.need_by_submit(); })
 }
 
-unsafe fn defer_with(list: *mut c_void, what: Deferred, demand: impl FnOnce()) -> bool {
+fn exact_restoration_waits_bounded(_configured: bool) -> bool { false }
+
+unsafe fn defer_with(list: *mut c_void, what: Deferred, waits_bounded: bool, demand: impl FnOnce()) -> bool {
     // A bounded bind records now and waits for the same bound. Deferring it only adds a segment;
     // thousands of these exhausted command-list memory in a retail title with a 1 ms budget.
     if !defer_pipeline_wait(
-        super::pso_async::waits_bounded(),
+        waits_bounded,
         demand,
         || split_recording(list, SegmentReason::DeferredDispatch(what)).is_some(),
     ) {
@@ -7084,6 +7092,8 @@ mod tests {
         }));
         assert_eq!(demanded.get(), 1);
         assert_eq!(splits, 1, "the default still defers to the submit");
+        assert!(!exact_restoration_waits_bounded(true),
+            "XCL_PSO_WAIT_MS must not turn mandatory exact restoration into a skipped dispatch");
     }
 
     #[test]
