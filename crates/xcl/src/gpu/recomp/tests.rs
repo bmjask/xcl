@@ -2474,6 +2474,34 @@ fn spill_slots(slot: fn(u32) -> u32) -> Vec<u8> {
     code
 }
 
+#[test]
+fn wave64_graphics_spill_shadows_cover_native_partial_waves() {
+    let code = program_of(&[
+        ins("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+        ins("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", 21), ("SRC1", 128 + 36)], None),
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 30), ("SRC1", 128 + 5)], None),
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V + 30), ("SRC1", 128 + 36)], None),
+        // With the analyzer's missing upper lanes EXEC_HI is zero, so this clears the low
+        // shadow but leaves the console's lane-36 spill. A physically present lane 36 does
+        // execute the move, however, and its native value must win over that shadow.
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 30), ("SRC0", 20)], None),
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 24), ("SRC0", V + 30), ("SRC1", 128 + 36)], None),
+    ]);
+    for split_wave64 in [false, true] {
+        let ps = translate(&code, &Options { mode: Mode::Pixel(draw_psi()), wave64: true, split_wave64, ..Default::default() }).unwrap().hlsl;
+        assert!(ps.contains("xcl_present = ballot_px(true);") && ps.contains(" = xcl_sh30_5;"), "{ps}");
+        assert_eq!(ps.matches("lanebit_at(xcl_present.x, xcl_present.y, 36u)").count(), 2, "{ps}");
+        let vs = translate(&code, &Options { mode: Mode::Vertex(draw_vsi()), wave64: true, split_wave64, ..Default::default() }).unwrap().hlsl;
+        assert!(vs.contains("xcl_present = ballot(true);"), "{vs}");
+        assert_eq!(vs.matches("lanebit_at(xcl_present.x, xcl_present.y, 36u)").count(), 2, "{vs}");
+    }
+    for split in [false, true] {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let e = crate::gpu::dxil::kernel::translate_pixel(&code, o, &draw_psi()).err().expect("direct DXIL accepted a spill shadow");
+        assert!(e.contains("v_writelane spill needs the HLSL path"), "{e}");
+    }
+}
+
 /// The compiler's whole-wave reduction: wave64 adds the upper half through lane 32.
 fn whole_reduction(op: &str, identity: u64, out: u64, wave64: bool, saved_mask: bool, upper_lane: u64, clobber: Option<u64>) -> Vec<u8> {
     let width = if wave64 { "B64" } else { "B32" };
@@ -2677,17 +2705,9 @@ fn gpu_wave64_ps_spill_slots() {
     let small = draw_console(None, Some(&code), &[[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]);
     let covered: Vec<(usize, &[f32; 4])> = small.iter().enumerate().filter(|(_, p)| p[3] == 1.0).collect();
     assert_eq!(covered.len(), 6);
-    // the 32-lane form keeps slots < 32 whatever the wave size, slots ≥ 32 in 32-lane waves;
-    // the native form (GPUs with 64-lane waves) still loses the slots of lanes not launched
-    let (lo, hi) = (runner::graphics_wave32(), runner::wave64_supported() == Ok(false));
     for (i, p) in covered {
         println!("pixel {i}, partial wave: {:?} (want {want:?})", &p[..2]);
-        if lo {
-            assert_eq!(p[0], want[0], "pixel {i}, partial wave: slots 0..31");
-        }
-        if hi {
-            assert_eq!(p[1], want[1], "pixel {i}, partial wave: slots 32..47");
-        }
+        assert_eq!([p[0], p[1]], want, "pixel {i}, partial wave: slots 0..31, 32..47");
     }
 }
 
@@ -2722,17 +2742,14 @@ fn gpu_wave64_vs_spill_slots_and_identity() {
     ]);
     let px = draw_console(Some(&code), None, &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]]);
     let want = [(0..32).map(slot).sum::<u32>() as f32, (32..48).map(slot).sum::<u32>() as f32, 1.0, 1.0];
-    // as in `gpu_wave64_ps_spill_slots`: slots < 32 in the 32-lane form; slots ≥ 32 and the
-    // identity in lane 32 in 32-lane waves (in a 64-lane wave of three vertices, lane 32 was
-    // not launched either)
-    let (lo, hi) = (runner::graphics_wave32(), runner::wave64_supported() == Ok(false));
+    // Spill slots are exact at either hardware wave size. The unrelated whole-wave identity is
+    // still reconstructed only in the 32-lane form.
+    let identity = runner::wave64_supported() == Ok(false);
     println!("{:?} (want {want:?})", px[0]);
     for (i, p) in px.iter().enumerate() {
-        if lo {
-            assert_eq!(p[0], want[0], "pixel {i}: slots 0..31");
-        }
-        if hi {
-            assert_eq!(&p[1..], &want[1..], "pixel {i}: slots 32..47, lane 32");
+        assert_eq!(&p[..2], &want[..2], "pixel {i}: slots 0..31, 32..47");
+        if identity {
+            assert_eq!(&p[2..], &want[2..], "pixel {i}: lane 32 identity");
         }
     }
 }
