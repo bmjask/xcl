@@ -5545,6 +5545,7 @@ pub(crate) mod driver_cache {
     }
 
     /// Keep `blob`, of a build that took `took`, for the next run.
+    #[cfg(test)]
     pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) -> bool {
         if let Some(turn) = KeepTurn::new(p, took) {
             turn.store(blob)
@@ -5935,18 +5936,6 @@ impl<K: Copy + Eq + std::hash::Hash> DriverBlobs<K> {
         }
     }
 
-    fn remember(&self, key: K, blob: std::sync::Arc<Vec<u8>>, limit: usize) {
-        if blob.is_empty() {
-            return;
-        }
-        let mut guard = self.blobs.lock().unwrap();
-        let (map, total) = guard.get_or_insert_with(|| (HashMap::new(), 0));
-        if !map.contains_key(&key) && blob.len() <= limit.saturating_sub(*total) {
-            *total += blob.len();
-            map.insert(key, blob);
-        }
-    }
-
     /// Remove only the generation that a rejected lookup actually used. A builder may have
     /// published a replacement under the same key while that driver call was in flight.
     fn forget_if(&self, key: K, expected: &std::sync::Arc<Vec<u8>>) -> bool {
@@ -6224,14 +6213,6 @@ const GRAPHICS_BLOBS_MAX: usize = 256 << 20;
 
 fn graphics_blob(key: (u64, usize, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
     GRAPHICS_BLOBS.get(key)
-}
-
-fn forget_graphics_blob(key: (u64, usize, usize), rejected: &std::sync::Arc<Vec<u8>>) -> bool {
-    GRAPHICS_BLOBS.forget_if(key, rejected)
-}
-
-fn remember_graphics_blob(key: (u64, usize, usize), blob: std::sync::Arc<Vec<u8>>) {
-    GRAPHICS_BLOBS.remember(key, blob, GRAPHICS_BLOBS_MAX);
 }
 
 fn forget_graphics_blob_if(key: (u64, usize, usize), expected: &std::sync::Arc<Vec<u8>>) -> bool {
@@ -7608,13 +7589,19 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     *ppv = std::ptr::null_mut();
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let mesh_bytes = stream.shader_bytes();
-    let gkey = (mesh_bytes != 0).then(|| two_pass_driver_id(this)).flatten().and_then(|driver| {
+    let disk_key = (mesh_bytes != 0).then(|| two_pass_driver_id(this)).flatten().and_then(|driver| {
         two_pass_identity::two_pass_stream_key(&stream.0, ps_samplers, driver, crate::gpu::recomp::pso::mem_windows())
     });
-    let gdisk = gkey.and_then(|(hash, bytes)| driver_cache::graphics_path(hash, bytes));
-    let gram = gkey.and_then(graphics_blob);
-    let gfrom_disk = gram.is_none();
-    let gcached = gram.or_else(|| gdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new));
+    let gkey = disk_key.map(|(hash, bytes)| (hash, bytes, mesh_rs as usize));
+    let gdisk = disk_key.and_then(|(hash, bytes)| driver_cache::graphics_path(hash, bytes));
+    let mut gcached = gkey.and_then(graphics_blob);
+    let gfrom_disk = gcached.is_none();
+    let mut gloaded = None;
+    if gfrom_disk {
+        gloaded = gdisk.as_deref().and_then(driver_cache::load);
+        gcached = gloaded.as_ref().map(driver_cache::LoadedBlob::shared);
+    }
+    let rejected_generation = gcached.clone();
 
     let bytes = mesh_bytes + tp.cs.len();
     let huge_bytes = huge_pso_bytes();
@@ -7646,7 +7633,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         };
         let desc = [stream.0.len(), stream.0.as_ptr() as usize];
         let mut raw = std::ptr::null_mut();
-        let (hr, took) = driver_compile_identified(label, mesh_bytes, false, None, || {
+        let (hr, took) = driver_compile_identified(label, mesh_bytes, false, None, blob.is_some(), || {
             finish_pso(this, fs, desc.as_ptr().cast(), riid, &mut raw)
         });
         let pso = (!raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw));
@@ -7657,13 +7644,13 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let (mut hr, mut mesh_pso, mut gin_driver) = create_mesh(kind, gcached.as_deref().map(Vec::as_slice));
     let mut greused = gcached.is_some();
-    if let Some((key, blob)) = gkey.zip(gcached.as_ref()).filter(|_| hr < 0 || mesh_pso.is_none()) {
+    if (hr < 0 || mesh_pso.is_none()) && gcached.is_some() {
         drop(mesh_pso.take());
-        if gfrom_disk || forget_graphics_blob(key, blob) {
-            let rejected_path = gdisk.as_deref().filter(|p| {
-                gfrom_disk || driver_cache::load(p).as_deref() == Some(blob.as_ref())
-            });
-            driver_cache::note(false, rejected_path);
+        if let (Some(key), Some(expected)) = (gkey, rejected_generation.as_ref()) {
+            forget_graphics_blob_if(key, expected);
+        }
+        if gfrom_disk {
+            driver_cache::note(false, gloaded.take());
         }
         take_cold_slot();
         (hr, mesh_pso, gin_driver) = create_mesh("mesh pass retry", None);
@@ -7673,24 +7660,14 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     };
-    if let Some(key) = gkey {
-        if greused {
-            if let Some(blob) = gcached.filter(|_| gfrom_disk) {
-                remember_graphics_blob(key, blob);
-                driver_cache::note(true, None);
-            }
-        } else {
-            let slow = driver_cache::worth_keeping(gin_driver);
-            if slow || mesh_bytes >= COMPUTE_BLOB_MIN_DXIL {
-                let blob = graphics_blob(key).or_else(|| read_pso_cached_blob(mesh_pso.as_raw()).map(std::sync::Arc::new));
-                if let Some(blob) = blob {
-                    if let Some(path) = gdisk.as_deref().filter(|_| slow) {
-                        driver_cache::keep(path, &blob, gin_driver);
-                    }
-                    remember_graphics_blob(key, blob);
-                }
-            }
+    if let Some(key) = gkey.filter(|_| !greused) {
+        keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, key, mesh_bytes, gdisk.as_deref(), gin_driver,
+            || read_pso_cached_blob(mesh_pso.as_raw()));
+    } else if greused && gfrom_disk {
+        if let (Some(key), Some(blob)) = (gkey, gcached.as_ref()) {
+            GRAPHICS_BLOBS.admit(key, blob.clone(), GRAPHICS_BLOBS_MAX);
         }
+        driver_cache::note(true, gloaded.take());
     }
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();

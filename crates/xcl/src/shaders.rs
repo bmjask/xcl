@@ -2331,7 +2331,7 @@ fn precompile(
                                     p.make(&c);
                                 }
                                 if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
-                                    p.make_one(&c.dxil, &c.samplers, true, None);
+                                    p.make_one(&c.dxil, &c.samplers, PipelineRoot::DirectChain, None);
                                 }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
