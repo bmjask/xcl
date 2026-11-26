@@ -100,7 +100,7 @@ impl Init {
         }
         let v = self.first(s, var);
         let cur = s.m.current_block();
-        let before = s.m.set_insert_before_term(false);
+        let before = s.m.set_insert_before_term(true);
         s.m.set_block(self.entry);
         let i32 = s.m.i32();
         let p = s.m.alloca(i32, 4);
@@ -133,6 +133,7 @@ impl Init {
             }
         }
         let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(true);
         s.m.set_block(self.entry);
         self.touched.insert(var);
         let io = self.io.expect("io");
@@ -146,7 +147,50 @@ impl Init {
             s.raw_load(io, off, 1)[0]
         };
         s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
         v
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::{Init, VAR_BUDGET};
+    use crate::gpu::dxil::{container::Stage, shader::Shader};
+    use std::collections::{BTreeSet, HashMap};
+
+    fn after_terminated_entry() -> (Shader, Init) {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let io = s.raw_uav(0, 0);
+        let entry = s.m.current_block();
+        let body = s.m.new_block();
+        s.m.br(body);
+        s.m.set_block(body);
+        let init = Init {
+            io: Some(io),
+            compute: None,
+            vgpr_base: None,
+            entry,
+            touched: BTreeSet::new(),
+            slots: HashMap::new(),
+            mem: None,
+        };
+        (s, init)
+    }
+
+    #[test]
+    fn lazy_register_load_precedes_an_entry_terminator() {
+        let (mut s, mut init) = after_terminated_entry();
+        let _ = init.first(&mut s, 4);
+        s.m.ret();
+        s.try_finish([1, 1, 1], None).expect("lazy register load after an entry branch");
+    }
+
+    #[test]
+    fn compact_register_slot_precedes_an_entry_terminator() {
+        let (mut s, mut init) = after_terminated_entry();
+        let _ = init.slot(&mut s, VAR_BUDGET);
+        s.m.ret();
+        s.try_finish([1, 1, 1], None).expect("compact register slot after an entry branch");
     }
 }
 
