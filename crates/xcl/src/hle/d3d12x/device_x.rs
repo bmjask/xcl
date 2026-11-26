@@ -1326,15 +1326,14 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
-    }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        let dispatches = list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
         let stride = u32::from_le_bytes(pc[..4].try_into().unwrap());
-        let dispatch_only = list.len() == 1 && list[0][0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32
+        let dispatch_only = list.len() == 1 && dispatches
             && stride >= 12 && stride % 4 == 0;
-        super::bind::note_dispatch_only_signature(*ppv as usize, dispatch_only.then_some(stride));
+        super::bind::note_indirect_signature(*ppv as usize, super::bind::IndirectSignatureInfo::new(
+            dispatches, needs_root, dispatch_only.then_some(stride),
+        ));
     }
     hr
 }
