@@ -235,6 +235,159 @@ struct WaitTicket {
     kind: WaitKind,
 }
 
+/// Sources which can require one CPU page to be considered by a future immutable upload plan.
+/// Multiple sources collapse into one page owner without losing why the page must be revisited.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkReasons(u8);
+
+impl WorkReasons {
+    const ZERO: Self = Self(1);
+    const RETRY: Self = Self(2);
+    const DIRTY: Self = Self(4);
+
+    fn insert(&mut self, other: Self) { self.0 |= other.0; }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WorkClaimToken {
+    state_generation: u64,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkClaimResolution {
+    Committed,
+    Restored,
+    AlreadyFinished,
+    StaleGeneration,
+}
+
+struct ClaimedWork {
+    token: WorkClaimToken,
+    pages: Vec<(usize, WorkReasons)>,
+}
+
+/// Inert foundation for splitting sparse planning from its serialized commit phase. Work added
+/// while a page is owned stays journalled for a later claim; cancelling an older claim merges its
+/// exact reasons back without rewinding or duplicating a newer claim. Tokens include the sparse
+/// state generation, so a late completion from replaced state cannot modify the replacement.
+#[allow(dead_code)]
+struct WorkClaimLedger {
+    state_generation: u64,
+    next_serial: u64,
+    available: BTreeMap<usize, WorkReasons>,
+    owners: BTreeMap<usize, u64>,
+    claims: BTreeMap<u64, Vec<(usize, WorkReasons)>>,
+}
+
+#[allow(dead_code)]
+impl WorkClaimLedger {
+    fn new(state_generation: u64) -> Self {
+        Self {
+            state_generation,
+            next_serial: 0,
+            available: BTreeMap::new(),
+            owners: BTreeMap::new(),
+            claims: BTreeMap::new(),
+        }
+    }
+
+    fn add_pages(&mut self, pages: impl IntoIterator<Item = usize>, reason: WorkReasons) {
+        for page in pages {
+            self.available.entry(page & !(PAGE - 1)).or_default().insert(reason);
+        }
+    }
+
+    fn add_zero_ranges(&mut self, ranges: &[(usize, usize)]) {
+        for &(start, bytes) in ranges {
+            if bytes == 0 {
+                continue;
+            }
+            let end = start.saturating_add(bytes);
+            let mut page = start & !(PAGE - 1);
+            while page < end {
+                self.available.entry(page).or_default().insert(WorkReasons::ZERO);
+                let Some(next) = page.checked_add(PAGE) else { break };
+                page = next;
+            }
+        }
+    }
+
+    fn add_retry_pages(&mut self, pages: impl IntoIterator<Item = usize>) {
+        self.add_pages(pages, WorkReasons::RETRY);
+    }
+
+    fn add_dirty_pages(&mut self, pages: impl IntoIterator<Item = usize>) {
+        self.add_pages(pages, WorkReasons::DIRTY);
+    }
+
+    /// Claim at most `limit` pages in address order. A page has one owner even when zero, retry,
+    /// and fresh dirty work overlap; reasons added after this snapshot remain for the next claim.
+    fn claim(&mut self, limit: usize) -> Option<ClaimedWork> {
+        if limit == 0 {
+            return None;
+        }
+        let pages: Vec<_> = self.available
+            .iter()
+            .filter(|(page, _)| !self.owners.contains_key(page))
+            .take(limit)
+            .map(|(&page, &reasons)| (page, reasons))
+            .collect();
+        if pages.is_empty() {
+            return None;
+        }
+        self.next_serial = self.next_serial.checked_add(1).expect("sparse work claim serial exhausted");
+        let serial = self.next_serial;
+        for &(page, _) in &pages {
+            self.available.remove(&page);
+            self.owners.insert(page, serial);
+        }
+        self.claims.insert(serial, pages.clone());
+        Some(ClaimedWork {
+            token: WorkClaimToken { state_generation: self.state_generation, serial },
+            pages,
+        })
+    }
+
+    fn commit(&mut self, token: WorkClaimToken) -> WorkClaimResolution {
+        self.finish(token, false)
+    }
+
+    fn restore(&mut self, token: WorkClaimToken) -> WorkClaimResolution {
+        self.finish(token, true)
+    }
+
+    fn cancel(&mut self, token: WorkClaimToken) -> WorkClaimResolution {
+        self.restore(token)
+    }
+
+    fn finish(&mut self, token: WorkClaimToken, restore: bool) -> WorkClaimResolution {
+        if token.state_generation != self.state_generation {
+            return WorkClaimResolution::StaleGeneration;
+        }
+        let Some(pages) = self.claims.remove(&token.serial) else {
+            return WorkClaimResolution::AlreadyFinished;
+        };
+        for (page, reasons) in pages {
+            if self.owners.get(&page) != Some(&token.serial) {
+                continue;
+            }
+            self.owners.remove(&page);
+            if restore {
+                self.available.entry(page).or_default().insert(reasons);
+            }
+        }
+        if restore { WorkClaimResolution::Restored } else { WorkClaimResolution::Committed }
+    }
+
+    fn replace_generation(&mut self, state_generation: u64) {
+        self.state_generation = state_generation;
+        self.available.clear();
+        self.owners.clear();
+        self.claims.clear();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreparationOutcome {
     Ready,
@@ -4214,4 +4367,51 @@ mod tests {
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
         }
     }
+
+    #[test]
+    fn late_claim_completion_cannot_change_a_newer_owner() {
+        let mut ledger = WorkClaimLedger::new(11);
+        ledger.add_dirty_pages([0x8000]);
+        let old = ledger.claim(1).unwrap();
+        assert_eq!(ledger.commit(old.token), WorkClaimResolution::Committed);
+
+        ledger.add_retry_pages([0x8000]);
+        let newer = ledger.claim(1).unwrap();
+        assert_eq!(ledger.restore(old.token), WorkClaimResolution::AlreadyFinished);
+        assert_eq!(ledger.owners.get(&0x8000), Some(&newer.token.serial));
+        assert_eq!(ledger.commit(newer.token), WorkClaimResolution::Committed);
+        assert!(ledger.available.is_empty());
+    }
+    #[test]
+    fn work_claim_ledger_merges_orders_and_restores_exact_out_of_order_work() {
+        let mut ledger = WorkClaimLedger::new(7);
+        ledger.add_zero_ranges(&[(0x3000, 2 * PAGE)]);
+        ledger.add_retry_pages([0x3001, 0x1000, 0x1000]);
+        ledger.add_dirty_pages([0x4000, 0x6001, 0x6000]);
+
+        let first = ledger.claim(2).unwrap();
+        assert_eq!(first.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x1000, WorkReasons::RETRY.0),
+            (0x3000, WorkReasons::ZERO.0 | WorkReasons::RETRY.0),
+        ]);
+        let second = ledger.claim(8).unwrap();
+        assert_eq!(second.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x4000, WorkReasons::ZERO.0 | WorkReasons::DIRTY.0),
+            (0x6000, WorkReasons::DIRTY.0),
+        ]);
+
+        ledger.add_dirty_pages([0x1000]);
+        assert!(ledger.claim(1).is_none(), "new work escaped an older owner of the same page");
+        assert_eq!(ledger.cancel(second.token), WorkClaimResolution::Restored);
+        let out_of_order = ledger.claim(1).unwrap();
+        assert_eq!(out_of_order.pages[0].0, 0x4000);
+        assert_eq!(ledger.commit(first.token), WorkClaimResolution::Committed);
+        let later = ledger.claim(1).unwrap();
+        assert_eq!(later.pages, [(0x1000, WorkReasons::DIRTY)]);
+        assert_eq!(ledger.commit(later.token), WorkClaimResolution::Committed);
+        assert_eq!(ledger.cancel(out_of_order.token), WorkClaimResolution::Restored);
+        let restored = ledger.claim(8).unwrap();
+        assert_eq!(restored.pages.iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x4000, 0x6000]);
+    }
+
 }
