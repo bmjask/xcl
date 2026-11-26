@@ -517,54 +517,61 @@ fn note_address(va: u64) {
     }
 }
 
-/// command signatures that change root arguments (they need the title's root signature)
-static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-
-pub(super) fn note_root_changing_signature(sig: usize) {
-    ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
+/// Immutable classification of one successfully created command signature. Replacing this value
+/// in one map operation prevents address reuse or concurrent execution from mixing generations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct IndirectSignatureInfo {
+    dispatch_only_stride: u32,
+    flags: u8,
 }
 
-/// command signatures with a Dispatch argument (noted at every creation, so a signature made
-/// at a freed one's address does not keep its kind)
-static DISPATCH_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+impl IndirectSignatureInfo {
+    const DISPATCHES: u8 = 1;
+    const ROOT_CHANGES: u8 = 2;
 
-pub(super) fn note_signature_dispatches(sig: usize, dispatches: bool) {
-    let mut s = DISPATCH_SIGNATURES.lock().unwrap();
-    let s = s.get_or_insert_with(Default::default);
-    if dispatches {
-        s.insert(sig);
-    } else {
-        s.remove(&sig);
+    pub(super) fn new(dispatches: bool, root_changes: bool, dispatch_only_stride: Option<u32>) -> Self {
+        Self {
+            dispatch_only_stride: dispatch_only_stride.unwrap_or(0),
+            flags: (dispatches as u8) * Self::DISPATCHES | (root_changes as u8) * Self::ROOT_CHANGES,
+        }
     }
+
+    fn dispatches(self) -> bool { self.flags & Self::DISPATCHES != 0 }
+    fn root_changes(self) -> bool { self.flags & Self::ROOT_CHANGES != 0 }
+    fn dispatch_only(self) -> Option<u32> { (self.dispatch_only_stride != 0).then_some(self.dispatch_only_stride) }
 }
 
-fn signature_dispatches(sig: usize) -> bool {
-    DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
+static INDIRECT_SIGNATURES: Mutex<Option<HashMap<usize, IndirectSignatureInfo>>> = Mutex::new(None);
+
+pub(super) fn note_indirect_signature(sig: usize, classification: IndirectSignatureInfo) {
+    INDIRECT_SIGNATURES.lock().unwrap().get_or_insert_with(HashMap::new).insert(sig, classification);
 }
 
-/// Command signatures made of one Dispatch argument, keyed to their stride.
-static DISPATCH_ONLY: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
-
-pub(super) fn note_dispatch_only_signature(sig: usize, stride: Option<u32>) {
-    let mut signatures = DISPATCH_ONLY.lock().unwrap();
-    let signatures = signatures.get_or_insert_with(Default::default);
-    match stride {
-        Some(stride) => { signatures.insert(sig, stride); }
-        None => { signatures.remove(&sig); }
-    }
+fn indirect_signature(sig: usize) -> IndirectSignatureInfo {
+    INDIRECT_SIGNATURES.lock().unwrap().as_ref()
+        .and_then(|signatures| signatures.get(&sig).copied()).unwrap_or_default()
 }
 
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    execute_indirect_classified(this, sig, max, args, args_off, count_buf, count_off, indirect_signature(sig))
+}
+
+pub(super) unsafe fn execute_indirect_classified(
+    this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64,
+    count_buf: usize, count_off: u64, signature: IndirectSignatureInfo,
+) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
-    let dispatches = signature_dispatches(sig);
+    let dispatches = signature.dispatches();
     let _detail = crate::stall::detail_span(if dispatches { crate::stall::StallKind::DetailDispatch } else { crate::stall::StallKind::DetailDraw });
     let unbuilt_compute = dispatches && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
-    if unbuilt_compute && super::list_x::defer(this, raw_pso, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+    if unbuilt_compute && super::list_x::defer(this, raw_pso, super::list_x::Deferred::Indirect(
+        sig, max, args, args_off, count_buf, count_off, signature,
+    )) {
         return;
     }
     let ((pso, bound_unbuilt), generation) = super::pso_async::resolve_wait_bound_and_pin_if_enabled(raw_pso);
@@ -622,7 +629,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
-    if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+    if signature.root_changes() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -630,7 +637,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    if compute && max == 1 && count_buf == 0 && DISPATCH_ONLY.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&sig)) {
+    if compute && max == 1 && count_buf == 0 && signature.dispatch_only().is_some() {
         let chained = indirect_address(args, args_off_title, args_off).map_or(Ok(false), |address| {
             super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), address,
                 |root| bind_abi_with_root_resolved(this, list, pso, false, root, None, [0; 3]).map(|_| ()))
@@ -2713,6 +2720,54 @@ void main(uint t : SV_GroupIndex) {
     }
 
     #[test]
+    fn command_signature_recreation_replaces_every_classification_bit() {
+        assert_eq!(std::mem::size_of::<IndirectSignatureInfo>(), 8);
+        let root_reuse = 0x7301_2800usize;
+        note_indirect_signature(root_reuse, IndirectSignatureInfo::new(true, true, Some(12)));
+        note_indirect_signature(root_reuse, IndirectSignatureInfo::default());
+        assert_eq!(indirect_signature(root_reuse), IndirectSignatureInfo::default(),
+            "a plain signature inherited root-changing or dispatch state");
+
+        let dispatch_reuse = 0x7301_2810usize;
+        note_indirect_signature(dispatch_reuse, IndirectSignatureInfo::new(true, false, Some(16)));
+        let replacement = IndirectSignatureInfo::new(true, true, None);
+        note_indirect_signature(dispatch_reuse, replacement);
+        assert_eq!(indirect_signature(dispatch_reuse), replacement,
+            "a non-dispatch-only replacement inherited the old stride");
+    }
+
+    #[test]
+    fn command_signature_snapshot_never_mixes_generations() {
+        let sig = 0x7301_2820usize;
+        let a = IndirectSignatureInfo::new(true, false, Some(12));
+        let b = IndirectSignatureInfo::new(false, true, None);
+        note_indirect_signature(sig, a);
+        let writer = std::thread::spawn(move || {
+            for n in 0..20_000 {
+                note_indirect_signature(sig, if n & 1 == 0 { b } else { a });
+            }
+        });
+        for _ in 0..20_000 {
+            let seen = indirect_signature(sig);
+            assert!(seen == a || seen == b, "mixed command-signature snapshot: {seen:?}");
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn deferred_indirect_owns_its_command_signature_snapshot() {
+        let sig = 0x7301_2830usize;
+        let original = IndirectSignatureInfo::new(true, false, Some(12));
+        note_indirect_signature(sig, original);
+        let deferred = list_x::Deferred::Indirect(1, 2, 3, 4, 5, 6, indirect_signature(sig));
+        note_indirect_signature(sig, IndirectSignatureInfo::new(false, true, None));
+
+        let list_x::Deferred::Indirect(_, _, _, _, _, _, retained) = deferred else { unreachable!() };
+        assert_eq!(retained, original,
+            "deferred replay followed the classification now stored at a reused signature address");
+    }
+
+    #[test]
     fn resolved_compute_metadata_does_not_follow_a_reused_native_address() {
         let exact = 0x7301_3000usize;
         let replacement = 0x7301_4000usize;
@@ -2773,7 +2828,7 @@ void main(uint t : SV_GroupIndex) {
         let mut real_ok_pso = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let real_ok = &mut real_ok_pso as *mut ResolutionPso as usize;
         let sig_root_changing = 0x7200_00F0usize;
-        note_root_changing_signature(sig_root_changing);
+        note_indirect_signature(sig_root_changing, IndirectSignatureInfo::new(false, true, None));
 
         pso_async::submit(
             standin_ok,
@@ -2837,7 +2892,7 @@ void main(uint t : SV_GroupIndex) {
         // compute root signature (XCL's ABI one after a translated dispatch: debug layer 953)
         let sig_dispatch = 0x7200_00F8usize;
         real::register_console_compute_for_test(standin_fail);
-        note_signature_dispatches(sig_dispatch, true);
+        note_indirect_signature(sig_dispatch, IndirectSignatureInfo::new(true, false, None));
         let before = counts_snapshot();
         unsafe {
             execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
@@ -2857,7 +2912,7 @@ void main(uint t : SV_GroupIndex) {
 
         // a signature made later at the same address without a Dispatch argument goes to the PC
         reset(list_ptr, 0x7200_0100, standin_fail);
-        note_signature_dispatches(sig_dispatch, false);
+        note_indirect_signature(sig_dispatch, IndirectSignatureInfo::default());
         unsafe {
             execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
         }
@@ -2909,8 +2964,8 @@ void main(uint t : SV_GroupIndex) {
         let real_ok = 0x7210_0004usize;
         let sig_dispatch = 0x7210_00F8usize;
         let sig_root_changing = 0x7210_00F0usize;
-        note_signature_dispatches(sig_dispatch, true);
-        note_root_changing_signature(sig_root_changing);
+        note_indirect_signature(sig_dispatch, IndirectSignatureInfo::new(true, false, None));
+        note_indirect_signature(sig_root_changing, IndirectSignatureInfo::new(false, true, None));
 
         pso_async::submit_lazy(shell_fail, true, Box::new(|| 0), 0);
         pso_async::shared(shell_fail, shared_driver);
@@ -2972,7 +3027,7 @@ void main(uint t : SV_GroupIndex) {
         );
 
         forget(list_ptr);
-        note_signature_dispatches(sig_dispatch, false);
+        note_indirect_signature(sig_dispatch, IndirectSignatureInfo::default());
         let _ = pso_async::released(shell_ok);
         real::forget_pso_for_test(shell_ok);
         real::forget_pso_for_test(real_ok);
