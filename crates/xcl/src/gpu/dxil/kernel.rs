@@ -158,6 +158,14 @@ pub enum Entry {
     Geometry(GsInterface),
 }
 
+/// Whether `d` accesses the group's LDS rather than using the DS encoding for a cross-lane
+/// operation. GDS is separate global memory and is refused by the instruction lowering itself.
+pub(crate) fn real_lds_access(d: &Decoded) -> bool {
+    d.enc.name == "ENC_DS"
+        && crate::gpu::rdna2::field_value(d.enc, &d.words, "GDS") != Some(1)
+        && !matches!(d.inst.name, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP")
+}
+
 /// A compute-mode program (the CS ABI of `cs`).
 pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
     translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None)
@@ -226,6 +234,9 @@ fn translate_on_this_thread(
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
+    if split && !matches!(entry, Entry::Geometry(_)) && cfg.insts.iter().any(real_lds_access) {
+        return Err("split wave64 LDS access needs the HLSL path".into());
+    }
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
     let uses_lds = lw.lds.is_some();
@@ -592,7 +603,7 @@ impl Lw {
         let mut slot = 1u32;
         for d in insts {
             let n = d.inst.name;
-            if d.enc.name == "ENC_DS" && !matches!(n, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP") {
+            if real_lds_access(d) {
                 uses_lds = true;
             }
             if n == "DS_BPERMUTE_B32" {

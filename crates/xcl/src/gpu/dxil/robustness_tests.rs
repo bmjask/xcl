@@ -139,6 +139,38 @@ fn a_group_barrier_of_several_hardware_waves_is_left_to_the_hlsl_path() {
     kernel::translate_mesh(&code, o(false, false), &ms(32)).expect("a mesh pass of one 32-lane wave");
 }
 
+#[test]
+fn split_wave64_real_lds_is_left_to_the_hlsl_path() {
+    let write = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None)]);
+    let swizzle = prog(&[("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 4)], None)]);
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+
+    let e = kernel::translate_compute(&write, o(true, true), &cs).err().expect("split LDS translated");
+    assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+    kernel::translate_compute(&write, o(true, false), &cs).expect("native wave64 LDS");
+    kernel::translate_compute(&write, o(false, false), &cs).expect("native wave32 LDS");
+    kernel::translate_compute(&swizzle, o(true, true), &cs).expect("split cross-lane DS");
+}
+
+#[test]
+fn real_lds_classification_excludes_cross_lane_ds_and_gds() {
+    let one = |name, fields: &[(&str, u64)]| {
+        let bytes = encode(name, "ENC_DS", fields, None).unwrap();
+        crate::gpu::rdna2::decode(&bytes, 0).unwrap()
+    };
+    assert!(kernel::real_lds_access(&one("DS_READ_B32", &[("VDST", 1), ("ADDR", 0)])));
+    assert!(!kernel::real_lds_access(&one("DS_READ_B32", &[("VDST", 1), ("ADDR", 0), ("GDS", 1)])));
+    for (name, fields) in [
+        ("DS_SWIZZLE_B32", &[("VDST", 1), ("ADDR", 0)][..]),
+        ("DS_BPERMUTE_B32", &[("VDST", 1), ("ADDR", 0), ("DATA0", 1)][..]),
+        ("DS_PERMUTE_B32", &[("VDST", 1), ("ADDR", 0), ("DATA0", 1)][..]),
+        ("DS_NOP", &[][..]),
+    ] {
+        assert!(!kernel::real_lds_access(&one(name, fields)), "{name}");
+    }
+}
+
 // ---- builder misuse: recorded as the first error, finish fails instead of panicking
 
 use super::container::Stage;
