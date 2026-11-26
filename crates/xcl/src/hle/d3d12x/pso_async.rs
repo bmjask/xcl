@@ -5737,6 +5737,75 @@ mod used_tests {
     }
 
     #[test]
+    fn active_pressure_observer_detach_feeds_retained_demand_restoration() {
+        let _global = pipeline_restoration_test_guard();
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_next = next.clone(); let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            build_next.load(Ordering::Acquire)
+        });
+        let build = Arc::new(Build::new_keyed_kind(
+            recipe.initial_job(), false, None, Some(recipe.clone()), PipelineKind::Compute,
+        ));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        build.completed_frame.store(0, Ordering::Relaxed);
+        let candidates = CandidateQueue::<Build, 2>::new();
+        note_eviction_candidate_on(&build, 0, &candidates);
+        let mut observer = PressureObserver::new(PressureAdmissionConfig {
+            enabled: true, max_sample_age_turns: 0, max_evictions_per_turn: 1,
+            ..Default::default()
+        }, EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        }).unwrap();
+        let coordinator = pipeline_restoration_coordinator();
+        let (observed, detached) = observer.evict_exact_on(
+            &candidates, 1, 100, Some(pressure_sample(1, 100)), coordinator,
+        );
+        assert_eq!(observed, PressureObservation {
+            policy: PressurePolicyMode::Active, mode: PressureMode::Evicting,
+            scanned: 1, eligible: 1, attempted: 1, evicted: 1,
+            ..Default::default()
+        });
+        let detached = detached.expect("active observer did not detach its exact candidate");
+        let evicted = detached.token().clone();
+        assert_eq!(build.real.load(Ordering::Acquire), 0);
+        assert!(build.eviction_token().is_some_and(|token| token.exact(&evicted)));
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted));
+        assert!(candidates.pop().is_none(), "successful candidate remained in the pressure journal");
+        detached.retire();
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
+
+        next.store(replacement_raw, Ordering::Release);
+        let original = 0x7E57_D02Busize;
+        let pending = structured_pending(build.clone(), true);
+        PENDING.insert(original, pending.clone());
+        let resolution = begin_pipeline_resolution(original).expect("registered evicted pipeline");
+        assert!(matches!(&resolution.0, StructuredResolve::Deferred { pending: retained, .. }
+            if Arc::ptr_eq(retained, &pending)));
+        let reused = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), false);
+        assert!(Arc::ptr_eq(&PENDING.insert(original, reused.clone()).unwrap(), &pending));
+        assert!(resolution.need_by_submit(), "retained demand did not queue exact restoration");
+        let PipelineChoice::Available { raw, generation } = resolution.resolve_for_emission()
+            else { panic!("observer-detached pipeline was not restored") };
+        assert_eq!((raw, generation.id(), calls.load(Ordering::Relaxed)), (replacement_raw, 2, 2));
+        assert!(build.eviction_token().is_none(), "terminal restoration was not reconciled");
+        assert!(coordinator.evicted.state(&evicted).is_none(), "eviction ledger record was not retired");
+
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &reused));
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(generation); drop(resolution); drop(reused); drop(pending);
+        drop(build); drop(recipe); release(raw_owner);
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn retained_failed_demand_observes_another_binds_successful_retry() {
         let _global = pipeline_restoration_test_guard();
         let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
