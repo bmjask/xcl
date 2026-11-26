@@ -906,7 +906,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             out.skipped_dispatches += 1;
                             continue;
                         }
-                        let user_sgprs = super::real::pso_user_sgprs(real);
+                        let user_sgprs = super::real::pso_user_sgprs_exact(real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
@@ -918,7 +918,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
-                        let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
+                        let own = super::real::pso_root_signature_exact(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),

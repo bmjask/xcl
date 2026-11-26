@@ -519,10 +519,10 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let [x, y, z] = grid;
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else {
-        match remapped_grid(grid, super::pso_dispatch_remap(pso)) {
+        match remapped_grid(grid, super::pso_dispatch_remap_exact(pso)) {
             Some([x, y, z]) => list.Dispatch(x, y, z),
             None => {
-                list.SetPipelineState(&super::remap_fallback::whole(pso)?);
+                list.SetPipelineState(&super::remap_fallback::whole_exact(pso)?);
                 list.Dispatch(x, y, z);
             }
         }

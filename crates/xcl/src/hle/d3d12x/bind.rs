@@ -590,7 +590,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Falling through to raw PC ExecuteIndirect
         // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
         // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
-        if let Some(tp) = super::real::two_pass_of(pso) {
+        if let Some(tp) = super::real::two_pass_of_exact(pso) {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -633,7 +633,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if compute && max == 1 && count_buf == 0 && DISPATCH_ONLY.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&sig)) {
         let chained = indirect_address(args, args_off_title, args_off).map_or(Ok(false), |address| {
             super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), address,
-                |root| bind_abi_with_root(this, list, pso, false, root))
+                |root| bind_abi_with_root_resolved(this, list, pso, false, root, None, [0; 3]).map(|_| ()))
         });
         match chained {
             Ok(true) => {
@@ -651,11 +651,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
     }
-    match bind_abi(this, list, pso, gfx) {
+    match bind_abi_resolved(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
-                if super::real::pso_dispatch_remap(pso).is_some() {
-                    match super::real::remap_fallback::whole(pso) {
+                if super::real::pso_dispatch_remap_exact(pso).is_some() {
+                    match super::real::remap_fallback::whole_exact(pso) {
                         Ok(fallback) => list.SetPipelineState(&fallback),
                         Err(e) => {
                             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -924,7 +924,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<(ID3D12GraphicsCommandList
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
         // (Close → E_INVALIDARG).
-        if let Some(tp) = super::real::two_pass_of(real) {
+        if let Some(tp) = super::real::two_pass_of_exact(real) {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -945,7 +945,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<(ID3D12GraphicsCommandList
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
-                    super::real::two_pass_of(real).is_some(),
+                    super::real::two_pass_of_exact(real).is_some(),
                     super::present::rt0_resource(this as usize).map(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) }))
                 );
             }
@@ -1277,7 +1277,7 @@ fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], 
     if flags & DISPATCH_THREAD_DIMENSIONS == 0 {
         return Some((dims, [0; 3]));
     }
-    let threads = super::real::pso_threads(pso)?.map(|t| t.max(1));
+    let threads = super::real::pso_threads_exact(pso)?.map(|t| t.max(1));
     let groups = std::array::from_fn(|k| dims[k].div_ceil(threads[k]));
     let limits = std::array::from_fn(|k| if dims[k] % threads[k] != 0 { dims[k] } else { 0 });
     Some((groups, limits))
@@ -1530,18 +1530,6 @@ fn prepared_abi_io(
     io
 }
 
-unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    let pso = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
-    bind_abi_resolved(this, list, pso, gfx)
-}
-
-unsafe fn bind_abi_with_root(
-    this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
-) -> Result<(), String> {
-    let pso = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
-    bind_abi_with_root_resolved(this, list, pso, gfx, root, None, [0; 3]).map(|_| ())
-}
-
 unsafe fn bind_abi_resolved(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
     bind_abi_with_root_resolved(this, list, pso, gfx, 0, None, [0; 3]).map(|_| ())
 }
@@ -1572,7 +1560,7 @@ unsafe fn bind_abi_with_root_resolved(
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
-    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(pso) };
+    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs_exact(pso) };
     let prepared = prepare_abi_state(this, u, gfx, user_sgprs)?;
     let PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator } = prepared;
     std::ptr::copy_nonoverlapping(args[inline..].as_ptr(), table_at as *mut u8, args.len() - inline);
@@ -1582,7 +1570,7 @@ unsafe fn bind_abi_with_root_resolved(
     std::ptr::write_bytes(res_at as *mut u8, 0, 256);
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = (root != 0).then_some(root)
-        .or_else(|| super::real::pso_root_signature(pso))
+        .or_else(|| super::real::pso_root_signature_exact(pso))
         .or_else(|| super::real::abi_rs_cached().map(|p| p as usize))
         .ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
@@ -2726,6 +2714,30 @@ void main(uint t : SV_GroupIndex) {
 
         let graphics = prepared_abi_io(None, &[], 0x1234_2000, true, None, 0, [9, 8, 7]);
         assert_eq!([graphics[slots[0]], graphics[slots[1]], graphics[slots[2]]], [0; 3]);
+    }
+
+    #[test]
+    fn resolved_compute_metadata_does_not_follow_a_reused_native_address() {
+        let exact = 0x7301_3000usize;
+        let replacement = 0x7301_4000usize;
+        real::register_compute_metadata_for_test(exact, 6, [4, 2, 1], (2, 0), 0x7301_5000);
+        real::register_compute_metadata_for_test(replacement, 9, [8, 1, 1], (3, 1), 0x7301_6000);
+        pso_async::submit_lazy(exact, true, Box::new(move || replacement), 0);
+        assert_eq!(pso_async::resolve_wait(exact), replacement);
+
+        assert_eq!(real::pso_threads(exact), Some([8, 1, 1]),
+            "the title-address accessor should still resolve an active stand-in");
+        assert_eq!(real::pso_threads_exact(exact), Some([4, 2, 1]));
+        assert_eq!(real::pso_user_sgprs_exact(exact), Some(6));
+        assert_eq!(real::pso_dispatch_remap_exact(exact), Some((2, 0)));
+        assert_eq!(real::pso_root_signature_exact(exact), Some(0x7301_5000));
+        assert_eq!(dispatch_groups(exact, [8, 4, 1], DISPATCH_THREAD_DIMENSIONS),
+            Some(([2, 2, 1], [0; 3])),
+            "an already-selected native generation was redirected through PENDING");
+
+        assert_eq!(pso_async::released(exact), replacement);
+        real::forget_pso_for_test(exact);
+        real::forget_pso_for_test(replacement);
     }
 
     #[test]
