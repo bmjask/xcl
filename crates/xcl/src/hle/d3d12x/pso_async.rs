@@ -2204,6 +2204,9 @@ impl<const R: usize> RestorationTicket<R> {
 
     /// Waits only on this queue job, with no Build, recipe, ledger, list, or coordinator lock.
     fn wait_and_take_pin(&self) -> Result<NativeGeneration, RehydrateCompletion> {
+        let waiting = self.attempt.outcome.lock().unwrap().is_none();
+        let _pipeline_wait = waiting.then(|| crate::stall::span(crate::stall::StallKind::PipelineWait)).flatten();
+        let _restoration_wait = waiting.then(|| crate::stall::span(crate::stall::StallKind::PipelineRestoreWait)).flatten();
         let mut job = self.attempt.job.lock().unwrap();
         while job.is_none() && self.attempt.outcome.lock().unwrap().is_none() {
             job = self.attempt.submitted.wait(job).unwrap();
@@ -8268,6 +8271,7 @@ impl RestorationDemand<PIPELINE_RESOLUTION_RECEIPTS> {
             return DeferredDemand::Ready(pin);
         }
         let requested = self.requested.get_or_init(|| {
+            let _demand = crate::stall::span(crate::stall::StallKind::PipelineRestoreDemand);
             if let Some(pin) = Self::resident(pending) {
                 return DeferredDemand::Ready(pin);
             }
@@ -8301,6 +8305,7 @@ fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator
 }
 
 fn reconcile_pipeline_restorations() {
+    let _reconcile = crate::stall::span(crate::stall::StallKind::PipelineRestoreReconcile);
     let _ = pipeline_restoration_coordinator().reconcile(PIPELINE_RESOLUTION_RECEIPTS);
 }
 
