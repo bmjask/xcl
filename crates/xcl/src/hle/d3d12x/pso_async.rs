@@ -30,6 +30,62 @@ pub struct RankedPreloadStats {
     pub promoted: u64,
 }
 
+/// Rare-path pressure lifecycle totals. Each field is a relaxed cumulative counter, so a snapshot
+/// across fields is approximate. A released generation owner means XCL issued that COM owner's
+/// `Release`; it does not prove the driver immediately reclaimed the allocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct PipelinePressureStats {
+    pub publications_detached: u64,
+    pub policy_owner_retirements: u64,
+    pub generation_owners_released: u64,
+    /// Unique exact restoration jobs accepted by the process coordinator; coalescing is excluded.
+    pub restoration_attempts: u64,
+    pub restoration_succeeded: u64,
+    pub restoration_failed: u64,
+}
+
+#[derive(Default)]
+struct PipelinePressureCounters {
+    publications_detached: AtomicU64,
+    policy_owner_retirements: AtomicU64,
+    generation_owners_released: AtomicU64,
+    restoration_attempts: AtomicU64,
+    restoration_succeeded: AtomicU64,
+    restoration_failed: AtomicU64,
+}
+
+impl PipelinePressureCounters {
+    fn snapshot(&self) -> PipelinePressureStats {
+        PipelinePressureStats {
+            publications_detached: self.publications_detached.load(Ordering::Relaxed),
+            policy_owner_retirements: self.policy_owner_retirements.load(Ordering::Relaxed),
+            generation_owners_released: self.generation_owners_released.load(Ordering::Relaxed),
+            restoration_attempts: self.restoration_attempts.load(Ordering::Relaxed),
+            restoration_succeeded: self.restoration_succeeded.load(Ordering::Relaxed),
+            restoration_failed: self.restoration_failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn pressure_counters() -> Arc<PipelinePressureCounters> {
+    static COUNTERS: OnceLock<Arc<PipelinePressureCounters>> = OnceLock::new();
+    COUNTERS.get_or_init(|| Arc::new(PipelinePressureCounters::default())).clone()
+}
+
+pub fn pipeline_pressure_stats() -> PipelinePressureStats { pressure_counters().snapshot() }
+
+fn pressure_observation_line(
+    observation: PressureObservation, stats: PipelinePressureStats,
+) -> String {
+    format!(
+        "{}; cumulative: {} detached, {} policy owners retired, {} generation owners released, {} restoration attempts ({} succeeded, {} failed)",
+        observation.line(), stats.publications_detached, stats.policy_owner_retirements,
+        stats.generation_owners_released, stats.restoration_attempts,
+        stats.restoration_succeeded, stats.restoration_failed,
+    )
+}
+
 struct Pending {
     build: Arc<Build>,
     /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
@@ -1748,9 +1804,8 @@ pub(crate) fn observe_pressure_turn(
             ),
         }
     };
-    let line = observation.line();
-    if let Some(detached) = detached { detached.retire() }
-    Some(line)
+    if let Some(detached) = detached { detached.retire_pressure(pressure_counters()) }
+    Some(pressure_observation_line(observation, pipeline_pressure_stats()))
 }
 
 #[allow(dead_code)]
@@ -2067,6 +2122,7 @@ struct RestorationCoordinator<const E: usize, const R: usize> {
     receipts: Arc<RehydrateReceiptRegistry<R>>,
     admission: Mutex<()>,
     attempts: Mutex<Vec<Arc<RestorationAttempt>>>,
+    pressure_stats: Option<Arc<PipelinePressureCounters>>,
     #[cfg(test)]
     captured: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
     #[cfg(test)]
@@ -2177,6 +2233,15 @@ impl DetachedExactEviction {
     /// Native destruction may re-enter pipeline bookkeeping. The transaction returns every owner
     /// so its caller can retire them only after releasing policy, admission, and state locks.
     fn retire(mut self) { self.release_owners(); }
+
+    fn retire_pressure(mut self, counters: Arc<PipelinePressureCounters>) {
+        counters.publications_detached.fetch_add(1, Ordering::Relaxed);
+        if let Some(pins) = self.pins.as_ref() {
+            pins[0].generation.pressure_release.arm(counters.clone());
+        }
+        self.release_owners();
+        counters.policy_owner_retirements.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn release_owners(&mut self) {
         drop(self.pins.take());
@@ -2331,12 +2396,43 @@ struct RestorationAttempt {
     submitted: Condvar,
     foreground: AtomicBool,
     outcome: Mutex<Option<RestorationOutcome>>,
+    pressure_stats: Option<Arc<PipelinePressureCounters>>,
+    pressure_reported: AtomicBool,
 }
 
 #[allow(dead_code)]
 enum RestorationOutcome {
     Failed(RehydrateCompletion),
     Succeeded(NativeGeneration),
+}
+
+impl RestorationAttempt {
+    fn report_terminal(&self, succeeded: bool) {
+        if self.pressure_reported.compare_exchange(
+            false, true, Ordering::AcqRel, Ordering::Acquire,
+        ).is_err() {
+            return;
+        }
+        if let Some(stats) = &self.pressure_stats {
+            let counter = if succeeded {
+                &stats.restoration_succeeded
+            } else {
+                &stats.restoration_failed
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn finish(&self, outcome: RestorationOutcome) {
+        let succeeded = matches!(outcome, RestorationOutcome::Succeeded(_));
+        let mut current = self.outcome.lock().unwrap();
+        if current.is_some() {
+            return;
+        }
+        *current = Some(outcome);
+        drop(current);
+        self.report_terminal(succeeded);
+    }
 }
 
 #[derive(Clone)]
@@ -2362,11 +2458,18 @@ struct RestorationQueued<'a, const E: usize, const R: usize> {
 #[allow(dead_code)]
 impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
     fn new(generation: u64) -> Option<Self> {
+        Self::new_with_pressure_stats(generation, None)
+    }
+
+    fn new_with_pressure_stats(
+        generation: u64, pressure_stats: Option<Arc<PipelinePressureCounters>>,
+    ) -> Option<Self> {
         Some(Self {
             evicted: EvictedBuildLedger::new(generation)?,
             receipts: Arc::new(RehydrateReceiptRegistry::new()?),
             admission: Mutex::new(()),
             attempts: Mutex::new(Vec::new()),
+            pressure_stats,
             #[cfg(test)]
             captured: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2441,12 +2544,17 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
                 _ => None,
             };
             if let Some(completion) = completion {
-                let _ = self.receipts.publish(&attempt.token, completion);
+                if self.receipts.publish(&attempt.token, completion) {
+                    attempt.report_terminal(false);
+                }
             }
         }
         let records = self.receipts.records(limit);
         let mut reconciled = 0;
         for record in records.into_iter().filter(|record| record.state.terminal()) {
+            if let Some(attempt) = attempts.iter().find(|attempt| attempt.token.exact(&record.token)) {
+                attempt.report_terminal(matches!(record.state, RehydrateCompletion::Succeeded { .. }));
+            }
             let token = &record.token.evicted;
             let ok = match record.state {
                 RehydrateCompletion::Refused => self.evicted.rehydrate_retry(token)
@@ -2521,15 +2629,19 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
             Ok(None) => return None,
         };
         let token = receipt.accepted_token(priority)?;
+        if let Some(stats) = &self.pressure_stats {
+            stats.restoration_attempts.fetch_add(1, Ordering::Relaxed);
+        }
         let attempt = Arc::new(RestorationAttempt {
             token: token.clone(), job: Mutex::new(None), submitted: Condvar::new(),
             foreground: AtomicBool::new(priority == RehydratePriority::Foreground), outcome: Mutex::new(None),
+            pressure_stats: self.pressure_stats.clone(), pressure_reported: AtomicBool::new(false),
         });
         self.attempts.lock().unwrap().push(attempt.clone());
         drop(admission);
         if !self.evicted.rehydrate_queued(evicted) {
             let _ = self.receipts.publish(&token, RehydrateCompletion::Cancelled);
-            *attempt.outcome.lock().unwrap() = Some(RestorationOutcome::Failed(RehydrateCompletion::Cancelled));
+            attempt.finish(RestorationOutcome::Failed(RehydrateCompletion::Cancelled));
             attempt.submitted.notify_all();
             return Some(RestorationTicket { receipts: self.receipts.clone(), attempt });
         }
@@ -2542,7 +2654,7 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
                     RehydrateCompletion::Cancelled
                 };
                 let _ = self.receipts.publish(&token, completion);
-                *attempt.outcome.lock().unwrap() = Some(RestorationOutcome::Failed(completion));
+                attempt.finish(RestorationOutcome::Failed(completion));
                 attempt.submitted.notify_all();
                 return Some(RestorationTicket { receipts: self.receipts.clone(), attempt });
             }
@@ -2581,7 +2693,7 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
             if let RestorationOutcome::Failed(completion) = &outcome {
                 let _ = receipts.publish(&token, *completion);
             }
-            *worker_attempt.outcome.lock().unwrap() = Some(outcome);
+            worker_attempt.finish(outcome);
         }));
         match job {
             Some(job) => {
@@ -2591,7 +2703,7 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
             }
             None => {
                 let _ = self.receipts.publish(&attempt.token, RehydrateCompletion::Refused);
-                *attempt.outcome.lock().unwrap() = Some(RestorationOutcome::Failed(RehydrateCompletion::Refused));
+                attempt.finish(RestorationOutcome::Failed(RehydrateCompletion::Refused));
                 attempt.submitted.notify_all();
             }
         }
@@ -2631,7 +2743,9 @@ impl<const R: usize> RestorationTicket<R> {
                     _ => RehydrateCompletion::Cancelled,
                 };
                 drop(outcome);
-                let _ = self.receipts.publish(&self.attempt.token, completion);
+                if self.receipts.publish(&self.attempt.token, completion) {
+                    self.attempt.report_terminal(false);
+                }
                 Err(completion)
             }
         }
@@ -2995,6 +3109,23 @@ struct Generation<T> {
     id: u64,
     raw: usize,
     _owner: T,
+    // Declared after `_owner`: its drop records only after that generation owner's COM Release.
+    pressure_release: GenerationPressureRelease,
+}
+
+#[derive(Default)]
+struct GenerationPressureRelease(OnceLock<Arc<PipelinePressureCounters>>);
+
+impl GenerationPressureRelease {
+    fn arm(&self, counters: Arc<PipelinePressureCounters>) { let _ = self.0.set(counters); }
+}
+
+impl Drop for GenerationPressureRelease {
+    fn drop(&mut self) {
+        if let Some(counters) = self.0.get() {
+            counters.generation_owners_released.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 struct GenerationSlot<T> {
@@ -3018,7 +3149,9 @@ enum Residency {
 impl<T> GenerationSlot<T> {
     fn publish(&mut self, raw: usize, owner: T) -> (Arc<Generation<T>>, Option<Arc<Generation<T>>>) {
         self.next = self.next.checked_add(1).expect("pipeline generation id exhausted");
-        let generation = Arc::new(Generation { id: self.next, raw, _owner: owner });
+        let generation = Arc::new(Generation {
+            id: self.next, raw, _owner: owner, pressure_release: Default::default(),
+        });
         let replaced = self.resident.replace(generation.clone());
         self.residency = Residency::Resident;
         (generation, replaced)
@@ -3118,7 +3251,9 @@ impl Build {
             None => {
                 let p = raw as *mut std::ffi::c_void;
                 let owner = unsafe { ID3D12PipelineState::from_raw_borrowed(&p) }?.clone();
-                let generation = Arc::new(Generation { id: 1, raw, _owner: owner });
+                let generation = Arc::new(Generation {
+                    id: 1, raw, _owner: owner, pressure_release: Default::default(),
+                });
                 *cached = Some(generation.clone());
                 generation
             }
@@ -4060,6 +4195,7 @@ mod used_tests {
         admission: *const Mutex<()>,
         timestamp_access: *const AtomicUsize,
         observer: *const Mutex<PressureObserver>,
+        pressure_stats: *const PipelinePressureCounters,
     }
 
     static PIPELINE_RESTORATION_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -4085,6 +4221,10 @@ mod used_tests {
                 if !probe.observer.is_null() {
                     assert!((&*probe.observer).try_lock().is_ok(),
                         "final native drop ran under the pressure observer lock");
+                }
+                if !probe.pressure_stats.is_null() {
+                    assert_eq!((&*probe.pressure_stats).generation_owners_released.load(Ordering::Relaxed), 0,
+                        "generation release was counted before its COM owner dropped");
                 }
             });
         }
@@ -4832,7 +4972,10 @@ mod used_tests {
         let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
         let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
         let first_pin = recipe.pin_with_residency(first_raw).0.unwrap();
-        let coordinator = RestorationCoordinator::<2, 2>::new(401).unwrap();
+        let pressure_stats = Arc::new(PipelinePressureCounters::default());
+        let coordinator = RestorationCoordinator::<2, 2>::new_with_pressure_stats(
+            401, Some(pressure_stats.clone()),
+        ).unwrap();
         let evicted = coordinator.reserve_eviction(&build, first_pin.ledger_identity()).unwrap().arm_detach().unwrap();
         drop(first_pin);
         assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
@@ -4859,10 +5002,16 @@ mod used_tests {
         let pin = foreground.wait_and_take_pin().unwrap();
         assert_eq!((pin.raw(), pin.id(), calls.load(Ordering::Relaxed)), (replacement_raw, 2, 2));
         assert_eq!(pin.raw(), replacement_raw, "a second detach invalidated the handed-off generation");
+        drop(background.wait_and_take_pin().unwrap());
 
         drop(background); drop(foreground); drop(pin);
         RESTORE_REENTER_ATTEMPTS.with(|address| address.set(&coordinator.attempts as *const _ as usize));
         assert_eq!(coordinator.reconcile(2), 1);
+        assert_eq!(pressure_stats.snapshot(), PipelinePressureStats {
+            restoration_attempts: 1,
+            restoration_succeeded: 1,
+            ..Default::default()
+        }, "foreground promotion counted a duplicate restoration attempt or outcome");
         RESTORE_REENTER_ATTEMPTS.with(|address| address.set(0));
         drop(coordinator); drop(build); drop(recipe);
         assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
@@ -4873,7 +5022,10 @@ mod used_tests {
         let recipe = Recipe::new(|| 0);
         let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe)));
         let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
-        let coordinator = RestorationCoordinator::<1, 1>::new(402).unwrap();
+        let pressure_stats = Arc::new(PipelinePressureCounters::default());
+        let coordinator = RestorationCoordinator::<1, 1>::new_with_pressure_stats(
+            402, Some(pressure_stats.clone()),
+        ).unwrap();
         let evicted = coordinated_evicted(&coordinator, &build, 60);
 
         let refused = BuildQueue::new(); refused.shutdown();
@@ -4891,7 +5043,8 @@ mod used_tests {
         let panicked = BuildQueue::new();
         let panic_ticket = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &panicked).unwrap();
         assert!(panicked.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
-        assert!(matches!(panic_ticket.wait_and_take_pin(), Err(RehydrateCompletion::Panicked))); assert_eq!(coordinator.reconcile(1), 1);
+        assert_eq!(coordinator.reconcile(1), 1, "an unwaited panic was not reconciled");
+        assert!(matches!(panic_ticket.wait_and_take_pin(), Err(RehydrateCompletion::Panicked)));
         let retry_q = BuildQueue::new();
         let retry = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &retry_q).unwrap();
         assert!(retry_q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
@@ -4901,6 +5054,11 @@ mod used_tests {
         build.owners.store(0, Ordering::Release);
         assert!(released_q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
         assert!(matches!(released.wait_and_take_pin(), Err(RehydrateCompletion::Released))); assert_eq!(coordinator.reconcile(1), 1);
+        assert_eq!(pressure_stats.snapshot(), PipelinePressureStats {
+            restoration_attempts: 6,
+            restoration_failed: 6,
+            ..Default::default()
+        }, "terminal restoration attempts were missed or counted more than once");
     }
 
     fn structured_pending(build: Arc<Build>, compute: bool) -> Arc<Pending> {
@@ -5447,11 +5605,15 @@ mod used_tests {
             ID3D12PipelineState::from_raw((raw as *mut RebuildFakePso).cast::<std::ffi::c_void>())
         };
         let first = NativeGeneration {
-            generation: Arc::new(Generation { id: 1, raw: first_raw, _owner: owner(first_raw) }),
+            generation: Arc::new(Generation {
+                id: 1, raw: first_raw, _owner: owner(first_raw), pressure_release: Default::default(),
+            }),
             recipe: Weak::new(),
         };
         let second = NativeGeneration {
-            generation: Arc::new(Generation { id: 2, raw: second_raw, _owner: owner(second_raw) }),
+            generation: Arc::new(Generation {
+                id: 2, raw: second_raw, _owner: owner(second_raw), pressure_release: Default::default(),
+            }),
             recipe: Weak::new(),
         };
         let promoted = Arc::new(OnceLock::new());
@@ -6421,6 +6583,7 @@ mod used_tests {
             admission: &coordinator.admission,
             timestamp_access: &build.eviction_timestamp_access,
             observer: std::ptr::null(),
+            pressure_stats: std::ptr::null(),
         };
         EVICTION_RELEASE_PROBE.with(|address| address.set(&probe as *const _ as usize));
         let limits = EvictionSelectionLimits {
@@ -6435,6 +6598,61 @@ mod used_tests {
         EVICTION_RELEASE_PROBE.with(|address| address.set(0));
         assert!(panicked.is_err());
         assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+        let token = build.eviction_token().unwrap();
+        assert!(build.clear_eviction_token(&token));
+        assert!(coordinator.evicted.finish(&token, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&token));
+    }
+
+    #[test]
+    fn pressure_lifecycle_distinguishes_detach_retirement_and_final_generation_release() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_reenter_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = completed_recipe_build(&recipe);
+        let retained = recipe.pin_with_residency(raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<1, 1>::new(1).unwrap();
+        let limits = EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        };
+        let ExactDetachAttempt::Detached(detached) = detach_exact_eviction_on(
+            selected_candidate(&build), 1, limits, &coordinator, || {}, || {},
+        ) else { panic!("exact detachment aborted") };
+        let stats = Arc::new(PipelinePressureCounters::default());
+        let probe = EvictionReleaseProbe {
+            done: &build.done,
+            rebuild: &recipe.0.rebuild,
+            generation: &recipe.0.generation,
+            admission: &coordinator.admission,
+            timestamp_access: &build.eviction_timestamp_access,
+            observer: std::ptr::null(),
+            pressure_stats: Arc::as_ptr(&stats),
+        };
+        EVICTION_RELEASE_PROBE.with(|address| address.set(&probe as *const _ as usize));
+        detached.retire_pressure(stats.clone());
+        assert_eq!(stats.snapshot(), PipelinePressureStats {
+            publications_detached: 1,
+            policy_owner_retirements: 1,
+            ..Default::default()
+        });
+        let line = pressure_observation_line(PressureObservation {
+            policy: PressurePolicyMode::Active,
+            mode: PressureMode::Evicting,
+            evicted: 1,
+            attempted: 1,
+            ..Default::default()
+        }, stats.snapshot());
+        assert!(line.ends_with(
+            "cumulative: 1 detached, 1 policy owners retired, 0 generation owners released, 0 restoration attempts (0 succeeded, 0 failed)"
+        ), "pressure line did not snapshot lifecycle counters after owner retirement: {line}");
+        assert_eq!(native.refs.load(Ordering::Relaxed), 1,
+            "policy retirement released a generation still retained by recorded work");
+        drop(retained);
+        assert_eq!(stats.generation_owners_released.load(Ordering::Relaxed), 1);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+        EVICTION_RELEASE_PROBE.with(|address| address.set(0));
+
         let token = build.eviction_token().unwrap();
         assert!(build.clear_eviction_token(&token));
         assert!(coordinator.evicted.finish(&token, EvictedBuildState::Poisoned));
@@ -6720,6 +6938,7 @@ mod used_tests {
             admission: &coordinator.admission,
             timestamp_access: &builds[evicted].eviction_timestamp_access,
             observer: &observer,
+            pressure_stats: std::ptr::null(),
         };
         EVICTION_RELEASE_PROBE.with(|address| address.set(&release_probe as *const _ as usize));
         detached.unwrap().retire();
@@ -9543,7 +9762,8 @@ impl RestorationDemand<PIPELINE_RESOLUTION_RECEIPTS> {
 fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator {
     static COORDINATOR: OnceLock<PipelineRestorationCoordinator> = OnceLock::new();
     COORDINATOR.get_or_init(|| {
-        PipelineRestorationCoordinator::new(1).expect("nonzero pipeline restoration capacities")
+        PipelineRestorationCoordinator::new_with_pressure_stats(1, Some(pressure_counters()))
+            .expect("nonzero pipeline restoration capacities")
     })
 }
 
@@ -9982,6 +10202,7 @@ impl NativeGenerationBenchSet {
                     id: index as u64 + 1,
                     raw: raw as usize,
                     _owner: raw_owner.clone(),
+                    pressure_release: Default::default(),
                 }),
                 recipe: Weak::new(),
             })

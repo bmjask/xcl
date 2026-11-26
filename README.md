@@ -361,6 +361,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     pipeline unused for 600 frames and resident for 60 frames is evicted per sample (at most 32
     candidates scanned and 8 exact transactions attempted); demand restores its exact identity.
     Eviction stops below 75% of budget. This experimental opt-in takes precedence over observe mode.
+    `report.json` records cumulative detach, owner-retirement and restoration totals under
+    `d3d12.pipeline_pressure`. A generation-owner release means XCL issued COM `Release`; it does
+    not prove that the driver immediately reclaimed the allocation or video memory.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
