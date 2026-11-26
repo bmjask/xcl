@@ -4813,7 +4813,7 @@ mod used_tests {
         let recipe = Recipe::new(move || raw);
         let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
         let old = structured_pending(build.clone(), false);
-        let resolution = PipelineResolution(classify_retained(original, &old));
+        let resolution = PipelineResolution(classify_retained(original, &old), old.compute);
         let replacement = structured_pending(
             Arc::new(Build::new(Box::new(|| panic!("replacement build ran")), false)), false,
         );
@@ -4877,10 +4877,16 @@ mod used_tests {
         let pending = structured_pending(build.clone(), false);
         assert!(PENDING.insert(original, pending.clone()).is_none());
         let resolution = begin_pipeline_resolution(original).expect("unfinished pipeline");
+        let indirect_clone = resolution.clone();
         assert!(resolution.submit_demand_pending());
 
         let job = build.job.lock().unwrap().take().unwrap();
         complete(&build, job());
+        let IndirectPipelineChoice::Exact { generation: indirect_first, .. } = resolution.resolve_for_indirect()
+            else { panic!("completed initial indirect pipeline was unavailable") };
+        let IndirectPipelineChoice::Exact { generation: indirect_second, .. } = indirect_clone.resolve_for_indirect()
+            else { panic!("cloned indirect resolution lost its promoted winner") };
+        assert!(indirect_first.same(&indirect_second));
         let PipelineChoice::Available { generation: first, .. } = resolution.resolve_for_emission()
             else { panic!("completed initial pipeline was unavailable") };
         let PipelineChoice::Available { generation: second, .. } = resolution.resolve_for_emission()
@@ -4909,7 +4915,7 @@ mod used_tests {
         assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement));
         release(raw_owner);
         drop(exact); drop(nonblocking); drop(retained); drop(reset); drop(second); drop(first);
-        drop(resolution); drop(pending); drop(build);
+        drop(indirect_second); drop(indirect_first); drop(indirect_clone); drop(resolution); drop(pending); drop(build);
         assert_eq!(native.refs.load(Ordering::Relaxed), 0);
     }
 
@@ -4917,13 +4923,106 @@ mod used_tests {
     fn initial_pending_probe_does_not_take_the_completion_lock() {
         let build = Arc::new(Build::new(Box::new(|| 0), false));
         let pending = structured_pending(build.clone(), true);
-        let resolution = PipelineResolution(StructuredResolve::initial(0x7E57_D01B, pending, 0x7E57_D01B, true));
+        let resolution = PipelineResolution(StructuredResolve::initial(0x7E57_D01B, pending, 0x7E57_D01B, true), true);
         let done = build.done.lock().unwrap();
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || tx.send(resolution.submit_demand_pending()).unwrap());
         assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("completion probe took the done lock"));
         drop(done);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn indirect_resolution_preserves_compute_kind_and_bounded_initial_fallback() {
+        assert!(pipeline_resolution_for_compute_test(0x7E57_D01A, || {}).is_compute());
+        let original = 0x7E57_D01Cusize;
+        let finish = Arc::new(AtomicBool::new(false));
+        let build_finish = finish.clone();
+        let build = Arc::new(Build::new(Box::new(move || {
+            while !build_finish.load(Ordering::Acquire) { std::thread::yield_now(); }
+            0
+        }), false));
+        let pending = structured_pending(build.clone(), true);
+        PENDING.insert(original, pending.clone());
+        let resolution = begin_pipeline_resolution(original).unwrap();
+        let replacement = structured_pending(
+            Arc::new(Build::new(Box::new(|| panic!("replacement build ran")), false)), false,
+        );
+        PENDING.insert(original, replacement.clone());
+        assert!(resolution.is_compute(), "address reuse changed the retained pipeline kind");
+        assert!(resolution.clone().is_compute(), "a clone lost the retained pipeline kind");
+
+        assert!(matches!(
+            resolution.resolve_for_indirect_with_budget(Some(std::time::Duration::ZERO)),
+            IndirectPipelineChoice::InitialFallback { raw, bound_unbuilt: true } if raw == original
+        ));
+        assert!(!*replacement.build.done.lock().unwrap());
+        assert!(replacement.build.job.lock().unwrap().is_some(), "fallback consulted the reused address");
+
+        finish.store(true, Ordering::Release);
+        let mut done = build.done.lock().unwrap();
+        while !*done { done = build.cv.wait(done).unwrap(); }
+        drop(done);
+        assert!(matches!(
+            resolution.resolve_for_indirect(),
+            IndirectPipelineChoice::InitialFallback { raw, bound_unbuilt: false } if raw == original
+        ), "a completed initial build failure did not preserve its ordinary stand-in result");
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement));
+    }
+
+    #[test]
+    fn indirect_resolution_rejects_released_and_stale_initial_fallbacks() {
+        let released_build = Arc::new(Build::new(Box::new(|| panic!("released build ran")), false));
+        let released_pending = structured_pending(released_build.clone(), true);
+        let released = PipelineResolution(
+            classify_retained(0x7E57_D01D, &released_pending), released_pending.compute,
+        );
+        released_build.owners.store(0, Ordering::Release);
+        assert!(matches!(released.resolve_for_indirect(), IndirectPipelineChoice::Unavailable));
+        released_build.owners.store(1, Ordering::Release);
+        released_build.orphan.store(true, Ordering::Release);
+        assert!(matches!(released.resolve_for_indirect(), IndirectPipelineChoice::Unavailable));
+
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let pending = structured_pending(build.clone(), true);
+        let stale = PipelineResolution(classify_retained(0x7E57_D01E, &pending), pending.compute);
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        let ready = PipelineResolution(classify_retained(0x7E57_D01F, &pending), pending.compute);
+        assert!(ready.is_compute() && ready.clone().is_compute(), "a ready snapshot lost compute kind");
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        assert!(matches!(stale.resolve_for_indirect(), IndirectPipelineChoice::Unavailable),
+            "an evicted initial generation escaped as its stand-in fallback");
+        drop(ready); drop(stale); drop(pending); drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn indirect_resolution_revalidates_release_after_wait() {
+        let original = 0x7E57_D022usize;
+        let started = Arc::new(AtomicBool::new(false));
+        let finish = Arc::new(AtomicBool::new(false));
+        let (build_started, build_finish) = (started.clone(), finish.clone());
+        let build = Arc::new(Build::new(Box::new(move || {
+            build_started.store(true, Ordering::Release);
+            while !build_finish.load(Ordering::Acquire) { std::thread::yield_now(); }
+            0
+        }), false));
+        let pending = structured_pending(build.clone(), true);
+        assert!(PENDING.insert(original, pending.clone()).is_none());
+        let resolution = begin_pipeline_resolution(original).unwrap();
+        let waiter = std::thread::spawn(move || resolution.resolve_for_indirect_with_budget(None));
+        while !started.load(Ordering::Acquire) { std::thread::yield_now(); }
+        assert_eq!(released(original), 0);
+        assert_eq!(build.owners.load(Ordering::Acquire), 0);
+        assert!(build.orphan.load(Ordering::Acquire));
+        finish.store(true, Ordering::Release);
+        assert!(matches!(waiter.join().unwrap(), IndirectPipelineChoice::Unavailable),
+            "release during the wait escaped as an unpinned initial fallback");
     }
 
     #[test]
@@ -4991,7 +5090,7 @@ mod used_tests {
         drop(build.job.lock().unwrap().take());
         complete(&build, 0);
         let pending = structured_pending(build.clone(), false);
-        let resolution = PipelineResolution(classify_retained(original, &pending));
+        let resolution = PipelineResolution(classify_retained(original, &pending), pending.compute);
         assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Unavailable));
 
         let (published, replaced) = recipe.publish(raw);
@@ -5028,34 +5127,55 @@ mod used_tests {
             recipe: Weak::new(),
         };
         let promoted = Arc::new(OnceLock::new());
+        let indirect_promoted = Arc::new(OnceLock::new());
         let start = Arc::new(std::sync::Barrier::new(3));
         let choices = std::thread::scope(|scope| {
             let first_thread = {
-                let (promoted, start) = (promoted.clone(), start.clone());
+                let (promoted, indirect_promoted, start) =
+                    (promoted.clone(), indirect_promoted.clone(), start.clone());
                 scope.spawn(move || {
                     start.wait();
-                    promote_initial_choice(&promoted, PipelineChoice::Available { raw: first_raw, generation: first })
+                    let ordinary = promote_initial_choice(&promoted, PipelineChoice::Available {
+                        raw: first_raw, generation: first.clone(),
+                    });
+                    (ordinary, promote_indirect_initial_choice(&indirect_promoted, first))
                 })
             };
             let second_thread = {
-                let (promoted, start) = (promoted.clone(), start.clone());
+                let (promoted, indirect_promoted, start) =
+                    (promoted.clone(), indirect_promoted.clone(), start.clone());
                 scope.spawn(move || {
                     start.wait();
-                    promote_initial_choice(&promoted, PipelineChoice::Available { raw: second_raw, generation: second })
+                    let ordinary = promote_initial_choice(&promoted, PipelineChoice::Available {
+                        raw: second_raw, generation: second.clone(),
+                    });
+                    (ordinary, promote_indirect_initial_choice(&indirect_promoted, second))
                 })
             };
             start.wait();
             [first_thread.join().unwrap(), second_thread.join().unwrap()]
         });
-        let [PipelineChoice::Available { generation: first, .. }, PipelineChoice::Available { generation: second, .. }] = choices
+        let [(PipelineChoice::Available { generation: first, .. }, IndirectPipelineChoice::Exact { generation: indirect_first, .. }),
+            (PipelineChoice::Available { generation: second, .. }, IndirectPipelineChoice::Exact { generation: indirect_second, .. })] = choices
             else { panic!("a concurrent available choice became unavailable") };
         assert!(first.same(&second));
         assert!(first.same(promoted.get().unwrap()));
+        assert!(indirect_first.same(&indirect_second));
+        assert!(indirect_first.same(indirect_promoted.get().unwrap()));
+        let pending = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), true);
+        let IndirectPipelineChoice::Exact { generation: after_local_fallback, .. } =
+            finish_indirect_initial_choice(
+                &indirect_promoted, &pending,
+                IndirectPipelineChoice::InitialFallback { raw: 0xBAD, bound_unbuilt: true },
+            ) else { panic!("a local fallback hid the concurrently promoted winner") };
+        assert!(after_local_fallback.same(indirect_promoted.get().unwrap()));
         let PipelineChoice::Available { generation: after_local_failure, .. } =
             promote_initial_choice(&promoted, PipelineChoice::Unavailable)
             else { panic!("a local failure hid the concurrently promoted winner") };
         assert!(first.same(&after_local_failure));
-        drop(after_local_failure); drop(second); drop(first); drop(promoted);
+        drop(after_local_failure); drop(after_local_fallback); drop(pending);
+        drop(indirect_second); drop(indirect_first);
+        drop(second); drop(first); drop(indirect_promoted); drop(promoted);
         assert_eq!((first_native.refs.load(Ordering::Relaxed), second_native.refs.load(Ordering::Relaxed)), (0, 0));
     }
 
@@ -5105,7 +5225,7 @@ mod used_tests {
         let initial = build.job.lock().unwrap().take().unwrap();
         complete(&build, initial());
         let pending = structured_pending(build.clone(), false);
-        let resolution = PipelineResolution(classify_retained(0x7E57_D014, &pending));
+        let resolution = PipelineResolution(classify_retained(0x7E57_D014, &pending), pending.compute);
 
         next.store(second_raw, Ordering::Release);
         assert_eq!(rebuild_once(&build), Some(RebuildResult::Published { generation: 2 }));
@@ -5307,10 +5427,12 @@ mod used_tests {
         drop(pin); assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
         next.store(0, Ordering::Release);
         let pending = structured_pending(build.clone(), true);
-        let resolution = PipelineResolution(classify_retained(0x7E57_D020, &pending));
+        let resolution = PipelineResolution(classify_retained(0x7E57_D020, &pending), pending.compute);
+        assert!(matches!(&resolution.0, StructuredResolve::Deferred { .. }));
 
         assert!(resolution.need_by_submit());
-        assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Unavailable));
+        assert!(matches!(resolution.resolve_for_indirect(), IndirectPipelineChoice::Unavailable),
+            "failed exact restoration escaped through the initial fallback policy");
         assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted),
             "failed restoration was not returned to retryable eviction state");
         assert!(coordinator.receipts.records(1).is_empty(), "terminal failure receipt was not reconciled");
@@ -5318,9 +5440,9 @@ mod used_tests {
             "retryable failure lost its exact eviction identity");
 
         next.store(replacement_raw, Ordering::Release);
-        let retry = PipelineResolution(classify_retained(0x7E57_D021, &pending));
+        let retry = PipelineResolution(classify_retained(0x7E57_D021, &pending), pending.compute);
         assert!(retry.need_by_submit());
-        let PipelineChoice::Available { raw: retry_raw, generation: retry_generation } = retry.resolve_for_emission()
+        let IndirectPipelineChoice::Exact { raw: retry_raw, generation: retry_generation } = retry.resolve_for_indirect()
             else { panic!("second bind did not restore the exact recipe") };
         assert_eq!(retry_raw, replacement_raw);
         let PipelineChoice::Available { raw: first_raw, generation: first_generation } = resolution.resolve_for_emission()
@@ -8909,15 +9031,23 @@ fn reconcile_pipeline_restorations() {
 }
 
 /// Opaque retained resolver decision carried by command-list state.
+/// The bool is the Pending's immutable compute kind, retained even after address reuse/release.
 #[allow(dead_code)] // consumed by a later emission stage; retaining it pins exact identity now
 #[derive(Clone)]
-pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>);
+pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>, bool);
 
 /// Generation-aware emission result. `Unavailable` is fail-closed: emission must never recover
 /// by looking up the title address again after this retained identity was selected.
 #[allow(dead_code)] // consumed by the later command-list integration stage
 pub(super) enum PipelineChoice {
     Available { raw: usize, generation: NativeGeneration },
+    Unavailable,
+}
+
+#[allow(dead_code)] // consumed by the ExecuteIndirect integration stage
+pub(super) enum IndirectPipelineChoice {
+    Exact { raw: usize, generation: NativeGeneration },
+    InitialFallback { raw: usize, bound_unbuilt: bool },
     Unavailable,
 }
 
@@ -8930,17 +9060,66 @@ fn begin_pipeline_resolution_on<const E: usize>(
     coordinator: &RestorationCoordinator<E, PIPELINE_RESOLUTION_RECEIPTS>,
     q: &BuildQueue,
 ) -> PipelineResolution {
-    PipelineResolution(classify_structured_on(original, pending, coordinator, q))
+    PipelineResolution(classify_structured_on(original, pending, coordinator, q), pending.compute)
 }
 
 /// Classify a bind without waiting or running driver work. Worker startup, consumption of the
 /// decision, and pressure policy remain separate stages.
 pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResolution> {
     let pending = entry(original)?;
-    Some(PipelineResolution(classify_retained(original, &pending)))
+    Some(PipelineResolution(classify_retained(original, &pending), pending.compute))
 }
 
 impl PipelineResolution {
+    #[allow(dead_code)] // consumed by the ExecuteIndirect integration stage
+    pub(super) fn is_compute(&self) -> bool { self.1 }
+
+    #[allow(dead_code)] // consumed by the ExecuteIndirect integration stage
+    pub(super) fn resolve_for_indirect(&self) -> IndirectPipelineChoice {
+        self.resolve_for_indirect_with_budget(wait_budget())
+    }
+
+    fn resolve_for_indirect_with_budget(
+        &self, budget: Option<std::time::Duration>,
+    ) -> IndirectPipelineChoice {
+        if let StructuredResolve::Initial { original, pending, promoted, .. } = &self.0 {
+            if let Some(generation) = promoted.get() {
+                return IndirectPipelineChoice::Exact {
+                    raw: generation.raw(), generation: generation.clone(),
+                };
+            }
+            if pending.build.owners.load(Ordering::Acquire) == 0
+                || pending.build.orphan.load(Ordering::Acquire)
+            {
+                return IndirectPipelineChoice::Unavailable;
+            }
+            pending.note_use();
+            let bound = resolve_wait_pending(pending, *original, budget);
+            let bound_unbuilt = pending.bound_unbuilt(*original, bound);
+            let (raw, generation, stale_fallback) = pin_resolved(
+                *original, pending, bound, bound_unbuilt,
+            );
+            return match (generation, stale_fallback) {
+                (Some(generation), _) => {
+                    promote_indirect_initial_choice(promoted, generation)
+                }
+                (None, false) => finish_indirect_initial_choice(
+                    promoted, pending,
+                    IndirectPipelineChoice::InitialFallback { raw, bound_unbuilt },
+                ),
+                (None, true) => finish_indirect_initial_choice(
+                    promoted, pending, IndirectPipelineChoice::Unavailable,
+                ),
+            };
+        }
+        match self.resolve_for_emission() {
+            PipelineChoice::Available { raw, generation } => {
+                IndirectPipelineChoice::Exact { raw, generation }
+            }
+            PipelineChoice::Unavailable => IndirectPipelineChoice::Unavailable,
+        }
+    }
+
     /// Whether submit can move exact work off recording without looking up the title address.
     pub(super) fn submit_demand_pending(&self) -> bool {
         matches!(&self.0, StructuredResolve::Initial { pending, bound_unbuilt: true, promoted, .. }
@@ -9025,6 +9204,30 @@ impl PipelineResolution {
             | StructuredResolve::Terminal { .. } => PipelineChoice::Unavailable,
         }
     }
+}
+
+fn promote_indirect_initial_choice(
+    promoted: &OnceLock<NativeGeneration>, generation: NativeGeneration,
+) -> IndirectPipelineChoice {
+    let _ = promoted.set(generation);
+    let generation = promoted.get().expect("initial exact promotion").clone();
+    IndirectPipelineChoice::Exact { raw: generation.raw(), generation }
+}
+
+fn finish_indirect_initial_choice(
+    promoted: &OnceLock<NativeGeneration>, pending: &Pending, local: IndirectPipelineChoice,
+) -> IndirectPipelineChoice {
+    if let Some(generation) = promoted.get() {
+        return IndirectPipelineChoice::Exact {
+            raw: generation.raw(), generation: generation.clone(),
+        };
+    }
+    if pending.build.owners.load(Ordering::Acquire) == 0
+        || pending.build.orphan.load(Ordering::Acquire)
+    {
+        return IndirectPipelineChoice::Unavailable;
+    }
+    local
 }
 
 fn promote_initial_choice(
@@ -9163,18 +9366,18 @@ impl PipelineResolutionBench {
 
         let ready_pending = make_pending();
         finish(&ready_pending, raws[0]);
-        let retained_ready = PipelineResolution(classify_retained(raws[0] ^ 0x101, &ready_pending));
+        let retained_ready = PipelineResolution(classify_retained(raws[0] ^ 0x101, &ready_pending), ready_pending.compute);
         assert!(matches!(&retained_ready.0, StructuredResolve::Ready { .. }));
 
         let initial_pending = make_pending();
-        let initial_completed = PipelineResolution(classify_retained(raws[1] ^ 0x202, &initial_pending));
+        let initial_completed = PipelineResolution(classify_retained(raws[1] ^ 0x202, &initial_pending), initial_pending.compute);
         assert!(matches!(&initial_completed.0, StructuredResolve::Initial { .. }));
         finish(&initial_pending, raws[1]);
         let _ = Self::consume(initial_completed.resolve_for_emission());
 
         let make_unpromoted = || {
             let pending = make_pending();
-            let resolution = PipelineResolution(classify_retained(raws[1] ^ 0x303, &pending));
+            let resolution = PipelineResolution(classify_retained(raws[1] ^ 0x303, &pending), pending.compute);
             finish(&pending, raws[1]);
             resolution
         };
@@ -9277,6 +9480,23 @@ pub(super) fn pipeline_resolution_for_test(
     original: usize,
     on_drop: impl FnOnce() + Send + 'static,
 ) -> PipelineResolution {
+    pipeline_resolution_for_kind_test(original, false, on_drop)
+}
+
+#[cfg(test)]
+pub(super) fn pipeline_resolution_for_compute_test(
+    original: usize,
+    on_drop: impl FnOnce() + Send + 'static,
+) -> PipelineResolution {
+    pipeline_resolution_for_kind_test(original, true, on_drop)
+}
+
+#[cfg(test)]
+fn pipeline_resolution_for_kind_test(
+    original: usize,
+    compute: bool,
+    on_drop: impl FnOnce() + Send + 'static,
+) -> PipelineResolution {
     let probe = PipelineResolutionDropProbe(Some(Box::new(on_drop)));
     let build = Arc::new(Build::new(Box::new(move || {
         let _keep = &probe;
@@ -9285,13 +9505,13 @@ pub(super) fn pipeline_resolution_for_test(
     let pending = Arc::new(Pending {
         build,
         driver: AtomicUsize::new(0),
-        compute: false,
+        compute,
         key: 0,
         used: AtomicBool::new(false),
         late: AtomicBool::new(false),
         spared: AtomicBool::new(false),
     });
-    PipelineResolution(StructuredResolve::initial(original, pending, original, true))
+    PipelineResolution(StructuredResolve::initial(original, pending, original, true), compute)
 }
 
 #[cfg(test)]
