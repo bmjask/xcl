@@ -7060,6 +7060,45 @@ fn mesh_split_wave64_form() {
     assert!(super::translate_mesh(&lane, ms, true, true, 1).unwrap().hlsl.contains("xcl_x_rla_uniform("));
 }
 
+/// How the split halves meet (`x64_spin_for`): a group barrier in a hardware group of one
+/// console wave, bounded arrival counters in a group of several; `XCL_WAVE64_SPIN=1` forces
+/// the counters, while `=0` keeps the barrier where there is one console wave.
+#[test]
+fn split_wave64_meet_form_by_group_size() {
+    use super::emit::x64_spin_for;
+    use super::CsInterface;
+    for threads in [16u32, 32, 40, 64] {
+        assert!(!x64_spin_for(threads, None), "{threads}: barrier by default");
+        assert!(!x64_spin_for(threads, Some("0")), "{threads}: XCL_WAVE64_SPIN=0");
+        assert!(!x64_spin_for(threads, Some("")), "{threads}: XCL_WAVE64_SPIN empty");
+        assert!(x64_spin_for(threads, Some("1")), "{threads}: XCL_WAVE64_SPIN=1");
+        assert!(x64_spin_for(threads, Some(" 1 ")), "{threads}: XCL_WAVE64_SPIN=' 1 '");
+    }
+    for threads in [65u32, 96, 128, 256, 1024] {
+        for env in [None, Some("0"), Some("1")] {
+            assert!(x64_spin_for(threads, env), "{threads}, {env:?}: several console waves always spin");
+        }
+    }
+    // Force the unremapped form here so this verifies selection by hardware group size; remapped
+    // compute groups are one 64-thread console wave and are covered by the remap test below.
+    let env = std::env::var("XCL_WAVE64_SPIN").ok();
+    let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
+    for dims in [[64u32, 1, 1], [8, 8, 1], [4, 4, 4], [40, 1, 1], [256, 1, 1], [8, 8, 4]] {
+        let threads = dims.iter().product::<u32>();
+        let cs = CsInterface { threads: dims, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let t = translate(&lane, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, no_remap: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains(&format!("#define XCL_X_THREADS {threads}u")), "{dims:?}");
+        let want = x64_spin_for(threads, env.as_deref());
+        assert!(t.hlsl.contains(&format!("#define XCL_X_SPIN {}\n", want as u8)), "{dims:?}");
+    }
+    // A half without a partner (32 threads or fewer: `xcl_xn == 0`) leaves before either form.
+    let t = translate(&lane, &Options { mode: Mode::Compute(CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 }), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    let meet = &t.hlsl[t.hlsl.find("bool xcl_x_meet()").unwrap()..];
+    let (leave, spin, barrier) = (meet.find("if (xcl_xn == 0u) return false;").unwrap(), meet.find("#if XCL_X_SPIN").unwrap(), meet.find("GroupMemoryBarrierWithGroupSync();").unwrap());
+    assert!(leave < spin && spin < barrier);
+}
+
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
 /// exchanges: masks with bits in either half (counted, scanned, branched on), readlane /
 /// readfirstlane of a lane in the other half, ds_bpermute across the halves, a GLC scalar
@@ -7537,8 +7576,10 @@ fn gpu_split_wave64_waves_diverge() {
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        if runner::split_wave64() && t.dispatch_remap.is_none() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
-            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
+        if runner::split_wave64() {
+            let hw_threads = if t.dispatch_remap.is_some() { 64 } else { threads };
+            let spin = super::emit::x64_spin_for(hw_threads, std::env::var("XCL_WAVE64_SPIN").ok().as_deref());
+            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains(&format!("#define XCL_X_SPIN {}\n", spin as u8)), "{dims:?}");
         }
         let remap = if direct_enabled(&opt) { None } else { t.dispatch_remap };
         let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
@@ -7556,6 +7597,58 @@ fn gpu_split_wave64_waves_diverge() {
                 let at = (base + (g * 256 + tid) * 8) / 4;
                 assert_eq!(out[at], want, "{dims:?}, group {g} thread {tid}: loop of wave {w}");
                 assert_eq!(out[at + 1], (w * 64 + (l ^ 33)) as u32, "{dims:?}, group {g} thread {tid}: ds_bpermute");
+            }
+        }
+    }
+}
+
+/// Groups of one console wave (64 threads or fewer), which meet at a group barrier when split
+/// (`x64_spin_for`): an exchange, then odd groups end early (`s_endpgm` on a scalar branch),
+/// even ones exchange once more and store. Neither half may be left waiting at the barrier
+/// (that would hang the dispatch), and partial groups (40, 48 threads) meet like full ones.
+#[test]
+fn gpu_split_wave64_one_wave_groups_end_early() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    // s0 = output base, s2 = group id
+    let p = prog(&[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 0)], Some(1000)), // v1 = 1000 + thread
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)), // vcc = threads 0..39
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 106)], None),
+        ("S_AND_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 2), ("SSRC1", 129)], None), // scc = odd group
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 1), ("SRC1", 165)], None), // lane 37 (upper half)
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 20)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 21), ("VSRC1", 4)], None),
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 16), ("SSRC0", 2), ("SSRC1", 134)], None), // group · 64
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 16), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 130), ("VSRC1", 7)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 7)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for threads in [64u32, 48, 40] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            let spin = super::emit::x64_spin_for(threads, std::env::var("XCL_WAVE64_SPIN").ok().as_deref());
+            assert!(t.hlsl.contains(&format!("#define XCL_X_SPIN {}\n", spin as u8)), "{threads}");
+        }
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
+        let base = 0x100usize;
+        let groups = 64usize;
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * 64 * 4) / 4]).unwrap();
+        for g in 0..groups {
+            for tid in 0..64usize {
+                let want = if g % 2 == 1 || tid >= threads as usize { 0 } else { 40 + 1037 };
+                assert_eq!(out[(base + (g * 64 + tid) * 4) / 4], want, "{threads} threads, group {g} thread {tid}");
             }
         }
     }
@@ -7803,7 +7896,8 @@ fn wave_local_remap_decision_and_console_ids() {
         let t = translate_as(&store, threads, [true; 3], false);
         assert_eq!(t.dispatch_remap, remap, "{threads:?}");
         assert!(t.hlsl.contains(shape) && t.hlsl.contains(group_id), "{threads:?}");
-        assert!(t.hlsl.contains("#define XCL_X_SPIN 0"), "{threads:?}");
+        let spin = super::emit::x64_spin_for(64, std::env::var("XCL_WAVE64_SPIN").ok().as_deref());
+        assert!(t.hlsl.contains(&format!("#define XCL_X_SPIN {}\n", spin as u8)), "{threads:?}");
     }
     let barrier = prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]);
     let lds = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None)]);
@@ -7812,7 +7906,7 @@ fn wave_local_remap_decision_and_console_ids() {
     }
     let fallback = translate_as(&store, [128, 1, 1], [false; 3], true);
     assert_eq!(fallback.dispatch_remap, None);
-    assert!(fallback.hlsl.contains("numthreads(128, 1, 1)") && fallback.hlsl.contains("#define XCL_X_SPIN 1"));
+    assert!(fallback.hlsl.contains("numthreads(128, 1, 1)") && fallback.hlsl.contains("#define XCL_X_SPIN 1\n"));
 }
 
 #[test]
@@ -7901,6 +7995,7 @@ fn bench_split_wave64() {
         for threads in [64u32, 256] {
             let mut ms = Vec::new();
             let mut exchanges = 0;
+            let mut spin = false;
             for wave64 in [false, true] {
                 let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
                 let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
@@ -7908,6 +8003,9 @@ fn bench_split_wave64() {
                 // the loop's exchanges: masks read whole (`x64_masks`: not the v_cndmask
                 // selector, unless `XCL_X64_ALL_MASKS`) and the readfirstlane
                 exchanges = t.hlsl.matches("= xcl_x_ballot(and(").count() + t.hlsl.matches("xcl_x_rla_uniform(").count().saturating_sub(1);
+                if wave64 {
+                    spin = t.hlsl.contains("#define XCL_X_SPIN 1\n");
+                }
                 assert!(t.complete(), "{:?}", t.unsupported_why);
                 let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
                 let groups = (1u32 << 18) / threads;
@@ -7921,9 +8019,8 @@ fn bench_split_wave64() {
                 t.sort_by(f64::total_cmp);
                 ms.push(t[t.len() / 2]);
             }
-            // the form `x64_spin` picks: counters for groups of more than one console wave,
-            // and by default for one as well (`XCL_WAVE64_SPIN=0`: a group barrier)
-            let spin = threads > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0");
+            // Report the emitted hardware-group form: remapping can turn a 256-thread console
+            // group into four independent 64-thread groups, each using the one-wave barrier.
             let form = if runner::split_wave64() { if spin { "split, counter-paired" } else { "split, barrier" } } else { "native" };
             println!(
                 "v_cmp + v_cndmask{}: {exchanges} exchange(s) / iteration, {threads} threads per group, 2^18 threads x {iterations} iterations: wave32 {:.1} ms, wave64 ({form}) {:.1} ms = {:.2}x",
