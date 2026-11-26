@@ -158,6 +158,28 @@ fn allocator_benches(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "pipeline-resolution-bench")]
+fn pipeline_resolution_benches(c: &mut Criterion) {
+    let fixture = xcl::hle::d3d12x::pso_async::PipelineResolutionBench::new();
+    let mut group = c.benchmark_group("runtime/pipeline_resolution");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("retained_ready", |b| {
+        b.iter(|| black_box(&fixture).retained_ready());
+    });
+    // Bind-time registry lookup + classification as a comparison ceiling, not another retained
+    // emission path.
+    group.bench_function("registry_ready", |b| {
+        b.iter(|| black_box(&fixture).registry_ready());
+    });
+    group.bench_function("initial_completed", |b| {
+        b.iter(|| black_box(&fixture).initial_completed());
+    });
+    group.bench_function("initial_completed_dispatch", |b| {
+        b.iter(|| black_box(&fixture).initial_completed_dispatch());
+    });
+    group.finish();
+}
+
 fn utility_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("runtime/util");
     for (name, pattern, value) in [
@@ -306,5 +328,12 @@ fn vfs_benches(c: &mut Criterion) {
 }
 
 fn main() {
-    support::run(&[utility_benches, manifest_and_config_benches, vfs_benches, allocator_benches]);
+    support::run(&[
+        utility_benches,
+        manifest_and_config_benches,
+        vfs_benches,
+        allocator_benches,
+        #[cfg(feature = "pipeline-resolution-bench")]
+        pipeline_resolution_benches,
+    ]);
 }
