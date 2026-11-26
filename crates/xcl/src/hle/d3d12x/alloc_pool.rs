@@ -439,15 +439,29 @@ pub(super) struct PendingSubmit {
 #[derive(Clone)]
 #[allow(dead_code)] // consumed by the later opt-in generation-pin stage
 pub(super) struct SubmissionReceipt {
-    fence: ID3D12Fence,
+    marker: Arc<QueueFence>,
     value: u64,
 }
 
 #[allow(dead_code)] // consumed by the later opt-in generation-pin stage
 impl SubmissionReceipt {
+    /// Exact queue-marker generation. The retained `Arc` prevents pointer reuse while a
+    /// retirement sweep observes this identity.
+    pub(super) fn fence_identity(&self) -> usize {
+        Arc::as_ptr(&self.marker) as usize
+    }
+
+    pub(super) fn completed_value(&self) -> u64 {
+        unsafe { self.marker.fence.GetCompletedValue() }
+    }
+
+    pub(super) fn target_value(&self) -> u64 {
+        self.value
+    }
+
     /// Whether the GPU is past the native submission represented by this receipt.
     pub(super) fn is_complete(&self) -> bool {
-        unsafe { self.fence.GetCompletedValue() >= self.value }
+        self.completed_value() >= self.value
     }
 }
 
@@ -480,7 +494,7 @@ pub(super) fn submission_receipt_for_test(completed: u64, value: u64) -> (Submis
     let object = object as *mut Fence;
     let completed = unsafe { &(*object).completed };
     let fence = unsafe { ID3D12Fence::from_raw(object.cast()) };
-    (SubmissionReceipt { fence, value }, completed)
+    (SubmissionReceipt { marker: Arc::new(QueueFence::new(fence)), value }, completed)
 }
 
 /// Result of a receipt-requesting submission. Once execution begins, failure to mark it cannot
@@ -719,7 +733,7 @@ impl PendingSubmit {
         drop(g);
         drop(replaced);
         sweep_release_owners();
-        Some(SubmissionReceipt { fence, value })
+        Some(SubmissionReceipt { marker, value })
     }
 
     #[cfg(test)]
@@ -1776,7 +1790,8 @@ mod tests {
         let mut new_object = Fence { vtable: vtable.as_ptr(), value: Cell::new(1), refs: Cell::new(1) };
         let old_fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut old_object).cast()) };
         let new_fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut new_object).cast()) };
-        let (list, failed_list, queue) = (0x7ffe_6c01usize, 0x7ffe_6c02usize, 0x7ffe_6c03usize);
+        let (list, second_list, failed_list, queue) =
+            (0x7ffe_6c01usize, 0x7ffe_6c02usize, 0x7ffe_6c03usize, 0x7ffe_6c04usize);
 
         let receipt = begin_submit(&[list as *mut c_void])
             .unwrap()
@@ -1784,6 +1799,17 @@ mod tests {
             .finish_with_queue_ops_receipted(queue, || Some(old_fence.clone()), |_, value| value == 1)
             .expect("the successful Signal has an exact receipt");
         assert!(!receipt.is_complete());
+        let receipt_refs = old_object.refs.get();
+        let receipt_clone = receipt.clone();
+        assert_eq!(old_object.refs.get(), receipt_refs, "receipt clone called COM AddRef");
+        drop(receipt_clone);
+        assert_eq!(old_object.refs.get(), receipt_refs, "receipt clone called COM Release");
+        let second_receipt = begin_submit(&[second_list as *mut c_void])
+            .unwrap()
+            .execution_possible()
+            .finish_with_queue_ops_receipted(queue, || unreachable!(), |_, value| value == 2)
+            .expect("the same queue marker makes another receipt");
+        assert_eq!(receipt.fence_identity(), second_receipt.fence_identity());
 
         let old_marker = STATE.lock().unwrap().as_mut().unwrap().fences.insert(
             queue,
@@ -1791,8 +1817,10 @@ mod tests {
         );
         drop(old_marker);
         assert!(!receipt.is_complete(), "a complete replacement marker cannot satisfy an old receipt");
-        old_object.value.set(1);
+        assert!(!second_receipt.is_complete());
+        old_object.value.set(2);
         assert!(receipt.is_complete());
+        assert!(second_receipt.is_complete());
 
         let failed = begin_submit(&[failed_list as *mut c_void]).unwrap().execution_possible();
         assert!(failed
@@ -1801,7 +1829,7 @@ mod tests {
                 false
             })
             .is_none());
-        let (marker, submit) = {
+        let (marker, submit, second_submit) = {
             let mut g = STATE.lock().unwrap();
             let s = g.as_mut().unwrap();
             let lifetime = s.list_lifetimes[&failed_list];
@@ -1809,11 +1837,14 @@ mod tests {
             s.submit_pins.remove(&(failed_list, lifetime));
             s.list_lifetimes.remove(&failed_list);
             s.list_lifetimes.remove(&list);
-            (s.fences.remove(&queue), s.last_submit.remove(&list))
+            s.list_lifetimes.remove(&second_list);
+            (s.fences.remove(&queue), s.last_submit.remove(&list), s.last_submit.remove(&second_list))
         };
         drop(marker);
         drop(submit);
+        drop(second_submit);
         drop(receipt);
+        drop(second_receipt);
         drop(old_fence);
         drop(new_fence);
         assert_eq!((old_object.refs.get(), new_object.refs.get()), (0, 0));
