@@ -35,6 +35,7 @@ mod standin;
 pub mod title_list;
 pub mod title_textures;
 mod uma_driver;
+mod used_journal;
 pub mod vram;
 
 use std::ffi::c_void;
