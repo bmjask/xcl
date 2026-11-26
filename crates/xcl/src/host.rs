@@ -120,6 +120,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
             crate::report::write_final(None);
             crate::log::flush();
+            crate::hle::d3d12x::pso_async::shutdown_used();
             crate::hle::d3d12x::real::end_title(0);
         });
     }
@@ -164,5 +165,6 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::xlog_info!("game entry point returned code {code}");
     crate::report::write_final(None);
     crate::log::flush();
+    crate::hle::d3d12x::pso_async::shutdown_used();
     code as i32
 }
