@@ -2535,21 +2535,53 @@ impl<G, R> GenerationRetirements<G, R> {
         retired
     }
 
-    fn retire_pending(&mut self, receipt: R, pins: Vec<G>, complete: impl Fn(&R) -> bool) -> Vec<(R, Vec<G>)> {
+    fn push(&mut self, receipt: R, pins: Vec<G>) {
         if !pins.is_empty() {
             self.pending.push((receipt, pins));
         }
-        self.sweep(complete)
     }
 
-    fn poison(&mut self, pins: Vec<G>, identity: impl Fn(&G) -> usize) {
+    /// Retain new identities permanently and return duplicates for destruction by the caller.
+    fn poison(&mut self, pins: Vec<G>, identity: impl Fn(&G) -> usize) -> Vec<G> {
         let identities = self.poisoned_identities.get_or_insert_with(HashSet::new);
+        let mut duplicates = Vec::new();
         for pin in pins {
             if identities.insert(identity(&pin)) {
                 self.poisoned.push(pin);
+            } else {
+                duplicates.push(pin);
             }
         }
+        duplicates
     }
+}
+
+/// Snapshot one receipt per exact fence owner, observe those owners without the state mutex, then
+/// retire every batch proven complete by that monotonic observation. Receipts appended during the
+/// probes are eligible only when they use an owner present in the snapshot.
+fn sweep_retirements<G, R, K, V>(
+    state: &Mutex<GenerationRetirements<G, R>>,
+    key: impl Fn(&R) -> K,
+    observe: impl Fn(&R) -> V,
+    complete: impl Fn(&R, &HashMap<K, V>) -> bool,
+) where
+    R: Clone,
+    K: Eq + std::hash::Hash,
+{
+    let probes = {
+        let retiring = state.lock().unwrap();
+        let mut probes = HashMap::new();
+        for (receipt, _) in &retiring.pending {
+            probes.entry(key(receipt)).or_insert_with(|| receipt.clone());
+        }
+        probes
+    };
+    let observed = probes.into_iter().map(|(key, receipt)| (key, observe(&receipt))).collect();
+    let retired = {
+        let mut retiring = state.lock().unwrap();
+        retiring.sweep(|receipt| complete(receipt, &observed))
+    };
+    drop(retired);
 }
 
 fn dedup_generations<G>(pins: impl Iterator<Item = G>, identity: impl Fn(&G) -> usize) -> Vec<G> {
@@ -2566,6 +2598,19 @@ fn dedup_generations<G>(pins: impl Iterator<Item = G>, identity: impl Fn(&G) -> 
 static RETIRING_GENERATIONS: Mutex<GenerationRetirements<NativeGeneration, super::alloc_pool::SubmissionReceipt>> =
     Mutex::new(GenerationRetirements::new());
 
+fn sweep_native_generations() {
+    sweep_retirements(
+        &RETIRING_GENERATIONS,
+        super::alloc_pool::SubmissionReceipt::fence_identity,
+        super::alloc_pool::SubmissionReceipt::completed_value,
+        |receipt, observed| {
+            observed
+                .get(&receipt.fence_identity())
+                .is_some_and(|&completed| completed >= receipt.target_value())
+        },
+    );
+}
+
 /// Keep the exact native generations used by one executed title submission until its strong
 /// queue receipt completes. Completed batches are swept whenever another pinned batch arrives.
 pub(super) fn retire_native_generations<'a>(
@@ -2579,10 +2624,8 @@ pub(super) fn retire_native_generations<'a>(
     if pins.is_empty() {
         return;
     }
-    let mut retiring = RETIRING_GENERATIONS.lock().unwrap();
-    let retired = retiring.retire_pending(receipt, pins, super::alloc_pool::SubmissionReceipt::is_complete);
-    drop(retiring);
-    drop(retired);
+    RETIRING_GENERATIONS.lock().unwrap().push(receipt, pins);
+    sweep_native_generations();
 }
 
 /// Native execution began but no exact retirement marker could be recorded. Retain every exact
@@ -2592,19 +2635,16 @@ pub(super) fn poison_native_generations<'a>(pins: impl Iterator<Item = &'a Nativ
     if pins.is_empty() {
         return;
     }
+    sweep_native_generations();
     let mut retiring = RETIRING_GENERATIONS.lock().unwrap();
-    let retired = retiring.sweep(super::alloc_pool::SubmissionReceipt::is_complete);
-    retiring.poison(pins, NativeGeneration::identity);
+    let duplicates = retiring.poison(pins, NativeGeneration::identity);
     drop(retiring);
-    drop(retired);
+    drop(duplicates);
 }
 
 #[cfg(test)]
 pub(super) fn sweep_native_generations_for_test() {
-    let mut retiring = RETIRING_GENERATIONS.lock().unwrap();
-    let retired = retiring.sweep(super::alloc_pool::SubmissionReceipt::is_complete);
-    drop(retiring);
-    drop(retired);
+    sweep_native_generations();
 }
 
 /// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
@@ -5072,6 +5112,22 @@ mod used_tests {
         receipt.fence.load(Ordering::Relaxed) >= receipt.value
     }
 
+    fn fake_fence_identity(receipt: &FakeReceipt) -> usize {
+        Arc::as_ptr(&receipt.fence) as usize
+    }
+
+    fn fake_completed_value(receipt: &FakeReceipt) -> u64 {
+        receipt.fence.load(Ordering::Relaxed)
+    }
+
+    fn fake_complete_observed(receipt: &FakeReceipt, observed: &HashMap<usize, u64>) -> bool {
+        observed.get(&fake_fence_identity(receipt)).is_some_and(|&value| value >= receipt.value)
+    }
+
+    fn sweep_fake<G>(state: &Mutex<GenerationRetirements<G, FakeReceipt>>) {
+        sweep_retirements(state, fake_fence_identity, fake_completed_value, fake_complete_observed);
+    }
+
     #[test]
     fn generation_retirement_deduplicates_and_uses_the_exact_receipt_owner() {
         let generation = Arc::new(());
@@ -5083,28 +5139,151 @@ mod used_tests {
 
         let old_fence = Arc::new(AtomicU64::new(0));
         let replacement_fence = Arc::new(AtomicU64::new(99));
-        let mut retiring = GenerationRetirements::new();
-        drop(retiring.retire_pending(
-            FakeReceipt { fence: old_fence.clone(), value: 7 },
-            pins,
-            fake_receipt_complete,
-        ));
-        drop(retiring.sweep(fake_receipt_complete));
-        assert_eq!(retiring.pending.len(), 1, "a replacement queue generation retired an old receipt");
+        let retiring = Mutex::new(GenerationRetirements::new());
+        retiring.lock().unwrap().push(FakeReceipt { fence: old_fence.clone(), value: 7 }, pins);
+        sweep_fake(&retiring);
+        assert_eq!(retiring.lock().unwrap().pending.len(), 1, "a replacement queue generation retired an old receipt");
         assert_eq!(Arc::strong_count(&generation), 2, "the in-flight batch did not retain its generation");
 
         old_fence.store(7, Ordering::Relaxed);
-        drop(retiring.sweep(fake_receipt_complete));
-        assert!(retiring.pending.is_empty());
+        sweep_fake(&retiring);
+        assert!(retiring.lock().unwrap().pending.is_empty());
         assert_eq!(Arc::strong_count(&generation), 1);
         assert_eq!(replacement_fence.load(Ordering::Relaxed), 99);
 
-        drop(retiring.retire_pending(
-            FakeReceipt { fence: old_fence, value: 7 },
-            vec![generation.clone()],
-            fake_receipt_complete,
-        ));
-        assert!(retiring.pending.is_empty(), "an already-complete receipt retained a final batch");
+        retiring.lock().unwrap().push(FakeReceipt { fence: old_fence, value: 7 }, vec![generation.clone()]);
+        sweep_fake(&retiring);
+        assert!(retiring.lock().unwrap().pending.is_empty(), "an already-complete receipt retained a final batch");
+    }
+
+    #[test]
+    fn generation_retirement_probes_each_exact_fence_once_and_honors_cutoffs() {
+        let (a, b) = (Arc::new(AtomicU64::new(5)), Arc::new(AtomicU64::new(0)));
+        let state = Mutex::new(GenerationRetirements::new());
+        {
+            let mut retiring = state.lock().unwrap();
+            for value in [2, 5, 8] {
+                retiring.push(FakeReceipt { fence: a.clone(), value }, vec![value]);
+            }
+            retiring.push(FakeReceipt { fence: b.clone(), value: 1 }, vec![1]);
+        }
+        let (a_probes, b_probes) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        sweep_retirements(
+            &state,
+            fake_fence_identity,
+            |receipt| {
+                assert!(state.try_lock().is_ok(), "fence observation ran under the retirement mutex");
+                if Arc::ptr_eq(&receipt.fence, &a) {
+                    a_probes.fetch_add(1, Ordering::Relaxed);
+                } else if Arc::ptr_eq(&receipt.fence, &b) {
+                    b_probes.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    panic!("unexpected fence owner");
+                }
+                fake_completed_value(receipt)
+            },
+            fake_complete_observed,
+        );
+
+        assert_eq!(
+            (a_probes.load(Ordering::Relaxed), b_probes.load(Ordering::Relaxed)),
+            (1, 1),
+            "each exact fence owner must be probed once",
+        );
+        let retiring = state.lock().unwrap();
+        assert_eq!(retiring.pending.len(), 2);
+        assert!(retiring.pending.iter().any(|(r, _)| Arc::ptr_eq(&r.fence, &a) && r.value == 8));
+        assert!(retiring.pending.iter().any(|(r, _)| Arc::ptr_eq(&r.fence, &b) && r.value == 1));
+    }
+
+    #[test]
+    fn generation_retirement_applies_a_snapshot_to_only_observed_fences() {
+        let (a, b) = (Arc::new(AtomicU64::new(5)), Arc::new(AtomicU64::new(99)));
+        let state = Mutex::new(GenerationRetirements::new());
+        state.lock().unwrap().push(FakeReceipt { fence: a.clone(), value: 3 }, vec![3]);
+        let appended = AtomicBool::new(false);
+        sweep_retirements(
+            &state,
+            fake_fence_identity,
+            |receipt| {
+                assert!(state.try_lock().is_ok(), "fence observation ran under the retirement mutex");
+                if !appended.swap(true, Ordering::Relaxed) {
+                    let mut retiring = state.lock().unwrap();
+                    retiring.push(FakeReceipt { fence: a.clone(), value: 4 }, vec![4]);
+                    retiring.push(FakeReceipt { fence: a.clone(), value: 7 }, vec![7]);
+                    retiring.push(FakeReceipt { fence: b.clone(), value: 1 }, vec![1]);
+                }
+                fake_completed_value(receipt)
+            },
+            fake_complete_observed,
+        );
+
+        let retiring = state.lock().unwrap();
+        assert_eq!(retiring.pending.len(), 2);
+        assert!(retiring.pending.iter().any(|(r, _)| Arc::ptr_eq(&r.fence, &a) && r.value == 7));
+        assert!(retiring.pending.iter().any(|(r, _)| Arc::ptr_eq(&r.fence, &b) && r.value == 1));
+    }
+
+    #[test]
+    fn generation_retirement_drops_completed_pins_without_the_mutex() {
+        struct DropPin {
+            state: Weak<Mutex<GenerationRetirements<DropPin, FakeReceipt>>>,
+            dropped: Arc<AtomicBool>,
+            unlocked: Arc<AtomicBool>,
+        }
+        impl Drop for DropPin {
+            fn drop(&mut self) {
+                let unlocked = self.state.upgrade().is_some_and(|state| state.try_lock().is_ok());
+                self.unlocked.store(unlocked, Ordering::Relaxed);
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let state = Arc::new(Mutex::new(GenerationRetirements::new()));
+        let (dropped, unlocked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let pin = DropPin { state: Arc::downgrade(&state), dropped: dropped.clone(), unlocked: unlocked.clone() };
+        state.lock().unwrap().push(
+            FakeReceipt { fence: Arc::new(AtomicU64::new(1)), value: 1 },
+            vec![pin],
+        );
+        sweep_fake(&state);
+
+        assert!(dropped.load(Ordering::Relaxed));
+        assert!(unlocked.load(Ordering::Relaxed), "completed generation dropped under the retirement mutex");
+    }
+
+    #[test]
+    fn generation_poison_returns_duplicates_for_drop_after_unlock() {
+        struct PoisonPin {
+            id: usize,
+            state: Weak<Mutex<GenerationRetirements<PoisonPin, FakeReceipt>>>,
+            dropped: Arc<AtomicBool>,
+            unlocked: Arc<AtomicBool>,
+        }
+        impl Drop for PoisonPin {
+            fn drop(&mut self) {
+                let unlocked = self.state.upgrade().is_some_and(|state| state.try_lock().is_ok());
+                self.unlocked.store(unlocked, Ordering::Relaxed);
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let state = Arc::new(Mutex::new(GenerationRetirements::new()));
+        let (kept_dropped, kept_unlocked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let kept = PoisonPin {
+            id: 7, state: Arc::downgrade(&state), dropped: kept_dropped.clone(), unlocked: kept_unlocked,
+        };
+        drop(state.lock().unwrap().poison(vec![kept], |pin| pin.id));
+        let (duplicate_dropped, duplicate_unlocked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let duplicate = PoisonPin {
+            id: 7, state: Arc::downgrade(&state), dropped: duplicate_dropped.clone(), unlocked: duplicate_unlocked.clone(),
+        };
+        let duplicates = state.lock().unwrap().poison(vec![duplicate], |pin| pin.id);
+        assert!(!duplicate_dropped.load(Ordering::Relaxed), "duplicate poison pin dropped inside the mutex");
+        assert!(!kept_dropped.load(Ordering::Relaxed), "the permanently retained generation was released");
+        drop(duplicates);
+        assert!(duplicate_dropped.load(Ordering::Relaxed));
+        assert!(duplicate_unlocked.load(Ordering::Relaxed), "duplicate poison pin dropped under the mutex");
     }
 
     #[test]
@@ -5116,8 +5295,8 @@ mod used_tests {
             |generation| Arc::as_ptr(generation) as usize,
         );
         let mut retiring = GenerationRetirements::<Arc<()>, FakeReceipt>::new();
-        retiring.poison(pins, |generation| Arc::as_ptr(generation) as usize);
-        retiring.poison(vec![generation.clone()], |generation| Arc::as_ptr(generation) as usize);
+        drop(retiring.poison(pins, |generation| Arc::as_ptr(generation) as usize));
+        drop(retiring.poison(vec![generation.clone()], |generation| Arc::as_ptr(generation) as usize));
         assert_eq!(retiring.poisoned.len(), 1, "a later poison duplicated an existing generation");
         drop(generation);
 
@@ -5135,16 +5314,11 @@ mod used_tests {
 
         let drops = Arc::new(AtomicUsize::new(0));
         let fence = Arc::new(AtomicU64::new(1));
-        let mut retiring = GenerationRetirements::new();
-        let retired = retiring.retire_pending(
-            FakeReceipt { fence, value: 1 },
-            vec![DropPin(drops.clone())],
-            fake_receipt_complete,
-        );
+        let retiring = Mutex::new(GenerationRetirements::new());
+        retiring.lock().unwrap().push(FakeReceipt { fence, value: 1 }, vec![DropPin(drops.clone())]);
+        sweep_fake(&retiring);
 
-        assert!(retiring.pending.is_empty());
-        assert_eq!(drops.load(Ordering::Relaxed), 0, "the manager dropped a pin while it was borrowed mutably");
-        drop(retired);
+        assert!(retiring.lock().unwrap().pending.is_empty());
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
