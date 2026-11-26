@@ -741,6 +741,12 @@ impl Em {
         self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
     }
 
+    /// An upper-lane spill shadow may need to distinguish a present native lane from a lane
+    /// that the PC wave did not launch.
+    fn upper_presence(&self) -> bool {
+        self.upper.as_ref().is_some_and(|u| u.shadows.iter().any(|&(_, l)| l >= 32))
+    }
+
     /// `ballot` of the program's wave (both halves' words in the split form, the helper lanes'
     /// bits in a pixel shader).
     fn ballot_fn(&self) -> &'static str {
@@ -4138,9 +4144,8 @@ impl Em {
                 }
                 let rla = self.rla_uniform_fn();
                 let read = format!("{rla}({a}, {b} & {wmask}u)");
-                // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
-                // read; a spill slot < 32 from its shadow whatever the wave size (its lane may
-                // not have been launched)
+                // wave64 VS / PS (`upper_lanes`): replace absent upper lanes with known values;
+                // read a spill slot from its shadow when its physical lane was not launched
                 let slot = super::upper_lanes::slot(d);
                 match (self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied(), slot) {
                     (Some(Read::Const(c)), Some(_)) => self.line(&format!("uint {t} = {c:#010x}u; if (!xcl_hw32) {t} = {read};")),
@@ -4149,7 +4154,10 @@ impl Em {
                         self.line(&format!("{t} = select(and(xcl_hw32, ({b} & 63u) >= 32u), {c:#010x}u, {t});"));
                     }
                     (Some(Read::Shadow), Some((v, l))) if l < 32 => self.line(&format!("uint {t} = xcl_sh{v}_{l};")),
-                    (Some(Read::Shadow), Some((v, l))) => self.line(&format!("uint {t} = xcl_sh{v}_{l}; if (!xcl_hw32) {t} = {read};")),
+                    (Some(Read::Shadow), Some((v, l))) => {
+                        self.line(&format!("uint {t} = xcl_sh{v}_{l};"));
+                        self.line(&format!("if (lanebit_at(xcl_present.x, xcl_present.y, {l}u)) {t} = {read};"));
+                    }
                     _ => self.line(&format!("uint {t} = {read};")),
                 }
                 // split wave64 (no `upper` there): the last arm, an exchange
@@ -4964,8 +4972,11 @@ impl Em {
             self.x64_prelude(&mut h);
         }
         if let Some(u) = &self.upper {
-            // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
-            h.push_str("// the wave has 32 lanes: it is a console wave whose lanes 32..63 are not populated\nstatic bool xcl_hw32 = false;\n");
+            // wave64 VS / PS missing-lane values (`upper_lanes`)
+            h.push_str("static bool xcl_hw32 = false;\n");
+            if self.upper_presence() {
+                h.push_str("static uint2 xcl_present = uint2(0u, 0u); // physical lanes (PS: whole live quads)\n");
+            }
             for (v, l) in &u.shadows {
                 let _ = writeln!(h, "static uint xcl_sh{v}_{l} = 0u; // v_writelane slot: v{v} lane {l}");
             }
@@ -5054,6 +5065,9 @@ impl Em {
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
+                }
+                if self.upper_presence() {
+                    h.push_str("    xcl_present = ballot(true);\n");
                 }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
@@ -5410,6 +5424,9 @@ impl Em {
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
+                }
+                if self.upper_presence() {
+                    h.push_str("    xcl_present = ballot_px(true);\n");
                 }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");

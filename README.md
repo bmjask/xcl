@@ -213,8 +213,8 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
   can still differ there. Recognized compiler-pattern wave64 vertex and pixel min/max/and/or
-  reductions are rebuilt over the lanes the GPU launched; other missing-lane reads and scalar
-  spills can still differ in partial waves. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
+  reductions and constant-lane scalar spill slots preserve missing partial-wave lanes; other
+  missing-lane reads can still differ. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
   made up of complete native waves can use the per-lane form for branches on whole-wave masks;
   split-wave64 programs that access LDS stay on the HLSL path to preserve instruction order
   between their two hardware wave32 halves.
