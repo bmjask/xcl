@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [features]
 pipeline-resolution-bench = []
+texture-selection-bench = []
 
 [[bin]]
 name = "xcl"
