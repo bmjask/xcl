@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone)]
 struct Config {
     test: bool,
+    json: bool,
     filter: Option<String>,
 }
 
@@ -26,6 +27,7 @@ pub struct BenchmarkGroup<'a> {
 pub struct Bencher {
     name: String,
     test: bool,
+    json: bool,
     throughput: Option<Throughput>,
     sample_size: usize,
     measurement_time: Duration,
@@ -52,9 +54,55 @@ fn median(sorted: &[f64]) -> f64 {
     }
 }
 
+const BENCHMARK_JSON_VERSION: u32 = 1;
+
+fn measurement_json(
+    name: &str,
+    sample_size: usize,
+    sample_iterations: u64,
+    median: f64,
+    mean: f64,
+    minimum: f64,
+    throughput: Option<Throughput>,
+) -> serde_json::Value {
+    let throughput = throughput.map(|throughput| {
+        let (kind, amount) = match throughput {
+            Throughput::Bytes(amount) => ("bytes", amount),
+            Throughput::Elements(amount) => ("elements", amount),
+        };
+        serde_json::json!({
+            "kind": kind,
+            "per_iteration": amount,
+            "per_second": amount as f64 / median.max(1e-12),
+        })
+    });
+    serde_json::json!({
+        "schema": "xcl-benchmark",
+        "version": BENCHMARK_JSON_VERSION,
+        "benchmark": name,
+        "sample_size": sample_size,
+        "sample_iterations": sample_iterations,
+        "median_ns_per_iter": median * 1e9,
+        "mean_ns_per_iter": mean * 1e9,
+        "min_ns_per_iter": minimum * 1e9,
+        "throughput": throughput,
+    })
+}
+
 fn test_helpers() {
     assert_eq!(median(&[1.0, 3.0]), 2.0);
     assert_eq!(median(&[1.0, 4.0, 9.0]), 4.0);
+    let json = measurement_json(
+        "group/case", 30, 17, 2e-9, 3e-9, 1e-9, Some(Throughput::Bytes(8)),
+    );
+    assert_eq!(json["schema"], "xcl-benchmark");
+    assert_eq!(json["version"], BENCHMARK_JSON_VERSION);
+    assert_eq!(json["benchmark"], "group/case");
+    assert_eq!(json["sample_size"], 30);
+    assert_eq!(json["sample_iterations"], 17);
+    assert_eq!(json["median_ns_per_iter"], 2.0);
+    assert_eq!(json["throughput"]["kind"], "bytes");
+    assert_eq!(json["throughput"]["per_iteration"], 8);
 }
 
 impl BenchmarkId {
@@ -76,15 +124,18 @@ impl Display for BenchmarkId {
 impl Criterion {
     fn from_args() -> Self {
         let mut test = false;
+        let mut json = false;
         let mut filter = None;
         for argument in std::env::args().skip(1) {
             if argument == "--test" {
                 test = true;
+            } else if argument == "--json" {
+                json = true;
             } else if !argument.starts_with('-') && filter.is_none() {
                 filter = Some(argument);
             }
         }
-        Self { config: Config { test, filter }, ran: 0 }
+        Self { config: Config { test, json, filter }, ran: 0 }
     }
 
     pub fn benchmark_group<'a>(&'a mut self, name: &str) -> BenchmarkGroup<'a> {
@@ -116,6 +167,7 @@ impl Criterion {
         routine(&mut Bencher {
             name,
             test: self.config.test,
+            json: self.config.json,
             throughput,
             sample_size: sample_size.max(3),
             measurement_time,
@@ -232,6 +284,21 @@ impl Bencher {
         let median = median(&samples);
         let mean = samples.iter().sum::<f64>() / samples.len() as f64;
         let minimum = samples[0];
+        if self.json {
+            println!(
+                "{}",
+                measurement_json(
+                    &self.name,
+                    samples.len(),
+                    sample_iterations,
+                    median,
+                    mean,
+                    minimum,
+                    self.throughput,
+                )
+            );
+            return;
+        }
         print!(
             "bench {}: median {:.1} ns/iter, mean {:.1}, min {:.1}",
             self.name,

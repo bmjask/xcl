@@ -440,12 +440,15 @@ labelled as missing; it does not infer significance or percentages.
 .\scripts\perf-compare.tests.ps1           # comparison fixture (synthetic artifacts)
 cargo bench -p xcl                          # synthetic performance benchmarks
 cargo bench -p xcl --bench core             # run one benchmark target
+cargo bench -p xcl --bench core -- --json   # one versioned JSON object per result
 ```
 
 Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
 executable. The dependency-free harness prints median, mean and minimum time plus throughput; a
 positional substring selects benchmarks, and `cargo bench -p xcl -- --test` runs every closure once
-as a fast smoke check.
+as a fast smoke check. `--json` emits newline-delimited, versioned records containing the sample
+count and iterations, nanoseconds per iteration and optional throughput, suitable for saved
+baselines and automated comparisons.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
