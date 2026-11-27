@@ -1445,8 +1445,8 @@ mod tests {
 
     #[test]
     fn release_probe_retries_a_same_address_backing_replacement() {
-        use std::cell::Cell;
         use std::mem::{offset_of, size_of};
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         static REPLACE: AtomicBool = AtomicBool::new(false);
         static KEY: AtomicUsize = AtomicUsize::new(0);
@@ -1993,27 +1993,25 @@ mod tests {
 
     #[test]
     fn submit_reservation_keeps_pre_reset_attribution_across_queues() {
-        use std::cell::Cell;
         use std::mem::{offset_of, size_of};
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
         #[repr(C)]
         struct Fence {
             vtable: *const usize,
-            value: Cell<u64>,
-            refs: Cell<u32>,
+            value: AtomicU64,
+            refs: AtomicU32,
         }
         unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
-            (*this.cast::<Fence>()).value.get()
+            (*this.cast::<Fence>()).value.load(Ordering::Acquire)
         }
         unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
             let fence = &*this.cast::<Fence>();
-            fence.refs.set(fence.refs.get() + 1);
-            fence.refs.get()
+            fence.refs.fetch_add(1, Ordering::AcqRel) + 1
         }
         unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             let fence = &*this.cast::<Fence>();
-            fence.refs.set(fence.refs.get() - 1);
-            fence.refs.get()
+            fence.refs.fetch_sub(1, Ordering::AcqRel) - 1
         }
         extern "system" fn unexpected_call() { std::process::abort(); }
 
@@ -2022,7 +2020,11 @@ mod tests {
         vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
         vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
         vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
-        let mut fence_object = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) };
+        let mut fence_object = Fence {
+            vtable: vtable.as_ptr(),
+            value: AtomicU64::new(0),
+            refs: AtomicU32::new(1),
+        };
         let fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence_object).cast()) };
 
         let (alloc, next, list) = (0x7ffe_5100usize, 0x7ffe_5200usize, 0x7ffe_5300usize);
@@ -2083,9 +2085,15 @@ mod tests {
         }
         drop(reused_address);
         forget_list(list);
+        fence_object.value.store(6, Ordering::Release);
         unsafe { forget(alloc) };
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert!(!s.backings.contains_key(&alloc) && !s.backings.contains_key(&next));
+        }
         drop(fence);
-        assert_eq!(fence_object.refs.get(), 0);
+        assert_eq!(fence_object.refs.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2353,24 +2361,22 @@ mod tests {
         #[repr(C)]
         struct Fence {
             vtable: *const usize,
-            value: Cell<u64>,
-            refs: Cell<u32>,
-            final_releases: Cell<u32>,
+            value: AtomicU64,
+            refs: AtomicU32,
+            final_releases: AtomicU32,
         }
         unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
-            (*this.cast::<Fence>()).value.get()
+            (*this.cast::<Fence>()).value.load(Ordering::Acquire)
         }
         unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
             let f = &*this.cast::<Fence>();
-            f.refs.set(f.refs.get() + 1);
-            f.refs.get()
+            f.refs.fetch_add(1, Ordering::AcqRel) + 1
         }
         unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             let f = &*this.cast::<Fence>();
-            let refs = f.refs.get() - 1;
-            f.refs.set(refs);
+            let refs = f.refs.fetch_sub(1, Ordering::AcqRel) - 1;
             if refs == 0 {
-                f.final_releases.set(f.final_releases.get() + 1);
+                f.final_releases.fetch_add(1, Ordering::AcqRel);
             }
             refs
         }
@@ -2383,9 +2389,9 @@ mod tests {
         vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
         let mut fence = Fence {
             vtable: vtable.as_ptr(),
-            value: Cell::new(0),
-            refs: Cell::new(1),
-            final_releases: Cell::new(0),
+            value: AtomicU64::new(0),
+            refs: AtomicU32::new(1),
+            final_releases: AtomicU32::new(0),
         };
         let mut ids = Box::new([0u8; 3]);
         let alloc = ids.as_mut_ptr() as usize;
@@ -2416,14 +2422,17 @@ mod tests {
             !s.of_list.contains_key(&second) && s.backings[&alloc].users.is_empty()
                 && s.backings[&alloc].marks.len() == 1 && !unsafe { backing_free_for_test(&s.backings[&alloc]) }
         };
-        fence.value.set(7);
+        fence.value.store(7, Ordering::Release);
         let reusable = unsafe { backing_free_for_test(&STATE.lock().unwrap().as_ref().unwrap().backings[&alloc]) };
         // Clean up the synthetic COM pointer before assertions, including on the old code.
         unsafe { forget(alloc) };
         assert!(first_removed, "another live recording must remain while the released list goes");
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
-        assert_eq!((fence.refs.get(), fence.final_releases.get()), (0, 1));
+        assert_eq!(
+            (fence.refs.load(Ordering::Acquire), fence.final_releases.load(Ordering::Acquire)),
+            (0, 1),
+        );
     }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
