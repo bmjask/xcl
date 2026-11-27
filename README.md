@@ -452,8 +452,12 @@ Benchmarks use generated inputs and public XCL APIs; they do not require game fi
 executable. The dependency-free harness prints median, mean and minimum time plus throughput; a
 positional substring selects benchmarks, and `cargo bench -p xcl -- --test` runs every closure once
 as a fast smoke check. `--json` emits newline-delimited, versioned records containing the sample
-count and iterations, nanoseconds per iteration and optional throughput, suitable for saved
-baselines and automated comparisons. `xcl-bench-compare` requires an explicit allowed regression
+count and iterations, nanoseconds per iteration, optional throughput, and the build profile,
+Rust toolchain, OS, architecture and CPU identity used for the run. `XCL_BENCH_PROFILE`,
+`XCL_BENCH_TOOLCHAIN`, `XCL_BENCH_OS`, `XCL_BENCH_ARCH` and `XCL_BENCH_CPU` override those identity
+fields for reproducible CI; set the CPU override on systems where automatic detection reports
+`null`. The records are suitable for saved baselines and automated comparisons.
+`xcl-bench-compare` requires an explicit allowed regression
 percentage, compares the observed medians, and exits 1 when any benchmark exceeds it. It refuses
 different benchmark sets or optional environment/hardware metadata. This is a deterministic
 threshold check, not a claim of statistical significance.

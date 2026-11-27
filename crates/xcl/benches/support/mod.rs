@@ -2,6 +2,7 @@
 
 use std::fmt::Display;
 use std::hint::black_box;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -9,6 +10,7 @@ struct Config {
     test: bool,
     json: bool,
     filter: Option<String>,
+    identity: BenchmarkIdentity,
 }
 
 pub struct Criterion {
@@ -31,6 +33,7 @@ pub struct Bencher {
     throughput: Option<Throughput>,
     sample_size: usize,
     measurement_time: Duration,
+    identity: BenchmarkIdentity,
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +59,77 @@ fn median(sorted: &[f64]) -> f64 {
 
 const BENCHMARK_JSON_VERSION: u32 = 1;
 
+#[derive(Clone, Debug, PartialEq)]
+struct BenchmarkIdentity {
+    environment: serde_json::Value,
+    hardware: serde_json::Value,
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+}
+
+fn rustc_identity() -> Option<String> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc).arg("--version").output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn cpu_identity() -> Option<String> {
+    if cfg!(windows) {
+        return nonempty(std::env::var("PROCESSOR_IDENTIFIER").ok());
+    }
+    if cfg!(target_os = "linux") {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        return cpuinfo.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            matches!(key.trim(), "model name" | "Hardware")
+                .then(|| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        });
+    }
+    if cfg!(target_os = "macos") {
+        let output = Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output().ok()?;
+        return output.status.success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|value| !value.is_empty());
+    }
+    None
+}
+
+fn benchmark_identity_with(
+    get: impl Fn(&str) -> Option<String>,
+    default_toolchain: impl FnOnce() -> Option<String>,
+    default_cpu: impl FnOnce() -> Option<String>,
+) -> BenchmarkIdentity {
+    let field = |name: &str, fallback: &str| nonempty(get(name)).unwrap_or_else(|| fallback.to_owned());
+    let profile = field(
+        "XCL_BENCH_PROFILE",
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+    );
+    let toolchain = nonempty(get("XCL_BENCH_TOOLCHAIN"))
+        .or_else(|| nonempty(default_toolchain()))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let cpu = nonempty(get("XCL_BENCH_CPU")).or_else(|| nonempty(default_cpu()));
+    BenchmarkIdentity {
+        environment: serde_json::json!({
+            "profile": profile,
+            "toolchain": toolchain,
+            "os": field("XCL_BENCH_OS", std::env::consts::OS),
+            "arch": field("XCL_BENCH_ARCH", std::env::consts::ARCH),
+        }),
+        hardware: serde_json::json!({ "cpu": cpu }),
+    }
+}
+
+fn benchmark_identity() -> BenchmarkIdentity {
+    benchmark_identity_with(
+        |name| std::env::var(name).ok(),
+        rustc_identity,
+        cpu_identity,
+    )
+}
+
 fn measurement_json(
     name: &str,
     sample_size: usize,
@@ -64,6 +138,7 @@ fn measurement_json(
     mean: f64,
     minimum: f64,
     throughput: Option<Throughput>,
+    identity: &BenchmarkIdentity,
 ) -> serde_json::Value {
     let throughput = throughput.map(|throughput| {
         let (kind, amount) = match throughput {
@@ -86,14 +161,28 @@ fn measurement_json(
         "mean_ns_per_iter": mean * 1e9,
         "min_ns_per_iter": minimum * 1e9,
         "throughput": throughput,
+        "environment": identity.environment,
+        "hardware": identity.hardware,
     })
 }
 
 fn test_helpers() {
     assert_eq!(median(&[1.0, 3.0]), 2.0);
     assert_eq!(median(&[1.0, 4.0, 9.0]), 4.0);
+    let identity = benchmark_identity_with(
+        |name| match name {
+            "XCL_BENCH_PROFILE" => Some("ci".into()),
+            "XCL_BENCH_TOOLCHAIN" => Some("rustc-test".into()),
+            "XCL_BENCH_OS" => Some("test-os".into()),
+            "XCL_BENCH_ARCH" => Some("test-arch".into()),
+            "XCL_BENCH_CPU" => Some("test-cpu".into()),
+            _ => None,
+        },
+        || Some("ignored-toolchain".into()),
+        || Some("ignored-cpu".into()),
+    );
     let json = measurement_json(
-        "group/case", 30, 17, 2e-9, 3e-9, 1e-9, Some(Throughput::Bytes(8)),
+        "group/case", 30, 17, 2e-9, 3e-9, 1e-9, Some(Throughput::Bytes(8)), &identity,
     );
     assert_eq!(json["schema"], "xcl-benchmark");
     assert_eq!(json["version"], BENCHMARK_JSON_VERSION);
@@ -103,6 +192,24 @@ fn test_helpers() {
     assert_eq!(json["median_ns_per_iter"], 2.0);
     assert_eq!(json["throughput"]["kind"], "bytes");
     assert_eq!(json["throughput"]["per_iteration"], 8);
+    assert_eq!(json["environment"]["profile"], "ci");
+    assert_eq!(json["environment"]["toolchain"], "rustc-test");
+    assert_eq!(json["environment"]["os"], "test-os");
+    assert_eq!(json["environment"]["arch"], "test-arch");
+    assert_eq!(json["hardware"]["cpu"], "test-cpu");
+    let second = measurement_json(
+        "group/other", 30, 17, 4e-9, 5e-9, 3e-9, None, &identity,
+    );
+    assert_eq!(second["environment"], json["environment"]);
+    assert_eq!(second["hardware"], json["hardware"]);
+
+    let defaults = benchmark_identity_with(
+        |_| None,
+        || Some("default-toolchain".into()),
+        || None,
+    );
+    assert_eq!(defaults.environment["toolchain"], "default-toolchain");
+    assert!(defaults.hardware["cpu"].is_null());
 }
 
 impl BenchmarkId {
@@ -135,7 +242,7 @@ impl Criterion {
                 filter = Some(argument);
             }
         }
-        Self { config: Config { test, json, filter }, ran: 0 }
+        Self { config: Config { test, json, filter, identity: benchmark_identity() }, ran: 0 }
     }
 
     pub fn benchmark_group<'a>(&'a mut self, name: &str) -> BenchmarkGroup<'a> {
@@ -171,6 +278,7 @@ impl Criterion {
             throughput,
             sample_size: sample_size.max(3),
             measurement_time,
+            identity: self.config.identity.clone(),
         });
     }
 }
@@ -295,6 +403,7 @@ impl Bencher {
                     mean,
                     minimum,
                     self.throughput,
+                    &self.identity,
                 )
             );
             return;
