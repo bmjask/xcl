@@ -7163,6 +7163,27 @@ pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResol
 }
 
 impl PipelineResolution {
+    /// Whether this retained bind still has an unfinished initial build. Completed and
+    /// restoration states are consumed directly instead of creating another deferred segment.
+    pub(super) fn initial_build_pending(&self) -> bool {
+        matches!(&self.0, StructuredResolve::Initial { pending, bound_unbuilt: true, .. }
+            if pending.build.owners.load(Ordering::Acquire) != 0
+                && !pending.build.orphan.load(Ordering::Acquire)
+                && !*pending.build.done.lock().unwrap())
+    }
+
+    /// Promote this retained bind's exact initial build for a deferred submit without looking up
+    /// the title address, which may already name a different pipeline generation.
+    pub(super) fn need_initial_by_submit(&self) {
+        if let StructuredResolve::Initial { pending, bound_unbuilt: true, .. } = &self.0 {
+            if pending.build.owners.load(Ordering::Acquire) != 0
+                && !pending.build.orphan.load(Ordering::Acquire)
+            {
+                need_pending_by_submit(pending);
+            }
+        }
+    }
+
     /// Exact completed generation safe to pass as a native Reset initial pipeline. An unfinished
     /// or unavailable retained identity returns None instead of consulting its reusable address.
     pub(super) fn ready_for_reset(&self) -> Option<(usize, NativeGeneration)> {
@@ -7592,6 +7613,10 @@ pub fn is_pending(pso: usize) -> bool {
 /// wanted from record time and goes before the workers' queue.
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
+    need_pending_by_submit(&p);
+}
+
+fn need_pending_by_submit(p: &Arc<Pending>) {
     p.build.want();
     let first = !std::mem::replace(&mut p.build.demand.lock().unwrap().by_submit, true);
     if first {
