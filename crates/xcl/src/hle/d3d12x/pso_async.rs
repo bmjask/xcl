@@ -7687,6 +7687,10 @@ impl PipelineResolutionBench {
         Self::consume(self.retained_ready.resolve_for_emission())
     }
 
+    pub(super) fn retained_resolution(&self) -> PipelineResolution {
+        self.retained_ready.clone()
+    }
+
     #[inline(never)]
     pub fn registry_ready(&self) -> usize {
         let resolution = begin_pipeline_resolution(self.registry_original).expect("benchmark registry fixture disappeared");
