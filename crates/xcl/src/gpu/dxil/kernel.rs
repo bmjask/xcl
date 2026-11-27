@@ -655,7 +655,10 @@ impl Lw {
             lw.partner = match t {
                 0..=32 => Partner::Missing,
                 33..=64 => Partner::Present,
-                _ => Partner::Spin,
+                // A timeout in one half must fail the whole dispatch. HLSL's `abort()` can
+                // do that; direct DXIL has no equivalent operation, so let the production
+                // caller fall back to HLSL instead of risking half-local output.
+                _ => Partner::Unsupported("counter-paired wave64 needs fail-closed HLSL"),
             };
         }
         lw

@@ -258,8 +258,8 @@ impl Lw {
     /// The spin exchange (several console waves per group): the HLSL `xcl_x_meet` with
     /// `XCL_X_SPIN`. Each half stores its words in its slot (double-buffered by the parity
     /// of the exchange count), fences, adds its lane count to its arrival counter and waits
-    /// (one lane, bounded) for the partner's counter; a partner that never arrives marks
-    /// the wave dead and its exchanges give 0 from then on.
+    /// (one lane, bounded) for the partner's counter; production translation rejects this
+    /// form because one half cannot terminate the whole dispatch through direct DXIL.
     fn exchange_spin(&mut self, vals: &[Value]) -> Vec<Value> {
         let stores: Vec<(Value, Value)> = vals.iter().enumerate().map(|(i, &v)| (self.c(i as u32), v)).collect();
         let loads: Vec<Value> = (0..vals.len()).map(|i| self.c(i as u32)).collect();
