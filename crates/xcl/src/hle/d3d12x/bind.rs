@@ -3591,6 +3591,7 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 3);
 
         forget(list_ptr);
+        list_x::on_release(list_ptr as usize);
         let real_ok_owner = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
@@ -3633,7 +3634,9 @@ void main(uint t : SV_GroupIndex) {
         let shell_fail = 0x7210_0001usize;
         let shell_ok = 0x7210_0002usize;
         let shared_driver = 0x7210_0003usize;
-        let real_ok = 0x7210_0004usize;
+        let pso_vtable = [0usize, resolution_add_ref as usize, resolution_release as usize];
+        let mut real_ok_pso = ResolutionPso { vtable: pso_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let real_ok = &mut real_ok_pso as *mut ResolutionPso as usize;
         let sig_dispatch = 0x7210_00F8usize;
         let sig_root_changing = 0x7210_00F0usize;
         note_indirect_signature(sig_dispatch, IndirectSignatureInfo::new(true, false, None));
@@ -3699,10 +3702,13 @@ void main(uint t : SV_GroupIndex) {
         );
 
         forget(list_ptr);
+        list_x::on_release(list_ptr as usize);
         note_indirect_signature(sig_dispatch, IndirectSignatureInfo::default());
-        let _ = pso_async::released(shell_ok);
+        let real_ok_owner = pso_async::released(shell_ok);
         real::forget_pso_for_test(shell_ok);
         real::forget_pso_for_test(real_ok);
+        assert_eq!(real_ok_owner, real_ok);
+        assert_eq!(unsafe { resolution_release(real_ok_owner as *mut c_void) }, 0);
     }
 
     #[test]
