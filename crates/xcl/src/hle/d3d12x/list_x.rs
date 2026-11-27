@@ -2473,6 +2473,40 @@ fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
     aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExpiredGpuWait {
+    val: u64,
+    waiting_queue: usize,
+    waiting_queue_ty: i32,
+}
+
+/// Remove elapsed waits for diagnostics without advancing any fence state. An elapsed wall-clock
+/// timeout does not prove that the producer's work completed and must never synthesize completion.
+fn take_expired_gpu_wait(cell: &mut SyncCell, held: bool) -> Option<ExpiredGpuWait> {
+    let mut expired = None;
+    cell.armed_waits.retain_mut(|aw| {
+        if !wait_expired(aw, held) {
+            return true;
+        }
+        if expired.is_none_or(|old: ExpiredGpuWait| aw.val >= old.val) {
+            expired = Some(ExpiredGpuWait {
+                val: aw.val,
+                waiting_queue: aw.waiting_queue,
+                waiting_queue_ty: aw.waiting_queue_ty,
+            });
+        }
+        false
+    });
+    expired
+}
+
+fn stop_for_unresolved_wait(reason: &str) -> ! {
+    let message = format!("{reason} – the title is stopped before its remaining GPU submission");
+    crate::xlog_error!("{message}");
+    crate::report::write_final(Some(message));
+    super::real::end_title(0x8000_4005)
+}
+
 fn wake_sync_watchdog() {
     let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
@@ -2485,7 +2519,7 @@ fn wake_sync_watchdog() {
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
-                let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
+                let mut out: Vec<(u64, u64, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
                 if let Some(graph) = g.as_mut() {
                     for (&va, cell) in graph.cells.iter_mut() {
@@ -2506,43 +2540,25 @@ fn wake_sync_watchdog() {
                         if cell.armed_waits.is_empty() {
                             continue;
                         }
-                        let mut max_exp = 0u64;
-                        let mut waiter_q = 0usize;
-                        let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         let held = super::pso_async::title_held();
-                        cell.armed_waits.retain_mut(|aw| {
-                            if wait_expired(aw, held) {
-                                if aw.val >= max_exp {
-                                    max_exp = aw.val;
-                                    waiter_q = aw.waiting_queue;
-                                    waiter_ty = aw.waiting_queue_ty;
-                                }
-                                return false;
-                            }
-                            true
-                        });
+                        let expired = take_expired_gpu_wait(cell, held);
                         let removed = before - cell.armed_waits.len();
                         if removed > 0 {
                             ARMED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
                         }
-                        if max_exp > 0 {
-                            cell.cpu_signaled_max = cell.cpu_signaled_max.max(max_exp);
-                            cell.submitted_signals.retain(|s| s.val > max_exp);
-                            if let Some(ref f) = cell.fence {
-                                out.push((
-                                    va,
-                                    max_exp,
-                                    f.clone(),
-                                    waiter_q,
-                                    waiter_ty,
-                                    cell.submitted_queue.or(cell.recorded_last_queue),
-                                    cell.recorded_list_type.map(|t| t.0),
-                                    cell.recorded_max,
-                                    cell.submitted_max,
-                                    completed,
-                                ));
-                            }
+                        if let Some(expired) = expired {
+                            out.push((
+                                va,
+                                expired.val,
+                                expired.waiting_queue,
+                                expired.waiting_queue_ty,
+                                cell.submitted_queue.or(cell.recorded_last_queue),
+                                cell.recorded_list_type.map(|t| t.0),
+                                cell.recorded_max,
+                                cell.submitted_max,
+                                completed,
+                            ));
                         }
                     }
                 }
@@ -2554,20 +2570,18 @@ fn wake_sync_watchdog() {
                 }
             }
             let had_expired = !expired.is_empty();
-            for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
-                unsafe {
-                    let _ = fence.Signal(val);
-                }
+            for &(va, val, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in &expired {
                 let wq = queue_id(waiter_q);
                 let pq = prod_q.map(queue_id);
-                crate::xlog_warn!(
-                    "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
+                crate::xlog_error!(
+                    "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x})",
                     gpu_wait_watchdog_timeout().as_millis()
                 );
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
                 crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
+                stop_for_unresolved_wait("a GPU queue wait exceeded its watchdog without a graph-proven cycle");
             }
         });
     });
@@ -2842,6 +2856,13 @@ enum GpuWaitOutcome {
     FallbackCpu,
 }
 
+fn wait_is_resolved(outcome: GpuWaitOutcome, cpu_satisfied: bool) -> bool {
+    match outcome {
+        GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => true,
+        GpuWaitOutcome::FallbackCpu => cpu_satisfied,
+    }
+}
+
 /// Attempt to satisfy a `Wait64BitValueX(GREATER_EQUAL, u64::MAX)` on the GPU via
 /// `queue.Wait(&fence, w.value)` (or same-queue FIFO ordering) instead of blocking the
 /// submission thread on the CPU.
@@ -2971,23 +2992,30 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     GpuWaitOutcome::Handled
 }
 
-unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
+unsafe fn wait_all_on_with_timeout(
+    queue: *mut c_void,
+    waits: &[PendingWait],
+    list_writes: &[(u64, u64)],
+    timeout: Duration,
+) -> bool {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
-    let timeout = wait_timeout();
     let q_ty = queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0);
     for w in waits {
         if w.is_satisfied() {
             continue;
         }
-        match try_gpu_wait(queue, w, list_writes) {
-            GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
-            GpuWaitOutcome::FallbackCpu => {}
+        let outcome = try_gpu_wait(queue, w, list_writes);
+        if wait_is_resolved(outcome, false) {
+            continue;
         }
         let memory_stall = crate::stall::span(crate::stall::StallKind::MemorySynchronization);
         let satisfied = w.wait_until_satisfied(timeout);
         drop(memory_stall);
-        if !satisfied && once(&TIMEOUTS, 40) {
+        if wait_is_resolved(outcome, satisfied) {
+            continue;
+        }
+        if once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
                 g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
@@ -3015,6 +3043,14 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
                 crate::xlog_warn!("D3D12.X: recent Write32/64 calls ({total} total): [{}]", summary.join(", "));
             }
         }
+        return false;
+    }
+    true
+}
+
+unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
+    if !wait_all_on_with_timeout(queue, waits, list_writes, wait_timeout()) {
+        stop_for_unresolved_wait("a CPU fallback memory wait timed out without a proven completion");
     }
 }
 
@@ -6579,6 +6615,30 @@ mod tests {
     }
 
     #[test]
+    fn only_proven_gpu_resolution_or_a_satisfied_cpu_wait_allows_submission() {
+        assert!(wait_is_resolved(GpuWaitOutcome::Handled, false));
+        assert!(wait_is_resolved(GpuWaitOutcome::CycleSkip, false),
+            "an exact graph-proven cycle break remains accepted");
+        assert!(wait_is_resolved(GpuWaitOutcome::FallbackCpu, true),
+            "a delayed producer that satisfies the CPU poll remains accepted");
+        assert!(!wait_is_resolved(GpuWaitOutcome::FallbackCpu, false),
+            "elapsed time alone must not make an unresolved dependency executable");
+
+        let cell = AtomicU64::new(0);
+        let missing = PendingWait {
+            va: &cell as *const AtomicU64 as u64,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value: 1,
+            mask: u64::MAX,
+            after_write64: false,
+        };
+        assert!(!unsafe {
+            wait_all_on_with_timeout(std::ptr::null_mut(), &[missing], &[], Duration::from_millis(1))
+        });
+    }
+
+    #[test]
     fn wait64_flags_do_not_mask_the_recorded_counter() {
         let mut token = 0usize;
         let list = (&mut token as *mut usize).cast::<c_void>();
@@ -9418,6 +9478,36 @@ mod tests {
         assert!(!wait_expired(&mut aw, false), "its clock starts again when the hold ends");
         aw.armed_at = old;
         assert!(wait_expired(&mut aw, false));
+    }
+
+    #[test]
+    fn an_elapsed_gpu_wait_does_not_synthesize_fence_completion() {
+        let old = Instant::now() - gpu_wait_watchdog_timeout() * 2;
+        let mut cell = SyncCell {
+            cpu_signaled_max: 3,
+            submitted_max: 9,
+            armed_waits: vec![ArmedGpuWait {
+                val: 9,
+                waiting_queue: 0x7000,
+                waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0,
+                wait_seq: 2,
+                armed_at: old,
+                after_write64: false,
+            }],
+            submitted_signals: vec![SubmittedSignal { val: 9, queue: 0x7100, seq: 1 }],
+            ..Default::default()
+        };
+
+        let expired = take_expired_gpu_wait(&mut cell, false).expect("the elapsed wait");
+        assert_eq!(expired, ExpiredGpuWait {
+            val: 9,
+            waiting_queue: 0x7000,
+            waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0,
+        });
+        assert!(cell.armed_waits.is_empty());
+        assert_eq!(cell.cpu_signaled_max, 3, "watchdog expiry is not a CPU signal");
+        assert_eq!(cell.submitted_signals.len(), 1, "the real producer remains authoritative");
+        assert_eq!(cell.submitted_signals[0].val, 9);
     }
 
     #[test]
