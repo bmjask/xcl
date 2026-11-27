@@ -358,6 +358,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   - `XCL_PSO_PRESSURE_OBSERVE=1`: every 2 seconds, shadow the compute-pipeline eviction policy
     without changing residency. It retains rebuild inputs and logs bounded policy outcomes when
     adapter-local usage reaches 90% of budget. `XCL_ACTIVITY` is not required.
+  - `XCL_SPARSE_UNLOCKED_PLAN=1`: experimentally build at most one owned sparse parity plan per
+    submission outside the global sparse-state lock. Generation, mapping and page changes restore
+    the exact pending work and force the established locked uploader. Capture and revalidation
+    still hash pages under the lock, so this defaults off and does not yet claim a speedup.
   - `XCL_PSO_PRESSURE_EVICT=1`: enable that policy. At most one rebuildable non-console compute
     pipeline unused for 600 frames and resident for 60 frames is evicted per sample (at most 32
     candidates scanned and 8 exact transactions attempted); demand restores its exact identity.
