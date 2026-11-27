@@ -789,6 +789,34 @@ struct Class {
 static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
 static EXTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(super) struct TestCommandListClass {
+    ext: usize,
+}
+
+#[cfg(test)]
+impl Drop for TestCommandListClass {
+    fn drop(&mut self) {
+        CLASSES.lock().unwrap().retain(|c| c.ext != self.ext);
+    }
+}
+
+/// Register the synthetic adopted command-list vtable used by unit tests that call helpers whose
+/// method slots are normally populated by `adopt`.
+#[cfg(test)]
+pub(super) fn test_command_list_class(orig: usize, ext: usize) -> TestCommandListClass {
+    let iface = layout::find("ID3D12GraphicsCommandList").expect("command-list layout");
+    CLASSES.lock().unwrap().push(Class {
+        orig,
+        kind: Kind::CommandList,
+        ext,
+        iface,
+        public: iface.methods.len(),
+        scanned: iface.methods.len(),
+    });
+    TestCommandListClass { ext }
+}
+
 unsafe fn vt(obj: *mut c_void) -> *const usize {
     *(obj as *const *const usize)
 }

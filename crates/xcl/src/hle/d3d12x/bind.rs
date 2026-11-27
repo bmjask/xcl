@@ -2760,6 +2760,10 @@ void main(uint t : SV_GroupIndex) {
             execute_indirect_calls: AtomicUsize::new(0),
         });
         let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let _class = real::test_command_list_class(
+            orig_vt.as_ptr() as usize,
+            unsafe { ext_vt.as_ptr().add(1) } as usize,
+        );
         let original = 0x7100_489Eusize;
         let exact_raw = 0x7100_489Fusize;
         let replacement = 0x7100_48A1usize;
@@ -3702,8 +3706,8 @@ void main(uint t : SV_GroupIndex) {
         );
 
         forget(list_ptr);
-        list_x::on_release(list_ptr as usize);
         note_indirect_signature(sig_dispatch, IndirectSignatureInfo::default());
+        list_x::on_release(list_ptr as usize);
         let real_ok_owner = pso_async::released(shell_ok);
         real::forget_pso_for_test(shell_ok);
         real::forget_pso_for_test(real_ok);
