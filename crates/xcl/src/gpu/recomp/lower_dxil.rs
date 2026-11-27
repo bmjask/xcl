@@ -862,7 +862,13 @@ mod tests {
             let mut cs = compute_cs();
             cs.threads = [threads, 1, 1];
             for (lines, expected) in wave_branch_cases(true) {
-                let dxil = super::compute_split(&decode(&lines), &cs)
+                let insts = decode(&lines);
+                if threads == 128 {
+                    let _error = super::compute_split(&insts, &cs)
+                        .expect_err("counter-paired direct DXIL was accepted");
+                    continue;
+                }
+                let dxil = super::compute_split(&insts, &cs)
                     .unwrap_or_else(|e| panic!("split threads={threads}, {lines:?}: {e}"));
                 if crate::gpu::dxil::validate::validator_supported() {
                     crate::gpu::dxil::validate::validate(&dxil)
@@ -872,18 +878,6 @@ mod tests {
                     let out = runner::dispatch(&dxil, [1, 1, 1], &[], &vec![0; threads as usize]).unwrap();
                     // Wave 0 (lanes 0..63) has lane 63 matching `SRC0 = 63`.
                     assert_eq!(&out[..64], &[expected; 64], "split threads={threads} wave0, {lines:?}");
-                    if threads == 128 {
-                        // Wave 1 (lanes 64..127) has no lane with v0 == 63, so compare against
-                        // the regular direct split-wave64 translator across all 128 threads.
-                        let bytes: Vec<u8> = lines
-                            .iter()
-                            .flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap())
-                            .collect();
-                        let o = super::KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
-                        let ref_dxil = crate::gpu::dxil::kernel::translate_compute(&bytes, o, &cs).unwrap().dxil;
-                        let ref_out = runner::dispatch(&ref_dxil, [1, 1, 1], &[], &vec![0; 128]).unwrap();
-                        assert_eq!(&out[..128], &ref_out[..128], "split threads=128 parity, {lines:?}");
-                    }
                 }
             }
         }

@@ -1047,14 +1047,21 @@ impl Em {
         let mut flow = Flow::Next;
         let mut i = 0;
         while i < block.len() {
+            let emitted_from = self.out.len();
             if self.x64() {
                 if let Some(consumed) = self.try_emit_x64_reduction_tail(&block[i..]) {
                     i += consumed;
+                    self.x64_fail_closed_since(emitted_from);
                     continue;
                 }
             }
             let next = block.get(i + 1).map(|n| n.pc).unwrap_or(end);
             flow = self.inst(&block[i], next);
+            // A counter-paired half that timed out must not continue with the helper's
+            // placeholder value: later stores would turn a synchronization failure into
+            // plausible but undefined game output. The other half either returns here too
+            // or times out at the same exchange.
+            self.x64_fail_closed_since(emitted_from);
             if !matches!(flow, Flow::Next) {
                 break;
             }
@@ -4871,6 +4878,16 @@ impl Em {
         x64_spin_for(self.x64_hw_threads(), std::env::var("XCL_WAVE64_SPIN").ok().as_deref())
     }
 
+    /// Stop a counter-paired console wave after its partner failed to arrive. Multi-wave
+    /// compute/mesh groups must first leave the emulated safe barrier's live-wave count.
+    fn x64_fail_closed_since(&mut self, from: usize) {
+        let emitted = &self.out[from..];
+        let exchanged = ["xcl_x_meet(", "xcl_x_ballot(", "xcl_x_rla_uniform(", "xcl_x_rla_any("].iter().any(|s| emitted.contains(s));
+        if self.x64() && exchanged && self.x64_spin() {
+            self.line(if self.safe_barrier { "if (xcl_x_dead) { xcl_s_barrier_exit(); return; }" } else { "if (xcl_x_dead) return;" });
+        }
+    }
+
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which
     /// keeps its exchange in the top of it.
     fn x64_lds(&self) -> bool {
@@ -5175,6 +5192,9 @@ impl Em {
                 }
                 let ballot = self.ballot_fn();
                 let _ = writeln!(h, "            e0 = {ballot}(xcl_dispatch_live);\n        }} else {{\n            e0 = {ballot}(true);\n        }}\n        exec_lo = e0.x; exec_hi = e0.y; }}");
+                if self.x64() && self.x64_spin() {
+                    h.push_str(if self.safe_barrier { "    if (xcl_x_dead) { xcl_s_barrier_exit(); return; }\n" } else { "    if (xcl_x_dead) return;\n" });
+                }
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",
@@ -5220,6 +5240,9 @@ impl Em {
                     h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                if self.x64() && self.x64_spin() {
+                    h.push_str(if self.safe_barrier { "    if (xcl_x_dead) { xcl_s_barrier_exit(); return; }\n" } else { "    if (xcl_x_dead) return;\n" });
+                }
                 for &v in &self.vgprs {
                     let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
                     let _ = writeln!(h, "    uint v{v} = {init};");
@@ -6272,8 +6295,9 @@ const PRELUDE_X64: &str = r#"
 static uint xcl_cw = 0u;
 static uint xcl_xk = 0u;
 static uint xcl_xn = 0u;
-// the other half did not arrive in time (a desynchronised pair): no more exchanges, the
-// wave finishes with its own half's values instead of hanging the GPU
+static const uint XCL_X_FAIL = 0x80000000u;
+// the other half did not arrive in time (a desynchronised pair): the generated program
+// returns after the exchange instead of consuming a placeholder value
 static bool xcl_x_dead = false;
 // The console thread (index in the group) this hardware thread stands for. The threads of a
 // group are interchangeable, but the console forms its waves from consecutive thread
@@ -6310,14 +6334,26 @@ bool xcl_x_meet() {
     uint lanes = WaveActiveCountBits(true);
     uint ok = 1u;
     if (WaveIsFirstLane()) {
+        uint own = xcl_cw * 2u + xcl_half;
+        uint other = xcl_cw * 2u + (xcl_half ^ 1u);
         uint o;
-        InterlockedAdd(XCL_XC(xcl_cw * 2u + xcl_half), lanes, o);
+        InterlockedAdd(XCL_XC(own), lanes, o);
         uint need = (k + 1u) * xcl_xn;
-        [loop] for (uint n = 0u; ; n++) {
-            uint c;
-            InterlockedAdd(XCL_XC(xcl_cw * 2u + (xcl_half ^ 1u)), 0u, c);
-            if ((int)(c - need) >= 0) break;
-            if (n >= (1u << 20)) { ok = 0u; break; }
+        if (((o | (o + lanes) | need) & XCL_X_FAIL) != 0u) {
+            ok = 0u;
+        } else {
+            [loop] for (uint n = 0u; ; n++) {
+                uint c;
+                InterlockedAdd(XCL_XC(other), 0u, c);
+                if ((c & XCL_X_FAIL) != 0u) { ok = 0u; break; }
+                if (c >= need) break;
+                if (n >= (1u << 20)) {
+                    uint actual;
+                    InterlockedCompareExchange(XCL_XC(other), c, c | XCL_X_FAIL, actual);
+                    if (actual == c || (actual & XCL_X_FAIL) != 0u) { ok = 0u; break; }
+                    if (actual >= need) break;
+                }
+            }
         }
     }
     if (WaveReadLaneFirst(ok) == 0u) { xcl_x_dead = true; return false; }

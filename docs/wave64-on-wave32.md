@@ -67,8 +67,9 @@ SGPRs of both halves and the tests fail if they ever differ.
   verdict (`WaveReadLaneFirst`); a fence, then the read. Slots are double-buffered by the
   parity of k: the partner can be at most one exchange ahead, so it never overwrites the
   slot being read. The wait is bounded (2^20 polls): if it ever runs out (a desynchronised
-  pair – should not happen, see hazards), the wave stops exchanging (`xcl_x_dead`) and
-  finishes with half-local values instead of hanging the GPU until a TDR. This relies on
+  pair – should not happen, see hazards), compare-exchange marks the partner's arrival
+  counter failed unless that partner arrived first. Both halves then stop before later
+  instructions can consume half-local exchange values. This relies on
   co-resident waves of one group making progress, which holds on GPUs (all waves of a group
   are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
   variant everywhere (the test suite passes with it too).
