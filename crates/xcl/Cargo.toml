@@ -17,6 +17,10 @@ texture-selection-bench = []
 name = "xcl"
 path = "src/main.rs"
 
+[[bin]]
+name = "xcl-bench-compare"
+path = "src/bin/bench_compare.rs"
+
 [dependencies]
 miniz_oxide = { version = "0.9", features = ["simd"] }
 retour = "0.3"

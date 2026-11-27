@@ -441,6 +441,7 @@ labelled as missing; it does not infer significance or percentages.
 cargo bench -p xcl                          # synthetic performance benchmarks
 cargo bench -p xcl --bench core             # run one benchmark target
 cargo bench -p xcl --bench core -- --json   # one versioned JSON object per result
+cargo run -p xcl --bin xcl-bench-compare -- baseline.ndjson candidate.ndjson --max-regression-percent 5
 ```
 
 Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
@@ -448,7 +449,10 @@ executable. The dependency-free harness prints median, mean and minimum time plu
 positional substring selects benchmarks, and `cargo bench -p xcl -- --test` runs every closure once
 as a fast smoke check. `--json` emits newline-delimited, versioned records containing the sample
 count and iterations, nanoseconds per iteration and optional throughput, suitable for saved
-baselines and automated comparisons.
+baselines and automated comparisons. `xcl-bench-compare` requires an explicit allowed regression
+percentage, compares the observed medians, and exits 1 when any benchmark exceeds it. It refuses
+different benchmark sets or optional environment/hardware metadata. This is a deterministic
+threshold check, not a claim of statistical significance.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
