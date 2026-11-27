@@ -260,6 +260,14 @@ fn compare_u64(op: u32, lhs: u64, rhs: u64) -> Option<bool> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingWaitObservation {
+    Satisfied,
+    Pending,
+    Unreadable,
+    Invalid,
+}
+
 impl PendingWait {
     unsafe fn read_value(&self) -> Option<u64> {
         let addr = self.va as usize;
@@ -273,11 +281,22 @@ impl PendingWait {
         }
     }
 
-    unsafe fn is_satisfied(&self) -> bool {
+    unsafe fn observe(&self) -> PendingWaitObservation {
+        if !matches!(self.width, 4 | 8) {
+            return PendingWaitObservation::Invalid;
+        }
         let Some(cur) = self.read_value() else {
-            return true;
+            return PendingWaitObservation::Unreadable;
         };
-        compare_u64(self.comparison, cur & self.mask, self.value).unwrap_or(true)
+        match compare_u64(self.comparison, cur & self.mask, self.value) {
+            Some(true) => PendingWaitObservation::Satisfied,
+            Some(false) => PendingWaitObservation::Pending,
+            None => PendingWaitObservation::Invalid,
+        }
+    }
+
+    unsafe fn is_satisfied(&self) -> bool {
+        self.observe() == PendingWaitObservation::Satisfied
     }
 
     unsafe fn wait_until_satisfied(&self, timeout: Duration) -> bool {
@@ -6611,6 +6630,28 @@ mod tests {
             assert!(!w64.wait_until_satisfied(Duration::from_millis(5)));
             cell64.store(0x0000_0002_0000_0001, Ordering::Release);
             assert!(w64.is_satisfied());
+        }
+    }
+
+    #[test]
+    fn an_unreadable_wait_cell_is_not_completion() {
+        let wait = PendingWait {
+            va: 0x10,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value: 1,
+            mask: u64::MAX,
+            after_write64: false,
+        };
+        unsafe {
+            assert_eq!(wait.observe(), PendingWaitObservation::Unreadable);
+            assert!(!wait.is_satisfied(), "an unmapped address is not proof of completion");
+            assert!(!wait_all_on_with_timeout(
+                std::ptr::null_mut(),
+                &[wait],
+                &[],
+                Duration::ZERO,
+            ), "an unreadable CPU fallback must fail closed");
         }
     }
 
