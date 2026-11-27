@@ -465,6 +465,13 @@ impl SubmissionReceipt {
     }
 }
 
+/// Best-effort exact queue progress for diagnostics that own no submitted resources. The caller
+/// must already hold the queue's ordered turn. Failure leaves the sample untracked and does not
+/// poison a [`SubmissionGate`] or change later title submission behavior.
+pub(super) unsafe fn try_timing_receipt(queue: *mut c_void) -> Option<SubmissionReceipt> {
+    PendingSubmit { entries: Vec::new() }.finish_receipted(queue)
+}
+
 #[cfg(test)]
 pub(super) fn submission_receipt_for_test(completed: u64, value: u64) -> (SubmissionReceipt, &'static AtomicU64) {
     use std::mem::{offset_of, size_of};

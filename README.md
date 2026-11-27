@@ -338,7 +338,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   call reads the clock and updates counters.
   `XCL_GPU_TIMING=1` times each native title `ExecuteCommandLists` chunk on the CPU. The count and
   slowest duration/list count are written to `report.json`; chunks taking at least 50 ms are logged
-  (`XCL_GPU_TIMING_MS` changes that threshold). It does not measure when the GPU finishes.
+  (`XCL_GPU_TIMING_MS` changes that threshold). It also retains a bounded set of exact
+  queue-generation fence receipts and polls them without waiting while collecting the report.
+  Tracked, completed and pending receipt counts are reported separately, along with exact-marker
+  failures, receipts discarded on tracker contention and pending receipts evicted at the capacity
+  bound. They are the correlation foundation for GPU timestamp durations, not GPU timing samples.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
