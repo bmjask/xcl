@@ -7285,7 +7285,7 @@ mod tests {
             bindings: Bindings { heaps: vec![0x1010, 0x2020], topology: Some(4), stencil: Some(9), ..Default::default() },
             ..Default::default()
         };
-        state.written_ranges.insert(WriteProducer::InSegmentGpu, 0x3000, 0x20);
+        state.note_write(WriteProducer::InSegmentGpu, 0x3000, 0x20);
         state.occlusion.ended_early.push(earlier_query);
         assert!(state.occlusion.begin(query, D3D12_QUERY_TYPE_OCCLUSION).is_none());
 
