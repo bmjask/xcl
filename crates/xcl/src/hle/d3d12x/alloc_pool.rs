@@ -1425,30 +1425,44 @@ mod tests {
     /// GPU fence each still prevent reuse, then completion makes the backing reusable.
     #[test]
     fn released_lists_leave_only_live_recordings_and_gpu_work_holding_the_backing() {
-        use std::cell::Cell;
         use std::mem::{offset_of, size_of};
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
         #[repr(C)]
         struct Fence {
             vtable: *const usize,
-            value: Cell<u64>,
-            releases: Cell<u32>,
+            value: AtomicU64,
+            refs: AtomicU32,
+            final_releases: AtomicU32,
         }
         unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
-            (*this.cast::<Fence>()).value.get()
+            (*this.cast::<Fence>()).value.load(Ordering::Acquire)
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.fetch_add(1, Ordering::AcqRel) + 1
         }
         unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             let f = &*this.cast::<Fence>();
-            f.releases.set(f.releases.get() + 1);
-            0
+            let refs = f.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+            if refs == 0 {
+                f.final_releases.fetch_add(1, Ordering::AcqRel);
+            }
+            refs
         }
         extern "system" fn unexpected_call() { std::process::abort(); }
 
         const SLOT: usize = size_of::<usize>();
-        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        let vtable = Box::leak(Box::new([unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT]));
         vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
         vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
-        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), releases: Cell::new(0) };
+        let fence = Box::leak(Box::new(Fence {
+            vtable: vtable.as_ptr(),
+            value: AtomicU64::new(0),
+            refs: AtomicU32::new(1),
+            final_releases: AtomicU32::new(0),
+        }));
         let mut ids = Box::new([0u8; 3]);
         let alloc = ids.as_mut_ptr() as usize;
         let (first, second) = (alloc + 1, alloc + 2);
@@ -1458,7 +1472,7 @@ mod tests {
             let mut g = STATE.lock().unwrap();
             let b = g.as_mut().unwrap().backings.get_mut(&alloc).unwrap();
             // The map owns one synthetic fence reference, dropped by forget below.
-            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut *fence).cast()) };
             b.marks.insert(1, (f, 7));
         }
 
@@ -1478,14 +1492,17 @@ mod tests {
             !s.of_list.contains_key(&second) && s.backings[&alloc].users.is_empty()
                 && s.backings[&alloc].marks.len() == 1 && !unsafe { s.backings[&alloc].free() }
         };
-        fence.value.set(7);
+        fence.value.store(7, Ordering::Release);
         let reusable = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
         // Clean up the synthetic COM pointer before assertions, including on the old code.
         unsafe { forget(alloc) };
         assert!(first_removed, "another live recording must remain while the released list goes");
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
-        assert_eq!(fence.releases.get(), 1);
+        assert_eq!(
+            (fence.refs.load(Ordering::Acquire), fence.final_releases.load(Ordering::Acquire)),
+            (0, 1),
+        );
     }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
