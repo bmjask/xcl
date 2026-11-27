@@ -753,8 +753,8 @@ struct EvictionSelectionLimits {
     min_resident_frames: u64,
 }
 
-/// One bounded, point-in-time policy candidate. Actual eviction must still call
-/// `try_evict_current`, which revalidates every ownership transition.
+/// One bounded, point-in-time policy candidate. Actual eviction must extend the exact
+/// install-and-revalidate transaction through native detachment without reopening its race window.
 #[allow(dead_code)]
 struct SelectedEvictionCandidate {
     candidate: EvictionCandidate,
@@ -1273,16 +1273,37 @@ struct PressureObservation {
     deferred: usize,
     discarded: usize,
     requeue_saturated: usize,
+    prepared: usize,
+    recent: usize,
+    changed: usize,
+    busy: usize,
+    released: usize,
+    ledger_full: usize,
 }
 
 impl PressureObservation {
+    fn note_preflight(&mut self, result: EvictionPreflight) {
+        match result {
+            EvictionPreflight::Prepared => self.prepared += 1,
+            EvictionPreflight::Recent => self.recent += 1,
+            EvictionPreflight::Changed => self.changed += 1,
+            EvictionPreflight::Busy => self.busy += 1,
+            EvictionPreflight::Released => self.released += 1,
+            EvictionPreflight::LedgerFull => self.ledger_full += 1,
+        }
+    }
+
     fn line(self) -> String {
         format!(
-            "pipeline pressure observation: {:?}; {} scanned, {} eligible, {} deferred, {} discarded, {} requeue saturated",
+            "pipeline pressure observation: {:?}; {} scanned, {} eligible, {} deferred, {} discarded, {} requeue saturated; preflight {} prepared, {} recent, {} changed, {} busy, {} released, {} ledger full",
             self.mode, self.scanned, self.eligible, self.deferred, self.discarded, self.requeue_saturated,
+            self.prepared, self.recent, self.changed, self.busy, self.released, self.ledger_full,
         )
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvictionPreflight { Prepared, Recent, Changed, Busy, Released, LedgerFull }
 
 struct PressureObserver {
     admission: PressureAdmission,
@@ -1309,6 +1330,20 @@ impl PressureObserver {
         self.observe_on_after_drain(candidates, turn, frame, sample, || {})
     }
 
+    fn observe_exact_on<const N: usize, const E: usize, const R: usize>(
+        &mut self,
+        candidates: &CandidateQueue<Build, N>,
+        turn: u64,
+        frame: u64,
+        sample: Option<PressureSample>,
+        coordinator: &RestorationCoordinator<E, R>,
+    ) -> PressureObservation {
+        let limits = self.limits;
+        self.observe_on_with_preflight(candidates, turn, frame, sample, || {}, |selected| {
+            Some(preflight_exact_eviction_on(selected, frame, limits, coordinator, || {}))
+        })
+    }
+
     fn observe_on_after_drain<const N: usize>(
         &mut self,
         candidates: &CandidateQueue<Build, N>,
@@ -1316,6 +1351,18 @@ impl PressureObserver {
         frame: u64,
         sample: Option<PressureSample>,
         after_drain: impl FnOnce(),
+    ) -> PressureObservation {
+        self.observe_on_with_preflight(candidates, turn, frame, sample, after_drain, |_| None)
+    }
+
+    fn observe_on_with_preflight<const N: usize>(
+        &mut self,
+        candidates: &CandidateQueue<Build, N>,
+        turn: u64,
+        frame: u64,
+        sample: Option<PressureSample>,
+        after_drain: impl FnOnce(),
+        mut preflight: impl FnMut(&SelectedEvictionCandidate) -> Option<EvictionPreflight>,
     ) -> PressureObservation {
         let decision = self.admission.decide(turn, sample);
         let mut observation = PressureObservation { mode: self.admission.mode, ..Default::default() };
@@ -1356,7 +1403,15 @@ impl PressureObserver {
         let (selected, deferred) = partition_eviction_candidates(drained, frame, limits);
         observation.eligible = selected.len();
         observation.deferred = deferred.len() + nonactionable.len();
-        for candidate in selected.into_iter().map(|selected| selected.candidate).chain(deferred) {
+        let mut actionable = Vec::with_capacity(selected.len() + deferred.len());
+        for selected in selected {
+            if let Some(result) = preflight(&selected) {
+                observation.note_preflight(result);
+            }
+            actionable.push(selected.candidate);
+        }
+        actionable.extend(deferred);
+        for candidate in actionable {
             if let Err(candidate) = candidate.try_requeue_on(candidates) {
                 self.held.push(candidate.into_held());
             }
@@ -1408,8 +1463,9 @@ pub(crate) fn observe_pressure_turn(
 ) -> Option<String> {
     let observer = pressure_observer()?;
     let sample = local.map(|segment| PressureSample { observed_turn: turn, segment });
-    Some(observer.lock().unwrap().observe_on(
+    Some(observer.lock().unwrap().observe_exact_on(
         eviction_candidates(), turn, super::present::presents(), sample,
+        pipeline_restoration_coordinator(),
     ).line())
 }
 
@@ -1771,6 +1827,94 @@ impl<const E: usize, const R: usize> Drop for InstalledEviction<'_, E, R> {
     }
 }
 
+struct ExactEvictionSnapshot {
+    generation: NativeGeneration,
+    last_use_frame: u64,
+    completed_frame: u64,
+}
+
+fn exact_eviction_snapshot(build: &Build) -> Result<ExactEvictionSnapshot, EvictionPreflight> {
+    let done = build.done.lock().unwrap();
+    if !*done {
+        return Err(EvictionPreflight::Busy);
+    }
+    if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+        return Err(EvictionPreflight::Released);
+    }
+    let Some(recipe) = build.recipe.as_ref() else { return Err(EvictionPreflight::Changed) };
+    let rebuild = recipe.0.rebuild.lock().unwrap();
+    if rebuild.active || rebuild.waiters != 0 {
+        return Err(EvictionPreflight::Busy);
+    }
+    let raw = build.real.load(Ordering::Acquire);
+    if raw == 0 {
+        return Err(EvictionPreflight::Changed);
+    }
+    let (generation, residency) = recipe.pin_with_residency(raw);
+    let Some(generation) = generation.filter(|_| residency == Residency::Resident) else {
+        return Err(EvictionPreflight::Changed);
+    };
+    let last_use_frame = build.last_use_frame.load(Ordering::Relaxed);
+    let completed_frame = build.completed_frame.load(Ordering::Relaxed);
+    drop(rebuild);
+    drop(done);
+    Ok(ExactEvictionSnapshot { generation, last_use_frame, completed_frame })
+}
+
+fn exact_eviction_snapshot_is_old_enough(
+    snapshot: &ExactEvictionSnapshot, frame: u64, limits: EvictionSelectionLimits,
+) -> bool {
+    conservative_frame_age(frame, snapshot.last_use_frame) >= limits.min_unused_frames
+        && conservative_frame_age(frame, snapshot.completed_frame) >= limits.min_resident_frames
+}
+
+/// Exercise the exact production transaction through publication and revalidation, then always
+/// abort it. The admission lock prevents a restoration request from observing the transient
+/// `Evicted` record while the native pipeline remains resident.
+fn preflight_exact_eviction_on<const E: usize, const R: usize>(
+    selected: &SelectedEvictionCandidate,
+    frame: u64,
+    limits: EvictionSelectionLimits,
+    coordinator: &RestorationCoordinator<E, R>,
+    after_install: impl FnOnce(),
+) -> EvictionPreflight {
+    let build = &selected.candidate.build;
+    let _admission = coordinator.admission.lock().unwrap();
+    if build.eviction_token().is_some() {
+        return EvictionPreflight::Busy;
+    }
+    let first = match exact_eviction_snapshot(build) {
+        Ok(snapshot) => snapshot,
+        Err(result) => return result,
+    };
+    if !exact_eviction_snapshot_is_old_enough(&first, frame, limits) {
+        return EvictionPreflight::Recent;
+    }
+    let Some(reservation) = coordinator.reserve_eviction(build, first.generation.ledger_identity()) else {
+        return EvictionPreflight::LedgerFull;
+    };
+    let Some(token) = reservation.arm_detach() else { return EvictionPreflight::Changed };
+    if !build.install_eviction_token(&token) {
+        let _ = coordinator.evicted.finish(&token, EvictedBuildState::Poisoned);
+        let _ = coordinator.evicted.retire(&token);
+        return EvictionPreflight::Busy;
+    }
+    let installed = InstalledEviction {
+        coordinator, build: build.clone(), token: Some(token),
+    };
+    after_install();
+    let result = match exact_eviction_snapshot(build) {
+        Ok(second) if !first.generation.same(&second.generation) => EvictionPreflight::Changed,
+        Ok(second) if first.last_use_frame != second.last_use_frame
+            || first.completed_frame != second.completed_frame
+            || !exact_eviction_snapshot_is_old_enough(&second, frame, limits) => EvictionPreflight::Recent,
+        Ok(_) => EvictionPreflight::Prepared,
+        Err(result) => result,
+    };
+    drop(installed);
+    result
+}
+
 struct RestorationAttempt {
     token: RehydrateAttemptToken,
     job: Mutex<Option<JobHandle>>,
@@ -1843,6 +1987,7 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
     }
 
     fn refuse_rehydrate(&self, evicted: &EvictedBuildToken) -> bool {
+        let _admission = self.admission.lock().unwrap();
         match self.receipts.reserve_unique(evicted, true) {
             Ok(Some(reservation)) => reservation.refused().is_some(),
             Ok(None) | Err(_) => false,
@@ -1852,6 +1997,7 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
     fn queue_rehydrate(
         &self, evicted: &EvictedBuildToken, priority: RehydratePriority, background_ready: bool,
     ) -> Option<RestorationQueue<'_, E, R>> {
+        let _admission = self.admission.lock().unwrap();
         let allow_new = priority == RehydratePriority::Foreground || background_ready;
         let reservation = match self.receipts.reserve_unique(evicted, allow_new) {
             Err(record) => {
@@ -1933,6 +2079,7 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
     }
 
     fn retries(&self, limit: usize) -> Vec<RestorationRetry> {
+        let _admission = self.admission.lock().unwrap();
         self.evicted.records(limit).into_iter().filter_map(|record| {
             (record.state == EvictedBuildState::Evicted).then_some(RestorationRetry { token: record.token })
         }).collect()
@@ -3525,6 +3672,47 @@ mod used_tests {
         LedgerNativeGeneration { id, identity: id as usize + 0x1000 }
     }
 
+    fn completed_recipe_build(recipe: &Recipe) -> Arc<Build> {
+        let build = Arc::new(Build::new_keyed(
+            recipe.initial_job(), false, None, Some(recipe.clone()),
+        ));
+        let job = build.job.lock().unwrap().take().unwrap();
+        complete(&build, job());
+        build
+    }
+
+    fn selected_candidate(build: &Arc<Build>) -> SelectedEvictionCandidate {
+        SelectedEvictionCandidate {
+            candidate: resident_candidate(build).unwrap(), unused_frames: 100, resident_frames: 100,
+        }
+    }
+
+    fn assert_shadow_blocks_restoration(
+        selected: &SelectedEvictionCandidate,
+        coordinator: &Arc<RestorationCoordinator<2, 8>>,
+        action: impl FnOnce(Arc<RestorationCoordinator<2, 8>>, EvictedBuildToken) + Send + 'static,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut worker = None;
+        let limits = EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        };
+        assert_eq!(preflight_exact_eviction_on(selected, 1, limits, coordinator, || {
+            let token = selected.candidate.build.eviction_token().unwrap();
+            let coordinator = coordinator.clone();
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                action(coordinator, token);
+                done_tx.send(()).unwrap();
+            }));
+            started_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(std::time::Duration::from_millis(20)).is_err());
+        }), EvictionPreflight::Prepared);
+        done_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        worker.unwrap().join().unwrap();
+    }
+
     #[test]
     fn pressure_admission_rejects_ambiguous_serial_horizons() {
         let mut config = pressure_config();
@@ -5086,6 +5274,7 @@ mod used_tests {
             max_scan: 3, max_select: 2, min_unused_frames: 10, min_resident_frames: 0,
         };
         let mut observer = PressureObserver::new(config, limits).unwrap();
+        let coordinator = RestorationCoordinator::<4, 4>::new(1).unwrap();
         let positions = || (
             queue.enqueue.load(Ordering::Relaxed), queue.dequeue.load(Ordering::Relaxed),
         );
@@ -5107,7 +5296,8 @@ mod used_tests {
             observed_turn: 9,
             segment: super::super::memory_report::Segment { usage: 95, budget: 100 },
         };
-        let observed = observer.observe_on(&queue, 10, 100, Some(high));
+        let observed = observer.observe_exact_on(&queue, 10, 100, Some(high), &coordinator);
+        assert_eq!(positions(), (before.0 + 2, before.1 + 2), "an observed candidate was not requeued exactly once");
         assert_eq!(observed, PressureObservation {
             mode: PressureMode::Evicting,
             scanned: 2,
@@ -5115,9 +5305,13 @@ mod used_tests {
             deferred: 1,
             discarded: 0,
             requeue_saturated: 0,
+            prepared: 1,
+            ..Default::default()
         });
         assert!(builds.iter().all(|build| build.real.load(Ordering::Acquire) != 0));
         assert!(builds.iter().all(|build| build.candidate_queued.load(Ordering::Acquire)));
+        assert!(builds.iter().all(|build| build.eviction_token().is_none()));
+        assert!(coordinator.evicted.records(4).is_empty());
 
         let same_turn = PressureSample {
             observed_turn: 10,
@@ -5146,6 +5340,7 @@ mod used_tests {
             deferred: 0,
             discarded: 0,
             requeue_saturated: 2,
+            ..Default::default()
         });
         assert_eq!(observer.held.len(), 2);
         assert!(observer.held.iter().all(|candidate| candidate.build.upgrade()
@@ -5192,6 +5387,156 @@ mod used_tests {
             release(raw);
         }
         assert!(native.iter().all(|value| value.refs.load(Ordering::Relaxed) == 0));
+    }
+
+    #[test]
+    fn exact_eviction_preflight_aborts_without_mutating_the_resident_pipeline() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = completed_recipe_build(&recipe);
+        build.completed_frame.store(1, Ordering::Relaxed);
+        build.last_use_frame.store(2, Ordering::Relaxed);
+        let selected = selected_candidate(&build);
+        let coordinator = RestorationCoordinator::<1, 1>::new(1).unwrap();
+        let limits = EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 10, min_resident_frames: 10,
+        };
+
+        assert_eq!(preflight_exact_eviction_on(&selected, 100, limits, &coordinator, || {}),
+            EvictionPreflight::Prepared);
+        assert_eq!(build.real.load(Ordering::Acquire), raw);
+        assert!(build.eviction_token().is_none());
+        assert!(coordinator.evicted.records(1).is_empty());
+        assert_eq!(recipe.pin_with_residency(raw).1, Residency::Resident);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 2);
+
+        let panic_coordinator = RestorationCoordinator::<1, 1>::new(2).unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = preflight_exact_eviction_on(&selected, 100, limits, &panic_coordinator, || panic!("hook"));
+        })).is_err());
+        assert!(build.eviction_token().is_none());
+        assert!(panic_coordinator.evicted.records(1).is_empty());
+        assert_eq!(recipe.pin_with_residency(raw).1, Residency::Resident);
+
+        let pin = recipe.pin_with_residency(raw).0.unwrap();
+        let existing = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        assert_eq!(preflight_exact_eviction_on(&selected, 100, limits, &coordinator, || {}),
+            EvictionPreflight::Busy);
+        assert!(build.eviction_token().is_some_and(|token| token.exact(&existing)));
+        assert!(build.clear_eviction_token(&existing));
+        assert!(coordinator.evicted.finish(&existing, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&existing));
+        drop(pin);
+
+        build.last_use_frame.store(100, Ordering::Relaxed);
+        assert_eq!(preflight_exact_eviction_on(&selected, 100, limits, &coordinator, || {}),
+            EvictionPreflight::Recent);
+        build.last_use_frame.store(2, Ordering::Relaxed);
+        assert_eq!(preflight_exact_eviction_on(&selected, 100, limits, &coordinator, || {
+            assert!(matches!(recipe.begin_rebuild(), RebuildTurn::Leader));
+        }),
+            EvictionPreflight::Busy);
+        recipe.finish_rebuild(RebuildResult::Failed);
+        assert_eq!(preflight_exact_eviction_on(&selected, 100, limits, &coordinator, || {
+            build.owners.store(0, Ordering::Release);
+        }),
+            EvictionPreflight::Released);
+
+        release(build.real.swap(0, Ordering::AcqRel));
+        drop(selected); drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn every_restoration_admission_path_waits_for_shadow_cleanup() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = completed_recipe_build(&recipe);
+        let selected = selected_candidate(&build);
+        let coordinator = Arc::new(RestorationCoordinator::<2, 8>::new(1).unwrap());
+
+        assert_shadow_blocks_restoration(&selected, &coordinator,
+            |coordinator, token| { let _ = coordinator.refuse_rehydrate(&token); });
+        let _ = coordinator.reconcile(8);
+        assert_shadow_blocks_restoration(&selected, &coordinator,
+            |coordinator, token| { let _ = coordinator.queue_rehydrate(
+                &token, RehydratePriority::Background, true); });
+        let _ = coordinator.reconcile(8);
+        assert_shadow_blocks_restoration(&selected, &coordinator,
+            |coordinator, token| { let q = BuildQueue::new(); q.shutdown();
+                let _ = coordinator.request_exact_on(&token, RehydratePriority::Foreground, &q); });
+        let _ = coordinator.reconcile(8);
+        assert_shadow_blocks_restoration(&selected, &coordinator,
+            |coordinator, _| { let _ = coordinator.retries(1); });
+
+        release(build.real.swap(0, Ordering::AcqRel));
+        drop(selected); drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn exact_eviction_preflight_rejects_generation_change_after_install() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut second = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let second_raw = &mut second as *mut RebuildFakePso as usize;
+        let source = Arc::new(AtomicUsize::new(first_raw));
+        let recipe = Recipe::new({ let source = source.clone(); move || source.load(Ordering::Acquire) });
+        let build = completed_recipe_build(&recipe);
+        let selected = selected_candidate(&build);
+        let coordinator = RestorationCoordinator::<1, 1>::new(1).unwrap();
+        let limits = EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        };
+
+        assert_eq!(preflight_exact_eviction_on(&selected, 1, limits, &coordinator, || {
+            source.store(second_raw, Ordering::Release);
+            build.completed_frame.store(1, Ordering::Relaxed);
+            assert!(matches!(rebuild_once(&build), Some(RebuildResult::Published { generation: 2 })));
+        }), EvictionPreflight::Changed);
+        assert_eq!(build.real.load(Ordering::Acquire), second_raw);
+        assert!(build.eviction_token().is_none());
+        assert!(coordinator.evicted.records(1).is_empty());
+        assert_eq!((first.refs.load(Ordering::Relaxed), second.refs.load(Ordering::Relaxed)), (0, 2));
+
+        release(build.real.swap(0, Ordering::AcqRel));
+        drop(selected); drop(build); drop(recipe);
+        assert_eq!((first.refs.load(Ordering::Relaxed), second.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn exact_eviction_preflight_reports_full_ledger_and_timestamp_crossing() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = completed_recipe_build(&recipe);
+        let selected = selected_candidate(&build);
+        let coordinator = RestorationCoordinator::<1, 1>::new(1).unwrap();
+        let occupied_build = ledger_build();
+        let occupied = coordinator.reserve_eviction(&occupied_build, ledger_native(9)).unwrap().arm_detach().unwrap();
+        let limits = EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        };
+        assert_eq!(preflight_exact_eviction_on(&selected, 10, limits, &coordinator, || {}),
+            EvictionPreflight::LedgerFull);
+        assert!(coordinator.evicted.finish(&occupied, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&occupied));
+
+        assert_eq!(preflight_exact_eviction_on(&selected, 10, limits, &coordinator, || {
+            build.last_use_frame.store(1, Ordering::Relaxed);
+        }), EvictionPreflight::Recent);
+        assert!(build.eviction_token().is_none());
+        assert!(coordinator.evicted.records(1).is_empty());
+
+        release(build.real.swap(0, Ordering::AcqRel));
+        drop(selected); drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -5255,6 +5600,7 @@ mod used_tests {
             deferred: 1,
             discarded: 1,
             requeue_saturated: 0,
+            ..Default::default()
         });
         assert!(queue.pop().unwrap().upgrade().is_some());
     }
