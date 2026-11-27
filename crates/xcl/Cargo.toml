@@ -9,6 +9,9 @@ license.workspace = true
 name = "xcl"
 path = "src/lib.rs"
 
+[features]
+pipeline-resolution-bench = []
+
 [[bin]]
 name = "xcl"
 path = "src/main.rs"
