@@ -1692,6 +1692,26 @@ impl Drop for AcceptedCoordinatedUpload {
     }
 }
 
+/// Coordination ownership attached to one live sparse state generation. Keeping the three
+/// ledgers together prevents a later activation from pairing work, waits, or ring reservations
+/// from different device/fence generations.
+#[allow(dead_code)]
+struct SparseCoordination {
+    batches: SparseBatches,
+    waits: ForegroundWaits,
+    reservations: UploadReservations,
+}
+
+impl SparseCoordination {
+    fn new(state_generation: u64, fence_allocation: u64) -> Option<Self> {
+        Some(Self {
+            batches: SparseBatches::with_fence(state_generation, fence_allocation)?,
+            waits: ForegroundWaits::new(state_generation, fence_allocation)?,
+            reservations: UploadReservations::new(state_generation, UPLOAD_SLOTS, STAGING, RING_ALIGN),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreparationOutcome {
     Ready,
@@ -1718,6 +1738,10 @@ struct RetiredTiles {
 struct State {
     generation: u64,
     mapping_epoch: u64,
+    /// Exact-generation ownership for the staged prepare/accept/publish sparse path. The legacy
+    /// submission path remains authoritative until activation PRs journal and consume its work.
+    #[allow(dead_code)]
+    coordination: SparseCoordination,
     dev: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -2328,9 +2352,14 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
         let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
         let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
+        let generation = NEXT_STATE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let fence_allocation = fence.as_raw() as usize as u64;
+        let coordination = SparseCoordination::new(generation, fence_allocation)
+            .expect("valid sparse state generation and fence identity");
         Ok(State {
-            generation: NEXT_STATE_GENERATION.fetch_add(1, Ordering::Relaxed),
+            generation,
             mapping_epoch: 0,
+            coordination,
             dev: dev.clone(),
             queue,
             fence,
@@ -4933,6 +4962,21 @@ mod tests {
         assert!(matches!(SparseBatches::new(u64::MAX).replace_generation(0), Err(SparseBatchError::StaleGeneration)));
     }
 
+    #[test]
+    fn live_sparse_coordination_owns_one_exact_generation() {
+        let coordination = SparseCoordination::new(101, 501).unwrap();
+        {
+            let batches = coordination.batches.ledger.lock().unwrap();
+            assert_eq!(batches.work.state_generation, 101);
+            assert_eq!(batches.fence, Some(SparseFenceIdentity { state_generation: 101, allocation: 501 }));
+        }
+        assert_eq!(coordination.waits.fence(), SparseFenceIdentity { state_generation: 101, allocation: 501 });
+        let reservation = coordination.reservations.reserve(0, RING_ALIGN).unwrap();
+        assert_eq!(reservation.token.unwrap().state_generation, 101);
+        assert!(SparseCoordination::new(0, 501).is_none());
+        assert!(SparseCoordination::new(101, 0).is_none());
+    }
+
     fn wait_ready(fence: SparseFenceIdentity, through: u64, value: Option<u64>) -> SparseReadyReceipt {
         SparseReadyReceipt { state_generation: fence.state_generation, fence, through, required_fence: value }
     }
@@ -5516,6 +5560,7 @@ mod tests {
             let mut s = State {
                 generation: 1,
                 mapping_epoch: 0,
+                coordination: SparseCoordination::new(1, 1).unwrap(),
                 dev,
                 queue,
                 fence,
@@ -5883,6 +5928,7 @@ mod tests {
             let mut s = State {
                 generation: 1,
                 mapping_epoch: 0,
+                coordination: SparseCoordination::new(1, 1).unwrap(),
                 dev,
                 queue,
                 fence,
@@ -5987,6 +6033,7 @@ mod tests {
             let mut s = State {
                 generation: 1,
                 mapping_epoch: 0,
+                coordination: SparseCoordination::new(1, 1).unwrap(),
                 dev,
                 queue,
                 fence,
@@ -6127,6 +6174,7 @@ mod tests {
         let s = State {
             generation: 1,
             mapping_epoch: 0,
+            coordination: SparseCoordination::new(1, 1).unwrap(),
             dev,
             queue,
             fence,
