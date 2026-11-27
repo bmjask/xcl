@@ -1424,7 +1424,7 @@ impl<'a> SubmissionChunk<'a> {
 
 /// Submit one exact title chunk, adding one shared retirement receipt when a recording
 /// can read the shared view heap or owns native pipeline generation pins. The ordinary path stays
-/// on `SubmissionGate::submit`, avoiding a marker, allocation or lock when neither applies.
+/// on `SubmissionGate::submit`; opt-in timing may append a best-effort diagnostic marker.
 pub(super) unsafe fn submit_title_chunk<'a>(
     gate: &mut super::alloc_pool::SubmissionGate,
     queue: *mut c_void,
@@ -1438,8 +1438,16 @@ pub(super) unsafe fn submit_title_chunk<'a>(
     if any_recording_poisoned(lists) {
         return false;
     }
+    let track_gpu_completion = super::real::gpu_timing_on();
     if !protect_shared_view && !protect_native_generations {
-        return gate.submit(queue, lists, prepare, execute);
+        let submitted = gate.submit(queue, lists, prepare, execute);
+        if submitted && track_gpu_completion {
+            match super::alloc_pool::try_timing_receipt(queue) {
+                Some(receipt) => super::real::note_gpu_completion_receipt(receipt, lists.len(), queue as usize),
+                None => super::real::note_gpu_completion_receipt_failure(),
+            }
+        }
+        return submitted;
     }
     let mut epoch = None;
     let submitted = gate.submit_receipted(
@@ -1453,6 +1461,17 @@ pub(super) unsafe fn submit_title_chunk<'a>(
         },
         execute,
     );
+    if track_gpu_completion {
+        match &submitted {
+            super::alloc_pool::ReceiptedSubmission::Executed(receipt) => {
+                super::real::note_gpu_completion_receipt(receipt.clone(), lists.len(), queue as usize);
+            }
+            super::alloc_pool::ReceiptedSubmission::ExecutedUntracked => {
+                super::real::note_gpu_completion_receipt_failure();
+            }
+            super::alloc_pool::ReceiptedSubmission::NotExecuted => {}
+        }
+    }
     finish_title_submission(
         submitted,
         epoch,

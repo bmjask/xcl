@@ -18,7 +18,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
@@ -190,6 +190,23 @@ pub struct D3d12Stats {
     /// Counts in base-2 nanosecond buckets. Bucket zero includes zero and one nanosecond.
     #[serde(default)]
     pub submission_histogram_log2_ns: Vec<u64>,
+    /// Opt-in title submissions correlated with an exact queue-generation fence receipt. These
+    /// are completion observations, not GPU timestamp durations.
+    #[serde(default)]
+    pub gpu_completion_receipts_tracked: u64,
+    #[serde(default)]
+    pub gpu_completion_completed: u64,
+    #[serde(default)]
+    pub gpu_completion_pending: usize,
+    /// Tracked receipts evicted because the bounded pending queue was full.
+    #[serde(default)]
+    pub gpu_completion_capacity_evictions: u64,
+    /// Submitted chunks for which an exact queue marker could not be created.
+    #[serde(default)]
+    pub gpu_completion_receipt_failures: u64,
+    /// Exact receipts discarded rather than blocking a submitter on report collection.
+    #[serde(default)]
+    pub gpu_completion_tracker_contentions: u64,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -258,13 +275,119 @@ static SUBMISSION_TIMING: Mutex<SubmissionTiming> = Mutex::new(SubmissionTiming 
     histogram: [0; crate::stall::HISTOGRAM_BUCKETS],
 });
 
+#[allow(dead_code)] // sequence metadata is consumed by the GPU timestamp-query stage
+struct PendingGpuCompletion {
+    receipt: super::alloc_pool::SubmissionReceipt,
+    sequence: u64,
+    lists: usize,
+    queue: usize,
+}
+
+#[derive(Default)]
+struct GpuCompletionTiming {
+    tracked: u64,
+    completed: u64,
+    capacity_evictions: u64,
+    pending: VecDeque<PendingGpuCompletion>,
+}
+
+impl GpuCompletionTiming {
+    const MAX_PENDING: usize = 16 * 1024;
+
+    fn push(
+        &mut self,
+        receipt: super::alloc_pool::SubmissionReceipt,
+        lists: usize,
+        queue: usize,
+    ) {
+        self.push_with_limit(receipt, lists, queue, Self::MAX_PENDING);
+    }
+
+    fn push_with_limit(
+        &mut self,
+        receipt: super::alloc_pool::SubmissionReceipt,
+        lists: usize,
+        queue: usize,
+        max_pending: usize,
+    ) {
+        debug_assert!(max_pending > 0);
+        self.tracked = self.tracked.saturating_add(1);
+        if self.pending.len() == max_pending {
+            self.pending.pop_front();
+            self.capacity_evictions = self.capacity_evictions.saturating_add(1);
+        }
+        self.pending.push_back(PendingGpuCompletion { receipt, sequence: self.tracked, lists, queue });
+    }
+
+    /// Poll exact queue-generation receipts from report collection, never from title submission.
+    /// `GetCompletedValue` does not wait; incomplete samples stay owned for a later report poll.
+    fn retire_completed(&mut self) {
+        let mut pending = VecDeque::with_capacity(self.pending.len());
+        for sample in self.pending.drain(..) {
+            if sample.receipt.is_complete() {
+                self.completed = self.completed.saturating_add(1);
+            } else {
+                pending.push_back(sample);
+            }
+        }
+        self.pending = pending;
+    }
+}
+
+static GPU_COMPLETION_TIMING: Mutex<GpuCompletionTiming> = Mutex::new(GpuCompletionTiming {
+    tracked: 0,
+    completed: 0,
+    capacity_evictions: 0,
+    pending: VecDeque::new(),
+});
+static GPU_COMPLETION_RECEIPT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static GPU_COMPLETION_TRACKER_CONTENTIONS: AtomicU64 = AtomicU64::new(0);
+
 fn gpu_timing_on_value(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-fn gpu_timing_on() -> bool {
+pub(super) fn gpu_timing_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| gpu_timing_on_value(std::env::var("XCL_GPU_TIMING").ok().as_deref()))
+}
+
+pub(super) fn note_gpu_completion_receipt(
+    receipt: super::alloc_pool::SubmissionReceipt,
+    lists: usize,
+    queue: usize,
+) {
+    if !gpu_timing_on() {
+        return;
+    }
+    // Instrumentation must never serialize title submitters behind report collection.
+    try_note_gpu_completion_receipt(
+        &GPU_COMPLETION_TIMING,
+        &GPU_COMPLETION_TRACKER_CONTENTIONS,
+        receipt,
+        lists,
+        queue,
+    );
+}
+
+fn try_note_gpu_completion_receipt(
+    timing: &Mutex<GpuCompletionTiming>,
+    contentions: &AtomicU64,
+    receipt: super::alloc_pool::SubmissionReceipt,
+    lists: usize,
+    queue: usize,
+) -> bool {
+    if let Ok(mut timing) = timing.try_lock() {
+        timing.push(receipt, lists, queue);
+        true
+    } else {
+        contentions.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+pub(super) fn note_gpu_completion_receipt_failure() {
+    GPU_COMPLETION_RECEIPT_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
 fn slow_submission_us_value(value: Option<&str>) -> u64 {
@@ -547,6 +670,13 @@ pub fn stats() -> D3d12Stats {
         .unwrap_or_default();
     let (presents, boundaries) = super::present::counters();
     let submission_timing = SUBMISSION_TIMING.lock().map(|timing| *timing).unwrap_or_default();
+    let (gpu_completion_receipts_tracked, gpu_completion_completed, gpu_completion_pending, gpu_completion_capacity_evictions) =
+        GPU_COMPLETION_TIMING.lock().map(|mut timing| {
+            if gpu_timing_on() {
+                timing.retire_completed();
+            }
+            (timing.tracked, timing.completed, timing.pending.len(), timing.capacity_evictions)
+        }).unwrap_or_default();
     D3d12Stats {
         backend: format!("{:?}", super::backend()).to_lowercase(),
         adapter: ADAPTER.lock().map(|a| a.clone()).unwrap_or_default(),
@@ -581,6 +711,12 @@ pub fn stats() -> D3d12Stats {
         submission_p95_upper_ms: submission_timing.percentile_upper_ns(95) as f64 / 1_000_000.0,
         submission_p99_upper_ms: submission_timing.percentile_upper_ns(99) as f64 / 1_000_000.0,
         submission_histogram_log2_ns: submission_timing.histogram.into(),
+        gpu_completion_receipts_tracked,
+        gpu_completion_completed,
+        gpu_completion_pending,
+        gpu_completion_capacity_evictions,
+        gpu_completion_receipt_failures: GPU_COMPLETION_RECEIPT_FAILURES.load(Ordering::Relaxed),
+        gpu_completion_tracker_contentions: GPU_COMPLETION_TRACKER_CONTENTIONS.load(Ordering::Relaxed),
     }
 }
 
@@ -9606,6 +9742,61 @@ mod submission_timing_tests {
         assert_eq!((timing.submissions, timing.total_ns, timing.slowest_ns), (u64::MAX, u64::MAX, u64::MAX));
         assert_eq!(timing.histogram[crate::stall::HISTOGRAM_BUCKETS - 1], 1);
         assert_eq!(timing.percentile_upper_ns(99), u64::MAX);
+    }
+
+    #[test]
+    fn gpu_completion_timing_retires_only_the_exact_completed_receipt() {
+        let (first, first_completed) = super::super::alloc_pool::submission_receipt_for_test(0, 3);
+        let (second, second_completed) = super::super::alloc_pool::submission_receipt_for_test(0, 7);
+        let second_identity = second.fence_identity();
+        let mut timing = GpuCompletionTiming::default();
+        // A reused raw queue address cannot conflate the retained fence generations.
+        timing.push(first, 2, 0x7000);
+        timing.push(second, 5, 0x7000);
+
+        first_completed.store(3, Ordering::Release);
+        timing.retire_completed();
+        assert_eq!(timing.tracked, 2);
+        assert_eq!(timing.completed, 1);
+        assert_eq!(timing.pending.len(), 1);
+        assert_eq!(timing.pending[0].sequence, 2);
+        assert_eq!(timing.pending[0].lists, 5);
+        assert_eq!(timing.pending[0].queue, 0x7000);
+        assert_eq!(timing.pending[0].receipt.fence_identity(), second_identity);
+        assert_eq!(timing.pending[0].receipt.target_value(), 7);
+
+        second_completed.store(7, Ordering::Release);
+        timing.retire_completed();
+        assert!(timing.pending.is_empty());
+        assert_eq!(timing.completed, 2);
+    }
+
+    #[test]
+    fn gpu_completion_timing_bounds_unobserved_receipts() {
+        let (receipt, _) = super::super::alloc_pool::submission_receipt_for_test(0, 4);
+        let mut timing = GpuCompletionTiming::default();
+        timing.push_with_limit(receipt.clone(), 1, 0x8000, 2);
+        timing.push_with_limit(receipt.clone(), 2, 0x8000, 2);
+        timing.push_with_limit(receipt, 3, 0x8000, 2);
+
+        assert_eq!(timing.tracked, 3);
+        assert_eq!(timing.capacity_evictions, 1);
+        assert_eq!(timing.pending.len(), 2);
+        assert_eq!(timing.pending[0].sequence, 2);
+        assert_eq!(timing.pending[1].sequence, 3);
+    }
+
+    #[test]
+    fn gpu_completion_timing_counts_receipts_discarded_on_contention() {
+        let timing = Mutex::new(GpuCompletionTiming::default());
+        let contentions = AtomicU64::new(0);
+        let (receipt, _) = super::super::alloc_pool::submission_receipt_for_test(0, 4);
+        let held = timing.lock().unwrap();
+
+        assert!(!try_note_gpu_completion_receipt(&timing, &contentions, receipt, 1, 0x9000));
+        assert_eq!(contentions.load(Ordering::Relaxed), 1);
+        assert_eq!(held.tracked, 0);
+        assert!(held.pending.is_empty());
     }
 
     #[test]
