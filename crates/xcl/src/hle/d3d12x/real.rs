@@ -4563,7 +4563,7 @@ fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() 
 }
 
 /// `XCL_PSO_TRACE=1`: every driver compile is logged, not only huge ones.
-fn pso_trace() -> bool {
+pub(super) fn pso_trace() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1"))
 }
@@ -5150,13 +5150,18 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         in_driver += took;
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+    let mut accepted_blob = if reused { cached.clone() } else { None };
     if hr >= 0 && !reused {
         let (memory, to_disk) = compute_blob_kept(dxil.len(), in_driver, driver_cache::compute_keep_threshold());
         if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, memory, to_disk && disk.is_some())) {
             driver_cache::keep(p, &b, in_driver);
+            accepted_blob = Some(b);
         }
     } else if reused && from_disk {
         driver_cache::note(true, None);
+    }
+    if hr >= 0 {
+        crate::pipelines::warm_replay::accepted(&[(disk.as_deref(), accepted_blob.as_ref(), reused && from_disk)]);
     }
     (hr, in_driver, reused)
 }
@@ -6082,6 +6087,48 @@ mod graphics_blob_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn accepted_legacy_graphics_blob_is_kept_under_the_current_name() {
+        let dir = std::env::temp_dir().join(format!("xcl-graphics-legacy-{}", std::process::id()));
+        let gkey = (0xabcdef0123456789, 12);
+        let old = dir.join(driver_cache::graphics_name(gkey.0, gkey.1));
+        let current = dir.join("gfx-current-12.pso");
+        let blob = b"driver-accepted blob";
+        assert!(driver_cache::write(&old, blob));
+        let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        let build = unsafe {
+            graphics_pso_through_cache(gkey, Some(&current), std::time::Duration::ZERO, &mut copy, false, 0,
+                |c| {
+                    assert_eq!(std::slice::from_raw_parts(c.CachedPSO.pCachedBlob as *const u8, c.CachedPSO.CachedBlobSizeInBytes), blob);
+                    0
+                },
+                || panic!("accepted blob does not need recompilation"))
+        };
+        assert!(build.reused);
+        assert_eq!(driver_cache::load(&current).as_deref(), Some(blob.as_slice()));
+        assert_eq!(driver_cache::load(&old).as_deref(), Some(blob.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graphics_preparation_records_only_the_blob_kept_on_disk() {
+        let dir = std::env::temp_dir().join(format!("xcl-graphics-prepared-{}", std::process::id()));
+        let path = dir.join("prepared.pso");
+        let bytes = std::sync::Arc::new(b"verified driver blob".to_vec());
+        let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        let (ok, files) = crate::pipelines::warm_replay::capture(|| {
+            let build = unsafe {
+                graphics_pso_through_cache((0x54a3, 19), Some(&path), std::time::Duration::ZERO,
+                    &mut copy, false, 0, |_| 0, || Some(bytes.clone()))
+            };
+            build.hr >= 0
+        });
+        assert!(ok);
+        assert_eq!(files.len(), 1, "a successful graphics PSO must give startup a verified disk receipt");
+        assert_eq!(driver_cache::load(&path).as_deref(), Some(bytes.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// On the device (the software one in tests): a pipeline made twice is compiled once and
     /// made from the blob kept on disk the second time; a damaged file is dropped and the
     /// pipeline compiled again.
@@ -6231,8 +6278,14 @@ unsafe fn graphics_pso_through_cache(
     let bytes = gkey.1;
     let mut cached = graphics_blob(gkey);
     let from_disk = cached.is_none();
+    let mut legacy_blob = false;
     if from_disk {
         cached = disk.and_then(driver_cache::load).map(std::sync::Arc::new);
+        if cached.is_none() {
+            let old = disk.and_then(|p| p.parent()).map(|dir| dir.join(driver_cache::graphics_name(gkey.0, bytes)));
+            cached = old.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+            legacy_blob = cached.is_some();
+        }
     }
     let build = create_graphics_pso_cached(
         copy,
@@ -6240,28 +6293,42 @@ unsafe fn graphics_pso_through_cache(
         rect_gs,
         || {
             forget_graphics_blob(gkey);
-            if from_disk {
+            if from_disk && !legacy_blob {
                 driver_cache::note(false, disk);
             }
         },
         |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((record, has_cached)), f),
         create,
     );
+    let mut accepted_blob = if build.reused { cached.clone() } else { None };
     if build.cache_eligible {
         if let (Some(b), Some(p)) = (blob_of(), disk) {
             driver_cache::keep_at(p, &b, build.in_driver, keep_min);
+            accepted_blob = Some(b);
         }
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
+    }
+    if build.reused && legacy_blob {
+        if let (Some(b), Some(p)) = (cached.as_deref(), disk) {
+            let _ = driver_cache::write(p, b);
+        }
+    }
+    if build.hr >= 0 {
+        crate::pipelines::warm_replay::accepted(&[(disk, accepted_blob.as_ref(), build.reused && from_disk && !legacy_blob)]);
     }
     build
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
+    translated_graphics_pso_with_bounds(this, f, desc, riid, ppv, false)
 }
 
-unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+unsafe fn translated_graphics_pso_with_bounds(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, depth_bounds: bool) -> Option<HRESULT> {
+    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv, depth_bounds))
+}
+
+unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, depth_bounds: bool) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
@@ -6280,6 +6347,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         return None;
     }
     if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
+        if depth_bounds { return None; }
         let _ = f;
         return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
     }
@@ -6339,7 +6407,12 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
-    let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
+    let mut gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
+    if depth_bounds {
+        let mut key = gkey.0.to_le_bytes().to_vec();
+        key.extend_from_slice(b"DEPTH_STENCIL1");
+        gkey.0 = crate::gpu::shader::fnv64(&key);
+    }
     // (no file without the adapter's identity: it could be another adapter's)
     let driver = driver_identity(this);
     let disk = driver.and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
@@ -6354,7 +6427,15 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         &mut copy,
         rect_gs.is_some(),
         ps_hash,
-        |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
+        |c| {
+            if depth_bounds {
+                let stream = graphics_depth_bounds_stream(c);
+                let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+                finish_pso(this, f, desc.as_ptr().cast(), riid, ppv)
+            } else {
+                finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)
+            }
+        },
         || keep_graphics_blob(gkey, *ppv, bytes),
     );
     GRAPHICS_STAGES.with(|s| s.set(None));
@@ -6539,6 +6620,14 @@ impl OwnedDesc {
             OwnedDesc::Compute(d, _) => &**d as *const _ as *const c_void,
             OwnedDesc::Graphics(d, ..) => &**d as *const _ as *const c_void,
             OwnedDesc::Stream(d, ..) => &**d as *const _ as *const c_void,
+        }
+    }
+
+    unsafe fn journal(&self) -> u64 {
+        match self {
+            OwnedDesc::Graphics(d, ..) => super::pso_journal::graphics(d),
+            OwnedDesc::Compute(d, _) => super::pso_journal::compute(d),
+            OwnedDesc::Stream(_, buf, blobs) => super::pso_journal::mesh_stream(buf, blobs),
         }
     }
 }
@@ -6847,6 +6936,65 @@ pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPEL
     made
 }
 
+/// Build a captured pipeline on the preparation device and keep its driver blob.
+pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, replay: &super::pso_journal::Replay, driver: impl Fn() -> G) -> Result<(), String> {
+    let this = dev.as_raw();
+    let _slot = driver();
+    match replay {
+        super::pso_journal::Replay::Graphics(desc, _, _, _, false) => {
+            if prepare_graphics(this as usize, desc) { Ok(()) } else { Err("graphics pipeline could not be prepared".into()) }
+        }
+        super::pso_journal::Replay::Graphics(desc, _, _, _, true) => {
+            let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let made = matches!(translated_graphics_pso_with_bounds(this, f, desc.as_ref() as *const _ as *const c_void,
+                &pc_iid(Kind::PipelineState), &mut out, true), Some(hr) if hr >= 0) && !out.is_null();
+            super::pso_async::release(out as usize);
+            if made { Ok(()) } else { Err("depth-bounds graphics pipeline could not be prepared".into()) }
+        }
+        super::pso_journal::Replay::Compute(desc, _) => {
+            let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let made = matches!(translated_compute_pso(this, f, desc.as_ref() as *const _ as *const c_void,
+                &pc_iid(Kind::PipelineState), &mut out), Some(Ok(hr)) if hr >= 0) && !out.is_null();
+            super::pso_async::release(out as usize);
+            if made { Ok(()) } else { Err("compute pipeline could not be prepared".into()) }
+        }
+        super::pso_journal::Replay::Mesh(..) => {
+            Err("pipeline needs the live render device – left to the title".into())
+        }
+    }
+}
+
+/// Prepare a captured pipeline on the live device before the title requests it.
+pub(crate) unsafe fn prepare_live(_hash: u64, replay: &super::pso_journal::Replay) -> bool {
+    let this = device_raw();
+    if this.is_null() { return false; }
+    let iid = pc_iid(Kind::PipelineState);
+    let mut out = std::ptr::null_mut();
+    let hr = match replay {
+        super::pso_journal::Replay::Graphics(desc, _, _, _, false) => {
+            let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+            translated_graphics_pso(this, f, desc.as_ref() as *const _ as *const c_void, &iid, &mut out)
+        }
+        super::pso_journal::Replay::Graphics(desc, _, _, _, true) => {
+            let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+            translated_graphics_pso_with_bounds(this, f, desc.as_ref() as *const _ as *const c_void, &iid, &mut out, true)
+        }
+        super::pso_journal::Replay::Compute(desc, _) => {
+            let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+            translated_compute_pso(this, f, desc.as_ref() as *const _ as *const c_void, &iid, &mut out).and_then(Result::ok)
+        }
+        super::pso_journal::Replay::Mesh(words, _) => {
+            let stream = [std::mem::size_of_val(words.as_slice()), words.as_ptr() as usize];
+            translated_mesh_stream(this, stream.as_ptr().cast(), &iid, &mut out)
+        }
+    };
+    let made = hr.is_some_and(|h| h >= 0) && !out.is_null();
+    super::pso_async::release(out as usize);
+    made
+}
+
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
@@ -6880,6 +7028,10 @@ unsafe fn note_pipeline_for_dump(this: *mut c_void, desc: *const c_void, ppv: *m
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
 unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
+    if super::pso_journal::enabled() && crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>())
+        && shader_bytes(&(*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC)).VS).is_some_and(crate::gpu::recomp::pso::is_console) {
+        if let Some(owned) = own_graphics(desc) { owned.journal(); }
+    }
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
@@ -6939,6 +7091,10 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
 unsafe fn compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::Pipeline);
     super::null::capture_compute_desc(desc as *const u8);
+    if super::pso_journal::enabled() && crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>())
+        && shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS).is_some_and(crate::gpu::recomp::pso::is_console) {
+        if let Some(owned) = own_compute(desc) { owned.journal(); }
+    }
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
@@ -7086,6 +7242,41 @@ impl StreamOut {
     fn shader_bytes(&self) -> usize {
         self.1
     }
+}
+
+/// Preserve DEPTH_STENCIL1 when a captured graphics stream is rebuilt with translated shaders.
+/// A plain graphics PSO description has no depth-bounds field.
+fn graphics_depth_bounds_stream(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> StreamOut {
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &d.pRootSignature);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &d.VS);
+    if d.PS.BytecodeLength != 0 { out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &d.PS); }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
+    let depth = D3D12_DEPTH_STENCIL_DESC1 {
+        DepthEnable: d.DepthStencilState.DepthEnable,
+        DepthWriteMask: d.DepthStencilState.DepthWriteMask,
+        DepthFunc: d.DepthStencilState.DepthFunc,
+        StencilEnable: d.DepthStencilState.StencilEnable,
+        StencilReadMask: d.DepthStencilState.StencilReadMask,
+        StencilWriteMask: d.DepthStencilState.StencilWriteMask,
+        FrontFace: d.DepthStencilState.FrontFace,
+        BackFace: d.DepthStencilState.BackFace,
+        DepthBoundsTestEnable: true.into(),
+    };
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, &depth);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &d.InputLayout);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, &d.IBStripCutValue);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &d.PrimitiveTopologyType);
+    let rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, RTFormats: d.RTVFormats };
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &d.CachedPSO);
+    if d.Flags.0 != 0 { out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags); }
+    out
 }
 
 /// The subobjects of a stream: (type, payload).
@@ -8187,7 +8378,7 @@ mod pso_blend_and_tsharp_tests {
 }
 
 enum StreamPipeline {
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, bool),
     Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>),
     /// neither with console shaders (or not readable)
     Unknown,
@@ -8253,6 +8444,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
         BackFace: keep,
     };
     let mut has_depth_stencil = false;
+    let mut depth_bounds = false;
     for (ty, p) in &subs {
         match ty {
             0 => put(&mut g.pRootSignature, p),
@@ -8269,6 +8461,11 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             11 | 21 => {
                 has_depth_stencil = true;
                 put(&mut g.DepthStencilState, p);
+                if *ty == 21 {
+                    let mut depth = D3D12_DEPTH_STENCIL_DESC1::default();
+                    put(&mut depth, p);
+                    depth_bounds = depth.DepthBoundsTestEnable.as_bool();
+                }
             }
             12 => put(&mut g.InputLayout, p),
             13 => put(&mut g.IBStripCutValue, p),
@@ -8327,7 +8524,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
         pc_topology_type(&mut g);
     }
-    StreamPipeline::Graphics(Box::new(g))
+    StreamPipeline::Graphics(Box::new(g), depth_bounds)
 }
 
 /// The bytes of a stream payload as a desc field (no references counted: the desc only borrows).
@@ -8367,6 +8564,9 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
 
 unsafe fn pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
+    if super::pso_journal::enabled() && crate::gpu::shader::readable(desc as usize, 16) {
+        if let Some(owned) = own_stream(desc) { owned.journal(); }
+    }
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
     if missed {
@@ -8380,9 +8580,18 @@ unsafe fn pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GU
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => {
+        StreamPipeline::Graphics(d, depth_bounds) => {
             let g = &*d as *const _ as *const c_void;
-            let hr = graphics_pso(this, g, riid, ppv, true);
+            let hr = if depth_bounds {
+                let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+                translated_graphics_pso_with_bounds(this, f, g, riid, ppv, true)
+                    .unwrap_or_else(|| {
+                        note_translation_error("depth-bounds graphics stream could not be translated".into());
+                        E_INVALIDARG
+                    })
+            } else {
+                graphics_pso(this, g, riid, ppv, true)
+            };
             note_pipeline_for_dump(this, g, ppv, hr);
             return hr;
         }
@@ -10483,6 +10692,33 @@ mod map_tests {
     }
 
     #[test]
+    fn prepared_graphics_stream_keeps_depth_bounds_and_other_state() {
+        let console_vs = crate::gpu::xbox::tests::sample(
+            1,
+            &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])],
+        );
+        let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        d.VS = bytecode(&console_vs);
+        d.SampleDesc.Count = 1;
+        d.DepthStencilState.DepthEnable = true.into();
+        d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        let stream = graphics_depth_bounds_stream(&d);
+        let subs = stream_subobjects(&stream.0).unwrap();
+        assert!(subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1.0 as u32));
+        assert!(!subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL.0 as u32));
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        match unsafe { stream_pipeline(desc.as_ptr().cast()) } {
+            StreamPipeline::Graphics(parsed, bounds) => {
+                assert!(bounds);
+                assert!(parsed.DepthStencilState.DepthEnable.as_bool());
+                assert_eq!(parsed.DepthStencilState.DepthFunc, D3D12_COMPARISON_FUNC_GREATER_EQUAL);
+                assert_eq!(parsed.VS.BytecodeLength, console_vs.len());
+            }
+            _ => panic!("expected a depth-bounds graphics pipeline"),
+        }
+    }
+
+    #[test]
     fn stream_pipeline_defaults_depth_enable_from_dsv_format() {
         let console_vs = crate::gpu::xbox::tests::sample(
             1,
@@ -10524,7 +10760,7 @@ mod map_tests {
             }
             let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
             match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
-                StreamPipeline::Graphics(g) => *g,
+                StreamPipeline::Graphics(g, _) => *g,
                 _ => panic!("expected graphics stream pipeline"),
             }
         };

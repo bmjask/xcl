@@ -41,22 +41,12 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     std::env::remove_var("XCL_PREPARATION_PARENT");
     std::env::remove_var("XCL_PREPARATION_MENU");
     let root = &boot.game_root;
-    if boot.config.graphics.eq_ignore_ascii_case("null") ||
-        (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir()) {
+    if boot.config.graphics.eq_ignore_ascii_case("null") { return Ok(()); }
+    let embedded = crate::shaders::module_shaders(root, &boot.exe_path)?;
+    if embedded.is_empty() && !root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir() && !crate::hle::d3d12x::pso_journal::path_in(&boot.data_dir).try_exists().map_err(|e| e.to_string())? {
         return Ok(());
     }
-    // `XCL_PREPARE=0`: the title starts at once and builds what it uses as it goes (it stands
-    // still for those builds): for a look at a change without the wait
-    if std::env::var("XCL_PREPARE").is_ok_and(|v| v.trim() == "0") {
-        crate::xlog_info!("Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
-        return Ok(());
-    }
-    let only = Some(crate::hle::d3d12x::pso_async::earlier_used_shaders())
-        .filter(|used| !used.is_empty() && !std::env::var("XCL_PREPARE_ALL").is_ok_and(|v| v.trim() == "1"));
-    if let Some(used) = &only {
-        crate::xlog_info!("Shader preparation: only the {} shaders earlier runs used (XCL_PREPARE_ALL=1: every record)", used.len());
-    }
-    let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), only, ..Default::default() });
+    let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), ..Default::default() });
     let hwnd = if super::enabled() {
         *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });
         ACTIVE.store(true, Ordering::Release);
@@ -65,23 +55,11 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
         Some(hwnd)
     } else { None };
     let result = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| prepare_for_launch(root, &progress));
-        // (a line every 5 s: a log that stands still for long reads as a frozen process)
-        let (began, mut said) = (Instant::now(), Instant::now());
+        let worker = scope.spawn(|| {
+            crate::pipelines::prepare_before_entry(&boot.data_dir, &progress, || prepare_for_launch(root, embedded, &progress))?;
+            Ok::<(), String>(())
+        });
         while !worker.is_finished() {
-            if said.elapsed() >= Duration::from_secs(5) {
-                said = Instant::now();
-                let workers = progress.workers.load(Ordering::Relaxed);
-                let graphics = progress.graphics.load(Ordering::Relaxed);
-                crate::xlog_info!(
-                    "Shader preparation: {} of {} {} {} after {} s",
-                    progress.done.load(Ordering::Relaxed),
-                    progress.total.load(Ordering::Relaxed),
-                    if graphics { "graphics pipelines" } else { "records" },
-                    if graphics { format!("built by {workers} workers") } else if workers != 0 { format!("checked for pipelines by {workers} workers") } else { "translated".to_string() },
-                    began.elapsed().as_secs()
-                );
-            }
             if let Some(parent) = &parent {
                 if unsafe { WaitForSingleObject(parent.as_raw_handle(), 80) } == WAIT_OBJECT_0 {
                     // The launcher was stopped during preparation. Do not leave an orphan compile or start the title.
@@ -173,11 +151,15 @@ unsafe fn paint(hwnd: HWND, s: &mut Screen) {
         let row = |top, bottom| RECT { left: x, right: x+width, top: y+scale(top), bottom: y+scale(bottom) };
         let done = s.progress.done.load(Ordering::Relaxed);
         let total = s.progress.total.load(Ordering::Relaxed);
-        let pct = percent(done, total, s.ready);
+        let pipeline_start = s.progress.pipeline_phase.get().copied();
+        let base = pipeline_start.unwrap_or(0);
+        let (phase_done, phase_total) = (done.saturating_sub(base), total.saturating_sub(base));
+        let pct = percent(phase_done, phase_total, s.ready);
         let (quiet, last) = s.clock.sample(done, s.start.elapsed());
-        let workers = s.progress.workers.load(Ordering::Relaxed);
-        let graphics = workers != 0 && s.progress.graphics.load(Ordering::Relaxed);
-        let heading = if s.progress.cancel.load(Ordering::Relaxed) { "Cancelling preparation" } else if graphics { "Building graphics pipelines" } else if workers != 0 { "Building pipelines" } else { "Preparing shaders" };
+        let heading = if s.progress.cancel.load(Ordering::Relaxed) { "Cancelling preparation" }
+            else if pipeline_start.is_some() { "Preparing pipelines" }
+            else if s.progress.checking_shader_cache.load(Ordering::Relaxed) { "Verifying cached shaders" }
+            else { "Preparing shaders" };
         let mut title = row(0,48);
         title.right -= scale(84);
         text(dc, title, heading, scale(31), 600, 0xf7f5f1, DT_LEFT);
@@ -185,12 +167,10 @@ unsafe fn paint(hwnd: HWND, s: &mut Screen) {
         let bar = row(65,72);
         fill(dc, bar, 0x4b4038);
         fill(dc, RECT {right: x+(width as i64 * pct as i64/100) as i32, ..bar}, 0xbdb458);
-        let count = if total == 0 { "Reading shader records…".into() }
-            else if graphics { format!("{done} of {total} graphics pipelines built by {workers} worker processes") }
-            else if workers != 0 { format!("{done} of {total} records checked by {workers} worker processes") }
-            else { format!("{done} of {total} records processed") };
+        let count = if pipeline_start.is_some() { format!("Stage 2 of 2 · {phase_done} of {phase_total} pipelines") }
+            else if total == 0 { "Reading shader records…".into() } else { format!("Stage 1 of 2 · {done} of {total} shader records") };
         text(dc, row(87,112), &count, scale(17), 400, 0xe1dcd7, DT_LEFT);
-        let mut times = if workers != 0 { format!("Large pipelines compile in the driver: {quiet} s since the last record") } else { format!("No shader progress for {quiet} s") };
+        let mut times = format!("No progress for {quiet} s");
         if let Some(ago) = last { times.push_str(&format!("    ·    Last stall ended {ago} s ago")); }
         text(dc, row(117,145), &times, scale(14), 400, 0xb4aaa4, DT_LEFT);
         BitBlt(dest, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);

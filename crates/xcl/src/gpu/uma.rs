@@ -1129,6 +1129,11 @@ impl Uma {
     }
 }
 
+/// The UMA if this process already initialized it.
+pub fn existing() -> Option<&'static Uma> {
+    GLOBAL.get()?.as_ref()
+}
+
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048;
 /// `XCL_UMA_WINDOWS=4|8|16`, default 4, with 8/16 requiring `XCL_HEAP_WINDOWS=1`).
 pub fn get() -> Option<&'static Uma> {

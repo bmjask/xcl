@@ -7,6 +7,28 @@
 //! writes deterministic compute HLSL, and `--measure-pso` times one exact driver compile.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+pub(crate) fn warm_settings_key() -> u64 {
+    let mut bytes = Vec::new();
+    for name in ["XCL_DIRECT_DXIL", "XCL_HEAP_WINDOWS", "XCL_UMA_WINDOWS", "XCL_DIRECT_SPLIT_INSTRUCTIONS", "XCL_DXC_DIR"] {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        if let Some(value) = std::env::var_os(name) {
+            bytes.extend_from_slice(value.to_string_lossy().as_bytes());
+        }
+        bytes.push(0);
+    }
+    // Keep the default key stable; these diagnostics alter graphics descriptors only when set.
+    for name in ["XCL_DEBUG_NO_STENCIL", "XCL_DEBUG_NO_CULL"] {
+        if let Some(value) = std::env::var_os(name).filter(|v| !v.is_empty()) {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(value.to_string_lossy().as_bytes());
+            bytes.push(0);
+        }
+    }
+    shader::fnv64(&bytes)
+}
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -705,6 +727,7 @@ impl Agg {
 enum Input {
     Pack { data: Vec<u8>, records: Vec<pack::Record> },
     Files(Vec<PathBuf>),
+    Embedded(Vec<(String, Vec<u8>)>),
 }
 
 impl Input {
@@ -712,6 +735,7 @@ impl Input {
         match self {
             Input::Pack { records, .. } => records.len(),
             Input::Files(f) => f.len(),
+            Input::Embedded(records) => records.len(),
         }
     }
 
@@ -720,6 +744,7 @@ impl Input {
         match self {
             Input::Pack { data, records } => (format!("{} @{:#x}", records[i].name, records[i].offset), pack::inflate(data, &records[i])),
             Input::Files(f) => (f[i].display().to_string(), std::fs::read(&f[i]).ok()),
+            Input::Embedded(records) => (records[i].0.clone(), Some(records[i].1.clone())),
         }
     }
 }
@@ -1642,6 +1667,10 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
 #[derive(Default)]
 pub(crate) struct LaunchPreparation {
     pub adapter: String,
+    pub compute_sources: Mutex<HashMap<u64, Vec<u8>>>,
+    pub(crate) driver_files: Mutex<Option<std::sync::Arc<crate::pipelines::warm_replay::Inventory>>>,
+    pub checking_shader_cache: std::sync::atomic::AtomicBool,
+    pub pipeline_phase: std::sync::OnceLock<usize>,
     pub done: AtomicUsize,
     pub total: AtomicUsize,
     pub cancel: std::sync::atomic::AtomicBool,
@@ -1654,6 +1683,17 @@ pub(crate) struct LaunchPreparation {
     /// only their records are translated before the title starts, and it translates another
     /// when it first uses it. `XCL_PREPARE_ALL=1`: every record, as without the list.
     pub only: Option<HashSet<u64>>,
+}
+
+impl LaunchPreparation {
+    pub(crate) fn driver_files(&self) -> Option<std::sync::Arc<crate::pipelines::warm_replay::Inventory>> {
+        let mut saved = self.driver_files.lock().unwrap();
+        if saved.is_none() {
+            let dir = recomp::dxc::cache_dir().join("driver");
+            *saved = crate::pipelines::warm_replay::driver_files(&dir).map(std::sync::Arc::new);
+        }
+        saved.clone()
+    }
 }
 
 /// Unpacked shader containers in the title's shaders directory. Do not follow directory
@@ -1674,8 +1714,58 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
+fn embedded_containers(bytes: &[u8], mut accept: impl FnMut(usize, &[u8])) {
+    let mut at = 0;
+    while let Some(i) = bytes[at..].windows(4).position(|s| s == b"DXBC") {
+        let start = at + i;
+        at = start + 4;
+        let Some(size) = bytes.get(start + 24..start + 28) else { break };
+        let size = u32::from_le_bytes(size.try_into().unwrap()) as usize;
+        let Some(blob) = bytes.get(start..start + size) else { continue };
+        if recomp::pso::is_console(blob) {
+            accept(start, blob);
+            at = start + size;
+        }
+    }
+}
+
+pub(crate) fn module_shaders(root: &Path, exe: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    let mut modules = vec![exe.to_path_buf()];
+    for dir in [Some(root), exe.parent().filter(|p| *p != root)].into_iter().flatten() {
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("Reading {}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")) && entry.file_type().is_ok_and(|t| t.is_file()) {
+                modules.push(path);
+            }
+        }
+    }
+    for path in modules {
+        let data = std::fs::read(&path).map_err(|e| format!("Reading {}: {e}", path.display()))?;
+        let Ok(pe) = crate::pe::Pe::parse(&data, crate::pe::Layout::File) else { continue };
+        for section in &pe.sections {
+            let start = section.raw_ptr as usize;
+            let len = section.raw_size.min(section.mapped_size()) as usize;
+            if let Some(bytes) = data.get(start..start + len) {
+                embedded_containers(bytes, |offset, blob| {
+                    if seen.insert(shader::fnv64(blob)) {
+                        records.push((format!("{} @{:#x}", path.display(), start + offset), blob.to_vec()));
+                    }
+                });
+            }
+        }
+    }
+    Ok(records)
+}
+
+pub(crate) fn prepare_for_launch(root: &Path, embedded: Vec<(String, Vec<u8>)>, progress: &LaunchPreparation) -> Result<(), String> {
     let mut inputs = Vec::new();
+    if !embedded.is_empty() {
+        crate::xlog_info!("Shader preparation: {} unique embedded console shader containers", embedded.len());
+        inputs.push(Input::Embedded(embedded));
+    }
     let pack = root.join("shaders.rpf");
     if pack.try_exists().map_err(|e| e.to_string())? {
         let data = std::fs::read(&pack).map_err(|e| format!("Reading {}: {e}", pack.display()))?;
@@ -2167,6 +2257,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
+                            if let Some(progress) = startup {
+                                progress.compute_sources.lock().unwrap().entry(shader::fnv64(&blob)).or_insert(blob.clone());
+                            }
                             if let Some(p) = pipelines {
                                 p.make(&c);
                                 if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {

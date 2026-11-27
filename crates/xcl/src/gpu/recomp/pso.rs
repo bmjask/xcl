@@ -109,6 +109,13 @@ fn windows_for(n: u32, heap: bool) -> u32 {
     }
 }
 
+/// `mem_windows` as a title's run had it, with its `HEAP_WINDOWS` (`xcl pipelines` replays a
+/// run's pipelines without the title's unified memory: the HLSL, and so the cache keys, must be
+/// that run's). 0: unset.
+pub fn set_mem_windows(n: u32) {
+    set_title_windows(n);
+}
+
 thread_local! {
     /// this thread translates in the switch form (`in_switch_form`)
     static SWITCH_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -194,6 +201,10 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
+pub(crate) fn translation_cache_identity() -> u64 {
+    translated::identity()
+}
+
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
 /// does not translate again what an earlier run of the same XCL build translated. The DXIL
 /// cache is keyed by the generated HLSL, so it needs the translation first: a retail game's
@@ -268,7 +279,7 @@ mod translated {
 
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
-    fn identity() -> u64 {
+    pub(super) fn identity() -> u64 {
         static I: OnceLock<u64> = OnceLock::new();
         *I.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
@@ -1287,7 +1298,10 @@ fn console_mesh_with(
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
-    let windows = mem_windows();
+    console_mesh_in(blob, ps, split_wave64, mem_windows())
+}
+
+pub(crate) fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windows: u32) -> Result<TwoPass, String> {
     let dir = dxc::cache_dir();
     console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, rodata, ms, wave64| {
         compile_console_mesh(blob, code, rodata, ms, wave64, windows, split_wave64)
@@ -1534,6 +1548,9 @@ mod slab_tests {
         assert!(dispatch_slabs([0, 4, 4], 8).is_empty());
     }
 }
+
+#[cfg(test)]
+pub(crate) use shader_cache_tests::synthetic_mesh_container;
 
 #[cfg(test)]
 mod shader_cache_tests {
@@ -2055,7 +2072,7 @@ mod shader_cache_tests {
         });
     }
 
-    fn synthetic_mesh_container() -> Vec<u8> {
+    pub(crate) fn synthetic_mesh_container() -> Vec<u8> {
         use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
         let mut psv_r = vec![0u8; 48];
         psv_r[12..14].copy_from_slice(&3u16.to_le_bytes()); // max_vertices

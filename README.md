@@ -237,6 +237,14 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
 .\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf' -Pipelines
 ```
 
+After a run has recorded a `pipelines.bin` journal, `xcl pipelines <path-to-pipelines.bin>`
+prepares its known native pipelines offline. It checkpoints completed recipes for the same
+preparation layout, translation settings, GPU and driver, so a diagnostics-only rebuild can
+resume them. On the next launch, XCL verifies the saved driver blobs before leaving cold
+single-object recipes on disk; previously used recipes are prepared on the live device.
+Graphics recipes with depth bounds use a pipeline-state stream in the offline pass.
+Pipelines discovered only during later play still require another offline pass.
+
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 

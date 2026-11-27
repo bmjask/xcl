@@ -35,6 +35,8 @@ struct Pending {
     /// a compute pipeline's console program (`fnv64` of its CS, as in the `[SHADER]` and driver
     /// compile lines); 0 = not known
     record: u64,
+    recipe: u64,
+    demand_noted: std::sync::atomic::AtomicBool,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
@@ -90,7 +92,7 @@ thread_local! {
 
 /// Run `p`'s build `job` on this thread (a worker's, or a bind's that took it): its time and
 /// whether its program was huge are noted for the logs.
-fn run_job(p: &Pending, job: Job) -> usize {
+fn run_job_timed(p: &Pending, job: Job) -> usize {
     JOB_START.with(|s| s.set(Some(std::time::Instant::now())));
     JOB_HUGE.with(|h| h.set(false));
     let real = job();
@@ -167,7 +169,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, run_job(p, job));
+    run_job(p, job);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -232,7 +234,14 @@ impl Pending {
         }
     }
 
+    fn note_recipe_demand(&self) {
+        if self.recipe != 0 && !self.demand_noted.load(Ordering::Relaxed) && !self.demand_noted.swap(true, Ordering::AcqRel) {
+            super::pso_journal::demanded(self.recipe);
+        }
+    }
+
     fn note_use(&self) {
+        self.note_recipe_demand();
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
             let on_use = self.on_use.lock().unwrap().take();
@@ -245,6 +254,26 @@ impl Pending {
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: super::sharded::Sharded<Arc<Pending>> = super::sharded::Sharded::new();
+
+/// Jobs actually executing, including synchronous first use. Deferred stand-ins have no job
+/// running until a thread claims them.
+static ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn active_jobs() -> usize {
+    ACTIVE_JOBS.load(Ordering::Relaxed)
+}
+
+fn run_job(p: &Pending, job: Job) {
+    struct Active;
+    impl Drop for Active {
+        fn drop(&mut self) {
+            ACTIVE_JOBS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    ACTIVE_JOBS.fetch_add(1, Ordering::Relaxed);
+    let _active = Active;
+    complete(p, run_job_timed(p, job));
+}
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
@@ -594,18 +623,45 @@ pub(super) fn building_here() -> bool {
 }
 
 /// A bind's wait for a pipeline still being built (`title_held`).
-struct Held;
+struct Held { recipe: u64, start: std::time::Instant }
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WaitStats {
+    pub started: usize,
+    pub active: usize,
+    pub finished_us: u64,
+    pub longest_us: u64,
+}
+
+static WAITS: AtomicUsize = AtomicUsize::new(0);
+static FINISHED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LONGEST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn wait_stats() -> WaitStats {
+    WaitStats { started: WAITS.load(Ordering::Relaxed), active: HELD.load(Ordering::Relaxed),
+        finished_us: FINISHED_US.load(Ordering::Relaxed), longest_us: LONGEST_US.load(Ordering::Relaxed) }
+}
 
 impl Held {
-    fn new() -> Held {
+    fn new(pipeline: &Pending) -> Held {
         HELD.fetch_add(1, Ordering::AcqRel);
-        Held
+        WAITS.fetch_add(1, Ordering::Relaxed);
+        if super::real::pso_trace() {
+            crate::xlog_info!("PSO wait start: recipe {:016x}, compute {}", pipeline.recipe, pipeline.compute);
+        }
+        Held { recipe: pipeline.recipe, start: std::time::Instant::now() }
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
+        let us = self.start.elapsed().as_micros() as u64;
+        FINISHED_US.fetch_add(us, Ordering::Relaxed);
+        LONGEST_US.fetch_max(us, Ordering::Relaxed);
         HELD.fetch_sub(1, Ordering::AcqRel);
+        if super::real::pso_trace() {
+            crate::xlog_info!("PSO wait finish: recipe {:016x}, {us} us", self.recipe);
+        }
     }
 }
 
@@ -738,7 +794,7 @@ pub fn submit(standin: usize, compute: bool, job: Job) {
 
 /// `submit`, with a compute pipeline's console program for the log (`record`; 0: not known).
 pub(super) fn submit_with(standin: usize, compute: bool, job: Job, record: u64) {
-    submit_as(standin, compute, job, true, 0, None, record);
+    submit_as(standin, compute, job, true, 0, None, record, 0);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -764,7 +820,7 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 /// backlog does that for every pipeline it holds before the driver builds any of them. `record`:
 /// a compute pipeline's console program, for the log (0: not known).
 pub(super) fn submit_lazy_with(standin: usize, compute: bool, job: Job, key: u64, warm: Option<Warm>, record: u64) {
-    submit_as(standin, compute, job, false, key, warm, record);
+    submit_as(standin, compute, job, false, key, warm, record, 0);
 }
 
 /// A lazy pipeline's translation and DXC compile without the driver's: what makes the DXIL
@@ -772,7 +828,7 @@ pub(super) fn submit_lazy_with(standin: usize, compute: bool, job: Job, key: u64
 pub type Warm = Box<dyn FnOnce() + Send>;
 
 impl Pending {
-    fn new(job: Job, send: bool, compute: bool, key: u64, warm: Option<Warm>, record: u64) -> Pending {
+    fn new(job: Job, send: bool, compute: bool, key: u64, warm: Option<Warm>, record: u64, recipe: u64) -> Pending {
         Pending {
             job: Mutex::new(Some(job)),
             sent: std::sync::atomic::AtomicBool::new(send),
@@ -783,6 +839,8 @@ impl Pending {
             compute,
             key,
             record,
+            recipe,
+            demand_noted: Default::default(),
             used: Default::default(),
             orphan: Default::default(),
             late: Default::default(),
@@ -808,8 +866,12 @@ impl Pending {
     }
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, warm: Option<Warm>, record: u64) {
-    let p = Arc::new(Pending::new(job, send, compute, key, warm, record));
+pub(super) fn submit_recipe(standin: usize, compute: bool, job: Job, key: u64, recipe: u64) {
+    submit_as(standin, compute, job, !lazy(), if lazy() { key } else { 0 }, None, 0, recipe);
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, warm: Option<Warm>, record: u64, recipe: u64) {
+    let p = Arc::new(Pending::new(job, send, compute, key, warm, record, recipe));
     if !send {
         LAZY_MADE.fetch_add(1, Ordering::Relaxed);
         if !compute {
@@ -1754,12 +1816,12 @@ mod used_tests {
 
     /// A pipeline for the backlog (`warm`: with its translation on its own), never built.
     fn pending(key: u64, warm: bool) -> Arc<Pending> {
-        Arc::new(Pending::new(Box::new(|| 0), false, false, key, warm.then(|| Box::new(|| {}) as Warm), 0))
+        Arc::new(Pending::new(Box::new(|| 0), false, false, key, warm.then(|| Box::new(|| {}) as Warm), 0, 0))
     }
 
     /// A compute pipeline for the backlog, never built.
     fn pending_compute(key: u64) -> Arc<Pending> {
-        Arc::new(Pending::new(Box::new(|| 0), false, true, key, None, 0))
+        Arc::new(Pending::new(Box::new(|| 0), false, true, key, None, 0, 0))
     }
 
     /// A backlog worker's build nobody waits for builds the pieces of its dispatch chain itself:
@@ -2159,6 +2221,22 @@ mod used_tests {
 
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn window_activity_counts_a_first_use_build_without_reading_the_standin_table() {
+        let standin = 0x7E57_EE01;
+        submit_as(standin, false, Box::new(move || {
+            // The window must be able to sample even while another thread owns the table.
+            PENDING.for_each(|key, _| {
+                if key == standin { assert!(active_jobs() >= 1); }
+            });
+            0
+        }), false, 0, None, 0, 0);
+        assert!(is_pending(standin));
+        resolve_wait(standin);
+        assert!(!is_pending(standin));
+        assert_eq!(released(standin), 0);
+    }
+
     /// A queued normal worker job whose stand-in was released before a worker starts it is
     /// skipped as orphaned instead of entering the compiler.
     #[test]
@@ -2510,7 +2588,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         if is_at_submit() {
             BUILT_AT_SUBMIT.fetch_add(1, Ordering::Relaxed);
         }
-        complete(&p, run_job(&p, job));
+        run_job(&p, job);
     }
     p.want();
     wait.until_done(None);
@@ -2543,7 +2621,7 @@ const LONG_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl<'a> Wait<'a> {
     fn new(p: &'a Pending) -> Wait<'a> {
-        Wait { p, start: std::time::Instant::now(), logged: false, _held: Held::new(), _cost: crate::hle::api_cost::time(crate::hle::api_cost::Call::PipelineWait) }
+        Wait { p, start: std::time::Instant::now(), logged: false, _held: Held::new(p), _cost: crate::hle::api_cost::time(crate::hle::api_cost::Call::PipelineWait) }
     }
 
     fn kind(&self) -> &'static str {
@@ -2806,6 +2884,9 @@ pub(super) fn has_real(pso: usize) -> bool {
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.
+#[cfg(test)]
+pub(super) fn has_standin_for_test(pso: usize) -> bool { entry(pso).is_some() }
+
 pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
@@ -2847,6 +2928,7 @@ pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     // (a lazy one is sent here: `resolve` does not send it again)
     p.sent.store(true, Ordering::Release);
+    p.note_recipe_demand();
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
         NEEDED_MADE.fetch_add(1, Ordering::Relaxed);
         NEEDED.lock().unwrap().push_back(p);

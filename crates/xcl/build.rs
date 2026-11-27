@@ -50,6 +50,40 @@ fn direct_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 mod source_hash;
 use source_hash::{add, add_source};
 
+// Bump when the native builder (including the D3D12.X glue in real.rs) changes the
+// mapping from a journal recipe to driver descriptors or blob acceptance. Shader
+// translator/toolchain, driver, adapter, settings and per-file stamps are keyed separately.
+const NATIVE_PREPARATION_ABI: &[u8] = b"xcl-native-preparation-v1";
+const PREPARATION_LAYOUT_SOURCES: &[&str] = &[
+    "src/gpu/recomp/pso.rs",          // root signatures, translation glue, split pipeline layout
+    "src/hle/d3d12x/pso_journal.rs",  // normalized recipe fields and reconstruction
+];
+
+fn preparation_source_id(root: &Path) -> u64 {
+    let mut id = 0xcbf2_9ce4_8422_2325u64;
+    add(&mut id, NATIVE_PREPARATION_ABI);
+    for &relative in PREPARATION_LAYOUT_SOURCES {
+        println!("cargo:rerun-if-changed={relative}");
+        add(&mut id, relative.as_bytes());
+        add(&mut id, &[0]);
+        add_source(&mut id, &std::fs::read(root.join(relative)).expect("read pipeline layout input"));
+        add(&mut id, &[0]);
+    }
+    for name in ["TARGET", "PROFILE", "CARGO_ENCODED_RUSTFLAGS", "OPT_LEVEL", "DEBUG"] {
+        add(&mut id, name.as_bytes());
+        add(&mut id, std::env::var(name).unwrap_or_default().as_bytes());
+        add(&mut id, &[0]);
+    }
+    let rustc = std::process::Command::new(std::env::var_os("RUSTC").expect("rustc"))
+        .arg("-vV").output().expect("read compiler identity");
+    assert!(rustc.status.success());
+    add_source(&mut id, &rustc.stdout);
+    let mut features: Vec<_> = std::env::vars().filter(|(name,_)| name.starts_with("CARGO_FEATURE_")).collect();
+    features.sort();
+    for (name, value) in features { add(&mut id, name.as_bytes()); add(&mut id, value.as_bytes()); add(&mut id, &[0]); }
+    id
+}
+
 fn main() {
     // xcl.exe without high-entropy ASLR: the title's memory then lies under 2^40, which a
     // retail title's BVH builder requires of its GPU addresses (#585, PR #631)
@@ -59,6 +93,7 @@ fn main() {
         _ => {}
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    println!("cargo:rustc-env=XCL_NATIVE_PREPARATION_ID={:016x}", preparation_source_id(root));
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     add(&mut h, b"xcl-translator-source-v1\0");
     add(&mut h, TRANSLATION_GLUE_REVISION.as_bytes());
@@ -93,4 +128,35 @@ fn main() {
         add(&mut d, &[0]);
     }
     println!("cargo:rustc-env=XCL_DIRECT_DXIL_SOURCE_ID={d:016x}");
+}
+
+
+#[cfg(test)]
+mod preparation_id_tests {
+    use super::*;
+
+    #[test]
+    fn warm_identity_ignores_the_painter_but_tracks_native_pipeline_inputs() {
+        let temp = std::env::temp_dir().join(format!("xcl-preparation-source-id-{}", std::process::id()));
+        let root = temp.join("crates/xcl");
+        let hle = root.join("src/hle/d3d12x");
+        let gpu = root.join("src/gpu/recomp");
+        std::fs::create_dir_all(&gpu).unwrap();
+        std::fs::create_dir_all(hle.join("present")).unwrap();
+        let layout = gpu.join("pso.rs");
+        let journal = hle.join("pso_journal.rs");
+        let ui = hle.join("present/preparation.rs");
+        let diagnostics = hle.join("culprit.rs");
+        for path in [&layout, &journal, &ui, &diagnostics] { std::fs::write(path, "fixture").unwrap(); }
+        let first = preparation_source_id(&root);
+        std::fs::write(&ui, "second paint").unwrap();
+        std::fs::write(&diagnostics, "new GPU marker").unwrap();
+        assert_eq!(first, preparation_source_id(&root));
+        std::fs::write(&layout, "changed root signature").unwrap();
+        assert_ne!(first, preparation_source_id(&root));
+        for path in [ui, diagnostics, layout, journal] { std::fs::remove_file(path).unwrap(); }
+        for dir in [hle.join("present"), hle, gpu, root.join("src/hle"), root.join("src/gpu"), root.join("src"), root, temp.join("crates"), temp] {
+            std::fs::remove_dir(dir).unwrap();
+        }
+    }
 }
