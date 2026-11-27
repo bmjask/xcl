@@ -2354,23 +2354,39 @@ mod tests {
         struct Fence {
             vtable: *const usize,
             value: Cell<u64>,
-            releases: Cell<u32>,
+            refs: Cell<u32>,
+            final_releases: Cell<u32>,
         }
         unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
             (*this.cast::<Fence>()).value.get()
         }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.set(f.refs.get() + 1);
+            f.refs.get()
+        }
         unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             let f = &*this.cast::<Fence>();
-            f.releases.set(f.releases.get() + 1);
-            0
+            let refs = f.refs.get() - 1;
+            f.refs.set(refs);
+            if refs == 0 {
+                f.final_releases.set(f.final_releases.get() + 1);
+            }
+            refs
         }
         extern "system" fn unexpected_call() { std::process::abort(); }
 
         const SLOT: usize = size_of::<usize>();
         let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
         vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
         vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
-        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), releases: Cell::new(0) };
+        let mut fence = Fence {
+            vtable: vtable.as_ptr(),
+            value: Cell::new(0),
+            refs: Cell::new(1),
+            final_releases: Cell::new(0),
+        };
         let mut ids = Box::new([0u8; 3]);
         let alloc = ids.as_mut_ptr() as usize;
         let (first, second) = (alloc + 1, alloc + 2);
@@ -2407,7 +2423,7 @@ mod tests {
         assert!(first_removed, "another live recording must remain while the released list goes");
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
-        assert_eq!(fence.releases.get(), 1);
+        assert_eq!((fence.refs.get(), fence.final_releases.get()), (0, 1));
     }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
