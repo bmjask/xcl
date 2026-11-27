@@ -714,6 +714,21 @@ impl SparseBatchLedger {
         Ok(())
     }
 
+    fn retry(&mut self, token: ClaimFrontierToken) -> Result<(), SparseBatchError> {
+        self.check(token.state_generation)?;
+        let work = self.binding(token, ClaimFrontierState::Pending)?;
+        if self.work.restore(work) != WorkClaimResolution::Restored {
+            self.poisoned = true;
+            return Err(SparseBatchError::Corrupt);
+        }
+        if let Err(error) = self.frontier.consume_obsolete(token) {
+            self.poisoned = true;
+            return Err(SparseBatchError::Frontier(error));
+        }
+        self.bindings.remove(&token.epoch);
+        Ok(())
+    }
+
     fn poison_exact(
         &mut self, token: ClaimFrontierToken, work: WorkClaimToken,
     ) -> Result<(), SparseBatchError> {
@@ -909,6 +924,10 @@ impl SparseBatchLease {
 
     fn obsolete(self) -> Result<(), SparseBatchError> {
         self.ledger.lock().unwrap().obsolete(self.token)
+    }
+
+    fn retry(self) -> Result<(), SparseBatchError> {
+        self.ledger.lock().unwrap().retry(self.token)
     }
 }
 
@@ -1251,6 +1270,32 @@ enum UploadPlanInvalid {
     SentHashes,
     SourceHashes,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyParityRevalidation {
+    Ready,
+    RetryCurrentGeneration,
+    RestartForGeneration,
+}
+
+#[derive(Default)]
+struct UnlockedParityBudget {
+    attempted: bool,
+}
+
+impl UnlockedParityBudget {
+    fn claim(&mut self, enabled: bool, has_batch: bool) -> bool {
+        if !enabled || !has_batch || self.attempted { return false }
+        self.attempted = true;
+        true
+    }
+}
+
+fn unlocked_sparse_planning_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_UNLOCKED_PLAN").is_ok_and(|value| value.trim() == "1"))
+}
+
 /// Private owned stand-in for a future mapped staging allocation. Keeping the copied bytes here
 /// makes it impossible for the record/execute callback to retain a borrowed title-memory view.
 #[allow(dead_code)]
@@ -1378,6 +1423,14 @@ impl CoordinatedSparseUploadPlan {
         validate_upload_pages(&self.pages, observe)
     }
 
+    fn obsolete(mut self) -> Result<(), SparseBatchError> {
+        self.lease.take().expect("unfinished coordinated sparse upload plan").obsolete()
+    }
+
+    fn retry(mut self) -> Result<(), SparseBatchError> {
+        self.lease.take().expect("unfinished coordinated sparse upload plan").retry()
+    }
+
     fn commit_reserved<C, E, S>(
         mut self,
         state_generation: u64,
@@ -1412,6 +1465,52 @@ impl CoordinatedSparseUploadPlan {
                 Err(CoordinatedSparseUploadError::PublishReservation(error))
             }
             Err(CoordinatedPublishError::Batch(error)) => Err(CoordinatedSparseUploadError::PublishBatch(error)),
+        }
+    }
+}
+
+enum LegacyParityUpload {
+    Lease { lease: SparseBatchLease, state_generation: u64, mapping_epoch: u64 },
+    Planned(CoordinatedSparseUploadPlan),
+}
+
+impl LegacyParityUpload {
+    fn revalidate(
+        &self,
+        state_generation: u64,
+        mapping_epoch: u64,
+        observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+    ) -> LegacyParityRevalidation {
+        let plan = match self {
+            Self::Lease { state_generation: planned_generation, mapping_epoch: planned_epoch, .. } => {
+                return if state_generation != *planned_generation {
+                    LegacyParityRevalidation::RestartForGeneration
+                } else if mapping_epoch != *planned_epoch {
+                    LegacyParityRevalidation::RetryCurrentGeneration
+                } else {
+                    LegacyParityRevalidation::Ready
+                };
+            }
+            Self::Planned(plan) => plan,
+        };
+        match plan.validate(state_generation, mapping_epoch, observe) {
+            Ok(()) => LegacyParityRevalidation::Ready,
+            Err(UploadPlanInvalid::StateGeneration) => LegacyParityRevalidation::RestartForGeneration,
+            Err(_) => LegacyParityRevalidation::RetryCurrentGeneration,
+        }
+    }
+
+    fn obsolete(self) -> Result<(), SparseBatchError> {
+        match self {
+            Self::Lease { lease, .. } => lease.obsolete(),
+            Self::Planned(plan) => plan.obsolete(),
+        }
+    }
+
+    fn retry(self) -> Result<(), SparseBatchError> {
+        match self {
+            Self::Lease { lease, .. } => lease.retry(),
+            Self::Planned(plan) => plan.retry(),
         }
     }
 }
@@ -2532,6 +2631,30 @@ impl State {
     #[inline]
     fn window_index(&self, a: usize) -> Option<usize> {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
+    }
+
+    /// Capture every identity used by unlocked sparse planning while this State is authoritative.
+    /// The returned value owns hashes and mapping metadata; it retains no title-memory borrow.
+    unsafe fn upload_page_observation(&self, page: usize) -> Option<UploadPageObservation> {
+        let tile = page & !(TILE - 1);
+        let entry = self.mapped.get(&tile)?;
+        let index = (page - tile) / PAGE;
+        if index >= PAGES_PER_TILE { return None }
+        let hole = entry.holes & (1u16 << index) != 0;
+        let sent = entry.sent[index].as_deref().copied();
+        let source = if hole {
+            ZERO_HASHES
+        } else {
+            let mut bytes = [0u8; PAGE];
+            if !crate::hle::dstorage::read_own(page, bytes.as_mut_ptr(), bytes.len()) {
+                return None;
+            }
+            std::array::from_fn(|chunk| {
+                let start = chunk * CHUNK;
+                chunk_hash(&bytes[start..start + CHUNK])
+            })
+        };
+        Some(UploadPageObservation { page, pool: entry.pool, hole, sent, source })
     }
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
@@ -4178,6 +4301,7 @@ unsafe fn before_execute_locked(
     timing: &mut UploadGateTiming,
 ) -> PreparationOutcome {
     let mut metric_runs = look.is_some().then(|| (BTreeMap::new(), BTreeMap::new()));
+    let mut unlocked_parity = UnlockedParityBudget::default();
     'prepare: loop {
     let t_started = t0.map(|_| std::time::Instant::now());
     let observed = poll_retirement_fences();
@@ -4263,6 +4387,66 @@ unsafe fn before_execute_locked(
         .seal_legacy(q as u64, &zero_runs, &prior_retry, &dirty_runs)
         .ok()
         .flatten();
+    // The unlocked planner is experimental because capture and revalidation still hash under
+    // STATE. When enabled, attempt it only once per title submission. Any invalidation restores
+    // the exact journals below; the next iteration stays locked and guarantees forward progress
+    // through the established legacy uploader.
+    let try_unlocked = unlocked_parity.claim(
+        unlocked_sparse_planning_enabled(), legacy_batch.is_some(),
+    );
+    let (mut g, mut legacy_parity) = if try_unlocked {
+        let batch = legacy_batch.expect("an unlocked parity attempt owns a sparse batch");
+        let state_generation = s.generation;
+        let mapping_epoch = s.mapping_epoch;
+        let snapshot = UploadPlanningSnapshot::capture(
+            state_generation,
+            mapping_epoch,
+            batch.pages(),
+            |page| s.upload_page_observation(page),
+        );
+        drop(g);
+        let parity = match snapshot {
+            Some(snapshot) if snapshot.observations.iter().all(|page| !page.hole) => {
+                LegacyParityUpload::Planned(
+                    CoordinatedSparseUploadPlan::from_snapshot(batch, snapshot)
+                        .expect("a snapshot captured from its exact sparse batch"),
+                )
+            }
+            _ => LegacyParityUpload::Lease { lease: batch, state_generation, mapping_epoch },
+        };
+        (lock_state(), Some(parity))
+    } else {
+        let state_generation = s.generation;
+        let mapping_epoch = s.mapping_epoch;
+        (g, legacy_batch.map(|lease| LegacyParityUpload::Lease {
+            lease, state_generation, mapping_epoch,
+        }))
+    };
+    let Some(s) = g.as_mut() else {
+        note_transfer_metrics(look.as_deref_mut(), metric_runs.as_ref());
+        return PreparationOutcome::Ready;
+    };
+    if let Some(parity) = legacy_parity.as_ref() {
+        match parity.revalidate(s.generation, s.mapping_epoch, |page| s.upload_page_observation(page)) {
+            // "Ready" accepts only the legacy attempt. The parity lease stays pending until that
+            // authoritative path finishes; coordinated accept/publish remains a later activation.
+            LegacyParityRevalidation::Ready => {}
+            LegacyParityRevalidation::RestartForGeneration => {
+                drop(g);
+                let _ = legacy_parity.take().unwrap().retry();
+                // The per-call budget is already consumed, so this rebuild cannot unlock again.
+                continue 'prepare;
+            }
+            LegacyParityRevalidation::RetryCurrentGeneration => {
+                s.to_zero.extend(zero_runs.iter().copied());
+                s.retry_pages = retry_journal(PreparationOutcome::RetryRequired, deferred, &dirty_runs);
+                drop(g);
+                let _ = legacy_parity.take().unwrap().retry();
+                // The per-call budget is already consumed, so this rebuild cannot unlock again.
+                continue 'prepare;
+            }
+        }
+    }
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     let mut outcome = PreparationOutcome::Ready;
     let mut upload_wait = None;
@@ -4288,8 +4472,8 @@ unsafe fn before_execute_locked(
         }
     }
     s.retry_pages = retry_journal(outcome, deferred, &dirty_runs);
-    if let Some(batch) = legacy_batch {
-        let _ = batch.obsolete();
+    if let Some(parity) = legacy_parity {
+        let _ = parity.obsolete();
     }
     if let Some((zero, dirty)) = metric_runs.as_mut() {
         remember_metric_runs(zero, &zero_runs);
@@ -5297,10 +5481,12 @@ mod tests {
     }
 
     #[test]
-    fn planning_snapshot_owns_observations_for_an_unlocked_build() {
+    fn live_parity_snapshot_revalidates_concurrent_changes_and_retries() {
         let batches = SparseBatches::new(73);
         assert!(batches.add_dirty_pages([0x2_3000]));
         let lease = batches.seal(3, 1).unwrap().unwrap();
+        let token = lease.token;
+        let through = batches.through().unwrap();
         let observed = upload_observation(0x2_3000, (6, 11), 0xB7);
         let mut captures = 0;
         let snapshot = UploadPlanningSnapshot::capture(73, 9, lease.pages(), |_| {
@@ -5319,6 +5505,62 @@ mod tests {
         rewritten.source[5] ^= 1;
         assert_eq!(plan.validate(73, 9, |_| Some(rewritten.clone())), Err(UploadPlanInvalid::SourceHashes));
         assert_eq!(plan.validate(73, 9, |_| Some(observed.clone())), Ok(()));
+
+        let parity = LegacyParityUpload::Planned(plan);
+        assert_eq!(
+            parity.revalidate(74, 9, |_| Some(observed.clone())),
+            LegacyParityRevalidation::RestartForGeneration,
+        );
+        assert_eq!(
+            parity.revalidate(73, 10, |_| Some(observed.clone())),
+            LegacyParityRevalidation::RetryCurrentGeneration,
+        );
+        assert_eq!(
+            parity.revalidate(73, 9, |_| Some(rewritten.clone())),
+            LegacyParityRevalidation::RetryCurrentGeneration,
+        );
+        assert_eq!(
+            parity.revalidate(73, 9, |_| Some(observed.clone())),
+            LegacyParityRevalidation::Ready,
+        );
+        assert_eq!(
+            batches.observe(through, 4),
+            Ok(ClaimFrontierAction::TakeOver(token)),
+            "validation must not accept or publish the behavior-neutral parity lease",
+        );
+        parity.retry().unwrap();
+        let restored = batches.seal(4, 1).unwrap().expect(
+            "a stale unlocked plan did not restore its exact work for retry",
+        );
+        assert_eq!(restored.pages(), &[(0x2_3000, WorkReasons::DIRTY)]);
+        let fallback = LegacyParityUpload::Lease {
+            lease: restored,
+            state_generation: 73,
+            mapping_epoch: 9,
+        };
+        assert_eq!(
+            fallback.revalidate(74, 9, |_| None),
+            LegacyParityRevalidation::RestartForGeneration,
+        );
+        assert_eq!(
+            fallback.revalidate(73, 10, |_| None),
+            LegacyParityRevalidation::RetryCurrentGeneration,
+        );
+        fallback.retry().unwrap();
+        let exact = batches.seal(5, 1).unwrap().unwrap();
+        assert_eq!(exact.pages(), &[(0x2_3000, WorkReasons::DIRTY)]);
+        exact.obsolete().unwrap();
+    }
+
+    #[test]
+    fn unlocked_parity_budget_falls_back_after_one_invalidated_attempt() {
+        let mut budget = UnlockedParityBudget::default();
+        assert!(!budget.claim(false, true), "the experimental path is inert by default");
+        assert!(!budget.claim(true, false), "an empty journal must not consume the attempt");
+        assert!(budget.claim(true, true));
+        for _ in 0..8 {
+            assert!(!budget.claim(true, true), "repeated invalidation must use the locked fallback");
+        }
     }
 
     #[test]
