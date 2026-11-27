@@ -29,6 +29,8 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    /// Retained decision for `pso`; live classification is added by a later stage.
+    resolution: Option<super::pso_async::PipelineResolution>,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
@@ -86,32 +88,37 @@ fn native_backing(list: *mut c_void, allocator: usize) -> usize {
 /// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let backing = native_backing(list, allocator);
-    let (old, blocks) = with(list, |s| {
+    let (old, blocks, old_resolution) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.pso = initial_pso;
+        let old_resolution = s.resolution.take();
         s.layout = None;
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
         s.limits = [0; 3];
-        (old, std::mem::take(&mut s.uma))
+        (old, std::mem::take(&mut s.uma), old_resolution)
     });
     console_list::hold_until_reset(old, blocks);
+    drop(old_resolution);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
-    with(list, |s| {
+    let old_resolution = with(list, |s| {
         s.pso = pso;
+        let old_resolution = s.resolution.take();
         s.layout = None;
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        old_resolution
     });
+    drop(old_resolution);
 }
 
 /// Allocation-bearing root state captured before a mid-list split commits. Preparation also
@@ -125,12 +132,14 @@ pub(super) struct PreparedSplit {
     args_gfx: Vec<u8>,
     rs_gfx: usize,
     pso: usize,
+    resolution: Option<super::pso_async::PipelineResolution>,
 }
 
 pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize) -> PreparedSplit {
     let backing = native_backing(to, allocator);
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso,
+            s.resolution.clone())
     });
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, 0);
@@ -138,23 +147,27 @@ pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
-    PreparedSplit { to: to as usize, allocator: backing, layout, args, layout_gfx, args_gfx, rs_gfx, pso }
+    PreparedSplit { to: to as usize, allocator: backing, layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution }
 }
 
 /// Install a preflighted split state without cloning or growing the state map.
 pub(super) fn install_prepared_split(prepared: PreparedSplit) {
-    let PreparedSplit { to, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso } = prepared;
-    let mut states = STATES.lock().unwrap();
-    let s = states.as_mut().and_then(|m| m.get_mut(&to)).expect("prepared split destination state");
-    debug_assert_eq!(s.allocator, 0);
-    debug_assert!(s.uma.is_empty());
-    s.allocator = allocator;
-    s.layout = layout;
-    s.args = args;
-    s.layout_gfx = layout_gfx;
-    s.args_gfx = args_gfx;
-    s.rs_gfx = rs_gfx;
-    s.pso = pso;
+    let PreparedSplit { to, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso, resolution } = prepared;
+    let old_resolution = {
+        let mut states = STATES.lock().unwrap();
+        let s = states.as_mut().and_then(|m| m.get_mut(&to)).expect("prepared split destination state");
+        debug_assert_eq!(s.allocator, 0);
+        debug_assert!(s.uma.is_empty());
+        s.allocator = allocator;
+        s.layout = layout;
+        s.args = args;
+        s.layout_gfx = layout_gfx;
+        s.args_gfx = args_gfx;
+        s.rs_gfx = rs_gfx;
+        s.pso = pso;
+        std::mem::replace(&mut s.resolution, resolution)
+    };
+    drop(old_resolution);
 }
 
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
@@ -174,7 +187,10 @@ pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
+    let removed = {
+        STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)))
+    };
+    if let Some(s) = removed {
         console_list::hold_until_reset(s.allocator, s.uma);
     }
 }
@@ -976,8 +992,16 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 /// #25 SetPipelineState: noted, then bound as on the PC
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
-    with(this, |s| s.pso = pso as usize);
+    set_tracked_pipeline_state(this, pso as usize);
     super::real::bind_pipeline(this, pso);
+}
+
+fn set_tracked_pipeline_state(this: *mut c_void, pso: usize) {
+    let old_resolution = with(this, |s| {
+        s.pso = pso;
+        s.resolution.take()
+    });
+    drop(old_resolution);
 }
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
@@ -1277,7 +1301,7 @@ pub(super) fn tracked_pso(list: *mut c_void) -> usize {
 mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
@@ -1544,6 +1568,63 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(tracked_pso(list), 0);
 
         forget(list);
+    }
+
+    fn probed_resolution(list: usize, original: usize, dropped: Arc<AtomicBool>)
+        -> pso_async::PipelineResolution {
+        pso_async::pipeline_resolution_for_test(original, move || {
+            assert!(STATES.try_lock().is_ok(), "pipeline resolution dropped under bind::STATES");
+            dropped.store(true, Ordering::Release);
+            let _ = list;
+        })
+    }
+
+    #[test]
+    fn pipeline_resolution_replacements_drop_outside_state_lock() {
+        let cases: [fn(*mut c_void); 4] = [
+            |list| clear_state(list, 0x7100_5001),
+            |list| reset(list, 0, 0x7100_5002),
+            |list| set_tracked_pipeline_state(list, 0x7100_5003),
+            forget,
+        ];
+        for (n, replace) in cases.into_iter().enumerate() {
+            let list = (0x7100_5100usize + n) as *mut c_void;
+            let dropped = Arc::new(AtomicBool::new(false));
+            let resolution = probed_resolution(list as usize, 0x7100_5200 + n, dropped.clone());
+            with(list, |s| s.resolution = Some(resolution));
+            replace(list);
+            assert!(dropped.load(Ordering::Acquire), "case {n} retained the replaced resolution");
+            if n + 1 != cases.len() {
+                forget(list);
+            }
+        }
+    }
+
+    #[test]
+    fn split_retains_the_exact_resolution_across_address_reuse() {
+        let from = 0x7100_6001usize as *mut c_void;
+        let to = 0x7100_6002usize as *mut c_void;
+        let original = 0x7100_6100usize;
+        let old = pso_async::pipeline_resolution_for_test(original, || {});
+        let old_identity = old.identity_for_test();
+        with(from, |s| {
+            s.pso = original;
+            s.resolution = Some(old);
+        });
+        reset(to, 0, 0);
+
+        let prepared = prepare_split(from, to, 0);
+        let replacement = pso_async::pipeline_resolution_for_test(original, || {});
+        let replacement_identity = replacement.identity_for_test();
+        assert_ne!(old_identity.1, replacement_identity.1);
+        with(from, |s| s.resolution = Some(replacement));
+        install_prepared_split(prepared);
+
+        assert_eq!(with(to, |s| s.resolution.as_ref().unwrap().identity_for_test()), old_identity,
+            "split state was redirected to the Pending now stored at the reused title address");
+        assert_eq!(with(from, |s| s.resolution.as_ref().unwrap().identity_for_test()), replacement_identity);
+        forget(from);
+        forget(to);
     }
 
     #[test]
