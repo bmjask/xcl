@@ -1159,6 +1159,24 @@ impl UploadReservation {
         self.token.take();
         Ok(())
     }
+
+    /// Publish after execute acceptance. Publication failure is fail-closed: the exact record and
+    /// its entire generation are poisoned instead of being cancelled by this guard's destructor.
+    fn publish_after_accept(mut self, fence: u64) -> Result<UploadSubmissionReceipt, UploadReservationError> {
+        let token = self.token.take().expect("finished upload reservation");
+        let mut ledger = self.ledger.lock().unwrap();
+        if fence == 0 {
+            let _ = ledger.poison(token);
+            return Err(UploadReservationError::State);
+        }
+        match ledger.submit(token, fence) {
+            Ok(()) => Ok(UploadSubmissionReceipt { token, fence }),
+            Err(error) => {
+                let _ = ledger.poison(token);
+                Err(error)
+            }
+        }
+    }
 }
 
 impl Drop for UploadReservation {
