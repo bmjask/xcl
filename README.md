@@ -280,7 +280,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
-    default.
+    default. Expiry stops the title before later GPU work is submitted; it never treats elapsed
+    time as proof that the waited-for work completed.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
   Loading a cached shader without split pieces reuses the file buffer, avoiding a second
