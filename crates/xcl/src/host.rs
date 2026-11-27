@@ -125,9 +125,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
-    // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
+    // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title), and
+    // which title fences and XCL queue waits are behind then
     if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
         let at: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if !at.is_empty() {
+            crate::hle::d3d12x::list_x::enable_sync_state_tracing();
+        }
         let _ = std::thread::Builder::new().name("xcl-thread-dump".into()).spawn(move || {
             let t0 = std::time::Instant::now();
             for s in at {
@@ -136,6 +140,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     std::thread::sleep(std::time::Duration::from_secs_f64(left));
                 }
                 crate::eh::dump_threads();
+                crate::hle::d3d12x::list_x::log_sync_state(&format!("{s} s"));
             }
         });
     }
