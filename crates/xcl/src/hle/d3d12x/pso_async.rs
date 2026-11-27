@@ -1666,6 +1666,8 @@ struct RestorationCoordinator<const E: usize, const R: usize> {
     captured: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
     #[cfg(test)]
     before_rebuild: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    #[cfg(test)]
+    before_classified_request: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
 /// An exact ledger record installed on its build before native detachment can begin. Dropping an
@@ -1749,6 +1751,8 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
             captured: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             before_rebuild: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_classified_request: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -4106,6 +4110,163 @@ mod used_tests {
         build.owners.store(0, Ordering::Release);
         assert!(released_q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
         assert!(matches!(released.wait_and_take_pin(), Err(RehydrateCompletion::Released))); assert_eq!(coordinator.reconcile(1), 1);
+    }
+
+    fn structured_pending(build: Arc<Build>, compute: bool) -> Arc<Pending> {
+        Arc::new(Pending {
+            build,
+            driver: AtomicUsize::new(0),
+            compute,
+            key: 0,
+            used: AtomicBool::new(false),
+            late: AtomicBool::new(false),
+            spared: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn structured_resolve_retains_pending_across_title_address_reuse() {
+        let original = 0x7E57_D001usize;
+        let old = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), false);
+        let coordinator = RestorationCoordinator::<1, 1>::new(501).unwrap();
+        let q = BuildQueue::new();
+        let outcome = classify_structured_on(original, &old, &coordinator, &q);
+        let replacement = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), true);
+        PENDING.insert(original, replacement.clone());
+
+        match outcome {
+            StructuredResolve::Initial { original: retained_original, pending, fallback, bound_unbuilt } => {
+                assert_eq!((retained_original, fallback, bound_unbuilt), (original, original, true));
+                assert!(Arc::ptr_eq(&pending, &old), "address reuse redirected a retained decision");
+                assert!(!Arc::ptr_eq(&pending, &replacement));
+            }
+            _ => panic!("unfinished build was not classified as initial"),
+        }
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement));
+    }
+
+    #[test]
+    fn structured_resolve_fails_closed_without_exact_eviction_record() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        let pending = structured_pending(build.clone(), false);
+        let coordinator = RestorationCoordinator::<1, 1>::new(502).unwrap();
+        let outcome = classify_structured_on(0x7E57_D002, &pending, &coordinator, &BuildQueue::new());
+        assert!(matches!(outcome, StructuredResolve::Terminal {
+            failure: StructuredResolveFailure::MissingEvictionRecord, ..
+        }));
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+        drop(pending); drop(build); drop(recipe);
+    }
+
+    #[test]
+    fn structured_resolve_keeps_exact_pin_during_speculative_rebuild() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        assert!(matches!(recipe.begin_rebuild(), RebuildTurn::Leader));
+        let pending = structured_pending(build.clone(), false);
+        let coordinator = RestorationCoordinator::<1, 1>::new(504).unwrap();
+        let outcome = classify_structured_on(0x7E57_D004, &pending, &coordinator, &BuildQueue::new());
+        let StructuredResolve::Ready { raw: chosen, pin: Some(pin), .. } = outcome else {
+            panic!("a rebuilding replacement hid the current exact generation")
+        };
+        assert_eq!((chosen, pin.raw()), (raw, raw));
+        recipe.finish_rebuild(RebuildResult::Failed);
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(pin); drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn structured_resolve_promotes_exact_background_without_inline_driver_work() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_next = next.clone(); let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            build_next.load(Ordering::Acquire)
+        });
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<1, 1>::new(503).unwrap();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin);
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+        let pending = structured_pending(build.clone(), false);
+        let q = BuildQueue::new();
+        let background = coordinator.request_exact_on(&evicted, RehydratePriority::Background, &q).unwrap();
+        let outcome = classify_structured_on(0x7E57_D003, &pending, &coordinator, &q);
+        let StructuredResolve::Restoring { ticket, .. } = &outcome else { panic!("eviction did not classify as restoring") };
+        assert!(background.token().exact(ticket.token()), "foreground classification did not coalesce exactly");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "classification ran driver work inline");
+        assert!(!q.try_run_one_between(Priority::Speculative, Priority::Preload), "attempt was not promoted");
+        assert!(q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        let resolved = outcome.wait_exact().unwrap().unwrap();
+        assert_eq!((resolved.raw, resolved.bound_unbuilt, calls.load(Ordering::Relaxed)),
+            (replacement_raw, false, 2));
+        assert!(resolved.pin.is_some());
+
+        drop(resolved); drop(outcome); drop(background);
+        assert_eq!(coordinator.reconcile(1), 1);
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn structured_resolve_prefers_publication_over_stale_cancelled_request() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw)); let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<1, 2>::new(505).unwrap();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin); assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+        let pending = structured_pending(build.clone(), false); let q = BuildQueue::new();
+        let background = coordinator.request_exact_on(&evicted, RehydratePriority::Background, &q).unwrap();
+        let (seen_tx, seen_rx) = mpsc::channel(); let (continue_tx, continue_rx) = mpsc::channel();
+        *coordinator.before_classified_request.lock().unwrap() = Some(Box::new(move || {
+            seen_tx.send(()).unwrap(); continue_rx.recv().unwrap();
+        }));
+        std::thread::scope(|scope| {
+            let classifier = scope.spawn(|| classify_structured_on(0x7E57_D005, &pending, &coordinator, &q));
+            seen_rx.recv().unwrap();
+            assert!(q.try_run_one_between(Priority::Speculative, Priority::Preload));
+            drop(background.wait_and_take_pin().unwrap()); drop(background);
+            assert_eq!(coordinator.reconcile(1), 1);
+            continue_tx.send(()).unwrap();
+            let outcome = classifier.join().unwrap();
+            assert!(matches!(outcome, StructuredResolve::Ready { raw, pin: Some(_), .. } if raw == replacement_raw),
+                "stale cancelled request hid a concurrently published generation");
+            drop(outcome);
+        });
+        assert_eq!(coordinator.reconcile(2), 1, "stale request was not retired");
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
     }
 
     #[test]
@@ -6579,6 +6740,184 @@ pub(super) fn resolve_and_pin_for_bind(pso: usize) -> (usize, Option<NativeGener
 
 #[derive(Clone, Copy)]
 enum ResolveMode { Lazy, Wait, ForBind }
+
+/// One retained resolver decision. This is private and unwired: a later list integration can
+/// classify without waiting, retain the original `Pending` across title-address reuse, and wait
+/// only when correctness-critical emission consumes an exact restoration ticket.
+#[allow(dead_code)]
+#[derive(Clone)]
+enum StructuredResolve<const R: usize> {
+    Ready {
+        original: usize,
+        raw: usize,
+        pin: Option<NativeGeneration>,
+    },
+    Initial {
+        original: usize,
+        pending: Arc<Pending>,
+        fallback: usize,
+        bound_unbuilt: bool,
+    },
+    Restoring {
+        original: usize,
+        pending: Arc<Pending>,
+        fallback: usize,
+        ticket: RestorationTicket<R>,
+    },
+    Terminal {
+        original: usize,
+        pending: Arc<Pending>,
+        fallback: usize,
+        failure: StructuredResolveFailure,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StructuredResolveFailure {
+    MissingEvictionRecord,
+    RestorationUnavailable,
+    Refused,
+    Cancelled,
+    Panicked,
+    BuildFailed,
+    Released,
+}
+
+#[allow(dead_code)]
+struct StructuredResolvedPipeline {
+    raw: usize,
+    pin: Option<NativeGeneration>,
+    bound_unbuilt: bool,
+}
+
+#[allow(dead_code)]
+impl<const R: usize> StructuredResolve<R> {
+    /// Never waits. An initial build or restoration returns only the retained Pending's fallback.
+    fn nonblocking(&self) -> StructuredResolvedPipeline {
+        match self {
+            Self::Ready { raw, pin, .. } => StructuredResolvedPipeline {
+                raw: *raw, pin: pin.clone(), bound_unbuilt: false,
+            },
+            Self::Initial { fallback, bound_unbuilt, .. } => StructuredResolvedPipeline {
+                raw: *fallback, pin: None, bound_unbuilt: *bound_unbuilt,
+            },
+            Self::Restoring { fallback, .. } | Self::Terminal { fallback, .. } => {
+                StructuredResolvedPipeline { raw: *fallback, pin: None, bound_unbuilt: true }
+            }
+        }
+    }
+
+    /// Wait only for an already-classified exact restoration. Initial cold-build policy remains
+    /// with the existing resolver until the later call-site integration stage.
+    fn wait_exact(&self) -> Result<Option<StructuredResolvedPipeline>, StructuredResolveFailure> {
+        match self {
+            Self::Ready { raw, pin, .. } => Ok(Some(StructuredResolvedPipeline {
+                raw: *raw, pin: pin.clone(), bound_unbuilt: false,
+            })),
+            Self::Initial { .. } => Ok(None),
+            Self::Restoring { ticket, .. } => ticket.wait_and_take_pin()
+                .map(|pin| Some(StructuredResolvedPipeline { raw: pin.raw(), pin: Some(pin), bound_unbuilt: false }))
+                .map_err(StructuredResolveFailure::from),
+            Self::Terminal { failure, .. } => Err(*failure),
+        }
+    }
+}
+
+impl From<RehydrateCompletion> for StructuredResolveFailure {
+    fn from(completion: RehydrateCompletion) -> Self {
+        match completion {
+            RehydrateCompletion::Refused => Self::Refused,
+            RehydrateCompletion::Cancelled => Self::Cancelled,
+            RehydrateCompletion::Panicked => Self::Panicked,
+            RehydrateCompletion::BuildFailed => Self::BuildFailed,
+            RehydrateCompletion::Released => Self::Released,
+            RehydrateCompletion::Reserved | RehydrateCompletion::Queued
+            | RehydrateCompletion::Succeeded { .. } => Self::RestorationUnavailable,
+        }
+    }
+}
+
+/// Classify one retained Pending without running driver work or waiting. The caller supplies the
+/// private coordinator and queue so this foundation neither creates a live policy singleton nor
+/// starts workers. No Build, recipe, registry, coordinator, or queue lock overlaps submission.
+#[allow(dead_code)]
+fn classify_structured_on<const E: usize, const R: usize>(
+    original: usize,
+    pending: &Arc<Pending>,
+    coordinator: &RestorationCoordinator<E, R>,
+    q: &BuildQueue,
+) -> StructuredResolve<R> {
+    enum Snapshot {
+        Ready(usize, Option<NativeGeneration>),
+        Initial(usize, bool),
+        Restore(usize),
+    }
+    let snapshot = || {
+        let done = pending.build.done.lock().unwrap();
+        let raw = pending.build.real.load(Ordering::Acquire);
+        let fallback = pending.stand(original);
+        if !*done {
+            return Snapshot::Initial(fallback, true);
+        }
+        let Some(recipe) = pending.build.recipe.as_ref() else {
+            // A one-shot Build has no independent native pin. Leave its current resolution to
+            // the existing resolver instead of carrying an ownerless raw pointer across release.
+            return Snapshot::Initial(fallback, false);
+        };
+        let (pin, residency) = recipe.pin_with_residency(raw);
+        match (pin, residency) {
+            // A speculative replacement may mark the recipe Rebuilding while the old exact
+            // resident generation remains published and fully usable.
+            (Some(pin), Residency::Resident | Residency::Rebuilding) => Snapshot::Ready(raw, Some(pin)),
+            (None, Residency::Evicted | Residency::Rebuilding) => Snapshot::Restore(fallback),
+            (None, Residency::Failed) => Snapshot::Initial(fallback, false),
+            _ => Snapshot::Restore(fallback),
+        }
+    };
+    let fallback = match snapshot() {
+        Snapshot::Ready(raw, pin) => return StructuredResolve::Ready { original, raw, pin },
+        Snapshot::Initial(fallback, bound_unbuilt) => return StructuredResolve::Initial {
+            original, pending: pending.clone(), fallback, bound_unbuilt,
+        },
+        Snapshot::Restore(fallback) => fallback,
+    };
+    let Some(evicted) = pending.build.eviction_token() else {
+        // Terminal reconciliation clears the token after publication. Reclassify once so that
+        // race returns the new exact resident pin instead of a false missing-record failure.
+        return match snapshot() {
+            Snapshot::Ready(raw, pin) => StructuredResolve::Ready { original, raw, pin },
+            Snapshot::Initial(fallback, bound_unbuilt) => StructuredResolve::Initial {
+                original, pending: pending.clone(), fallback, bound_unbuilt,
+            },
+            Snapshot::Restore(fallback) => StructuredResolve::Terminal {
+                original, pending: pending.clone(), fallback,
+                failure: StructuredResolveFailure::MissingEvictionRecord,
+            },
+        };
+    };
+    #[cfg(test)]
+    let before_request = coordinator.before_classified_request.lock().unwrap().take();
+    #[cfg(test)]
+    if let Some(before_request) = before_request {
+        before_request();
+    }
+    let requested = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, q);
+    // Success may publish and reconcile after the token snapshot but before this request. Its
+    // exact current pin wins over the stale request's Cancelled terminal state.
+    if let Snapshot::Ready(raw, pin) = snapshot() {
+        return StructuredResolve::Ready { original, raw, pin };
+    }
+    match requested {
+        Some(ticket) => StructuredResolve::Restoring {
+            original, pending: pending.clone(), fallback, ticket,
+        },
+        None => StructuredResolve::Terminal {
+            original, pending: pending.clone(), fallback,
+            failure: StructuredResolveFailure::RestorationUnavailable,
+        },
+    }
+}
 
 fn resolve_and_pin_mode(pso: usize, mode: ResolveMode) -> (usize, Option<NativeGeneration>) {
     let Some(p) = entry(pso) else { return (pso, None) };
