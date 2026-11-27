@@ -1201,6 +1201,32 @@ struct UploadPageObservation {
     source: [u64; CHUNKS],
 }
 
+/// Owned point-in-time input for building a coordinated upload plan after releasing `STATE`.
+/// Capture is the only step that needs the live mapping and title bytes; plan construction uses
+/// these immutable observations, then commit revalidates them against the current State.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct UploadPlanningSnapshot {
+    state_generation: u64,
+    mapping_epoch: u64,
+    claimed: Vec<(usize, WorkReasons)>,
+    observations: Vec<UploadPageObservation>,
+}
+
+#[allow(dead_code)]
+impl UploadPlanningSnapshot {
+    fn capture(
+        state_generation: u64,
+        mapping_epoch: u64,
+        claimed: &[(usize, WorkReasons)],
+        mut observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+    ) -> Option<Self> {
+        if state_generation == 0 { return None }
+        let observations = claimed.iter().map(|&(page, _)| observe(page)).collect::<Option<Vec<_>>>()?;
+        Some(Self { state_generation, mapping_epoch, claimed: claimed.to_vec(), observations })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 struct PlannedUploadPage {
@@ -1313,9 +1339,32 @@ impl CoordinatedSparseUploadPlan {
         mapping_epoch: u64,
         observe: impl FnMut(usize) -> Option<UploadPageObservation>,
     ) -> Option<Self> {
-        if lease.token.state_generation != state_generation { return None }
-        let pages = build_upload_pages(lease.pages(), observe)?;
-        Some(Self { lease: Some(lease), state_generation, mapping_epoch, pages })
+        let snapshot = UploadPlanningSnapshot::capture(
+            state_generation, mapping_epoch, lease.pages(), observe,
+        )?;
+        Self::from_snapshot(lease, snapshot)
+    }
+
+    /// Build only from owned observations. A live caller captures `snapshot` under `STATE`, drops
+    /// that lock, and performs this allocation/scanning work before reacquiring for `validate`.
+    fn from_snapshot(lease: SparseBatchLease, snapshot: UploadPlanningSnapshot) -> Option<Self> {
+        if lease.token.state_generation != snapshot.state_generation
+            || lease.pages() != snapshot.claimed
+            || snapshot.observations.len() != snapshot.claimed.len()
+        {
+            return None;
+        }
+        let mut observations = snapshot.observations.into_iter();
+        let pages = build_upload_pages(&snapshot.claimed, |page| {
+            let observation = observations.next()?;
+            (observation.page == page).then_some(observation)
+        })?;
+        Some(Self {
+            lease: Some(lease),
+            state_generation: snapshot.state_generation,
+            mapping_epoch: snapshot.mapping_epoch,
+            pages,
+        })
     }
 
     fn validate(
@@ -5245,6 +5294,31 @@ mod tests {
         let mut rewritten = observation.clone();
         rewritten.source[3] ^= 1;
         assert_eq!(plan.validate(71, 7, |_| Some(rewritten.clone())), Err(UploadPlanInvalid::SourceHashes));
+    }
+
+    #[test]
+    fn planning_snapshot_owns_observations_for_an_unlocked_build() {
+        let batches = SparseBatches::new(73);
+        assert!(batches.add_dirty_pages([0x2_3000]));
+        let lease = batches.seal(3, 1).unwrap().unwrap();
+        let observed = upload_observation(0x2_3000, (6, 11), 0xB7);
+        let mut captures = 0;
+        let snapshot = UploadPlanningSnapshot::capture(73, 9, lease.pages(), |_| {
+            captures += 1;
+            Some(observed.clone())
+        }).unwrap();
+        assert_eq!(captures, 1);
+
+        // Construction consumes only the owned snapshot; no live State observation is available
+        // while this work runs outside its lock.
+        let plan = CoordinatedSparseUploadPlan::from_snapshot(lease, snapshot).unwrap();
+        assert_eq!(plan.pages[0].source, observed.source);
+        assert_eq!(plan.validate(74, 9, |_| Some(observed.clone())), Err(UploadPlanInvalid::StateGeneration));
+        assert_eq!(plan.validate(73, 10, |_| Some(observed.clone())), Err(UploadPlanInvalid::MappingEpoch));
+        let mut rewritten = observed.clone();
+        rewritten.source[5] ^= 1;
+        assert_eq!(plan.validate(73, 9, |_| Some(rewritten.clone())), Err(UploadPlanInvalid::SourceHashes));
+        assert_eq!(plan.validate(73, 9, |_| Some(observed.clone())), Ok(()));
     }
 
     #[test]
