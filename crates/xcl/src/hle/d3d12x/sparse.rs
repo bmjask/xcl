@@ -808,6 +808,38 @@ impl SparseBatches {
         true
     }
 
+    /// Mirror one legacy upload attempt into an exact-generation batch. All three reason sets are
+    /// added and claimed under one ledger lock so a future unlocked planner cannot observe only a
+    /// prefix of the legacy journal.
+    fn seal_legacy(
+        &self,
+        owner: u64,
+        zero: &[(usize, usize)],
+        retry: &[usize],
+        dirty: &[(usize, usize)],
+    ) -> Result<Option<SparseBatchLease>, SparseBatchError> {
+        let mut dirty_pages = Vec::new();
+        for &(start, bytes) in dirty {
+            let end = start.saturating_add(bytes);
+            let mut page = start & !(PAGE - 1);
+            while page < end {
+                dirty_pages.push(page);
+                let Some(next) = page.checked_add(PAGE) else { break };
+                page = next;
+            }
+        }
+        dirty_pages.sort_unstable();
+        dirty_pages.dedup();
+
+        let mut ledger = self.ledger.lock().unwrap();
+        ledger.check(self.state_generation)?;
+        ledger.work.add_zero_ranges(zero);
+        ledger.work.add_retry_pages(retry.iter().copied());
+        ledger.work.add_dirty_pages(dirty_pages);
+        let result = ledger.seal(self.state_generation, owner, usize::MAX)?;
+        Ok(result.map(|(token, pages)| SparseBatchLease { ledger: self.ledger.clone(), token, pages }))
+    }
+
     fn seal(&self, owner: u64, limit: usize) -> Result<Option<SparseBatchLease>, SparseBatchError> {
         let result = self.ledger.lock().unwrap().seal(self.state_generation, owner, limit)?;
         Ok(result.map(|(token, pages)| SparseBatchLease { ledger: self.ledger.clone(), token, pages }))
@@ -1696,6 +1728,7 @@ impl Drop for AcceptedCoordinatedUpload {
 /// ledgers together prevents a later activation from pairing work, waits, or ring reservations
 /// from different device/fence generations.
 #[allow(dead_code)]
+#[derive(Clone)]
 struct SparseCoordination {
     batches: SparseBatches,
     waits: ForegroundWaits,
@@ -1709,6 +1742,16 @@ impl SparseCoordination {
             waits: ForegroundWaits::new(state_generation, fence_allocation)?,
             reservations: UploadReservations::new(state_generation, UPLOAD_SLOTS, STAGING, RING_ALIGN),
         })
+    }
+
+    fn seal_legacy(
+        &self,
+        owner: u64,
+        zero: &[(usize, usize)],
+        retry: &[usize],
+        dirty: &[(usize, usize)],
+    ) -> Result<Option<SparseBatchLease>, SparseBatchError> {
+        self.batches.seal_legacy(owner, zero, retry, dirty)
     }
 }
 
@@ -4097,6 +4140,10 @@ unsafe fn before_execute_locked(
         note_transfer_metrics(look.as_deref_mut(), metric_runs.as_ref());
         return PreparationOutcome::Ready;
     };
+    // Snapshot the exact-generation coordination owners while this State is authoritative. The
+    // Arc-backed ledgers may later be used after STATE is released without borrowing replacement
+    // state; this parity stage still leaves the legacy upload path authoritative.
+    let coordination = s.coordination.clone();
     // the title's work sees what was decommitted unmapped, as it was
     let flushed = s.flush_parked_with(Some(queue));
     let drained = s.drain_quarantined_with(|fence| {
@@ -4115,6 +4162,7 @@ unsafe fn before_execute_locked(
     dirty_runs.clear();
     let mut deferred = Vec::new();
     let retry_pages = std::mem::take(&mut s.retry_pages);
+    let prior_retry = retry_pages.clone();
     if retry_pages.is_empty() {
         let mut i = 0;
         while i < dirty.len() {
@@ -4140,19 +4188,18 @@ unsafe fn before_execute_locked(
         }
     } else {
         let mut pages = retry_pages;
-        let prior = pages.clone();
         pages.extend(dirty.iter().flat_map(|&a| (a..a.saturating_add(page)).step_by(PAGE)));
         pages.sort_unstable();
         pages.dedup();
         for pg in pages {
             let t = pg & !(TILE - 1);
             let Some(entry) = s.mapped.get_mut(&t) else {
-                if prior.binary_search(&pg).is_ok() { deferred.push(pg) }
+                if prior_retry.binary_search(&pg).is_ok() { deferred.push(pg) }
                 continue;
             };
             let idx = (pg - t) / PAGE;
             if entry.holes & (1u16 << idx) != 0 {
-                if prior.binary_search(&pg).is_ok() { deferred.push(pg) }
+                if prior_retry.binary_search(&pg).is_ok() { deferred.push(pg) }
                 continue;
             }
             let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
@@ -4160,6 +4207,13 @@ unsafe fn before_execute_locked(
         }
     }
     let t_scanned = t0.map(|_| std::time::Instant::now());
+    // Dual-journal exactly what the legacy attempt is about to consume. This sealed batch is a
+    // parity record only: the established upload path remains authoritative and retires it as
+    // obsolete after publishing its own retry state.
+    let legacy_batch = coordination
+        .seal_legacy(q as u64, &zero_runs, &prior_retry, &dirty_runs)
+        .ok()
+        .flatten();
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     let mut outcome = PreparationOutcome::Ready;
     let mut upload_wait = None;
@@ -4185,6 +4239,9 @@ unsafe fn before_execute_locked(
         }
     }
     s.retry_pages = retry_journal(outcome, deferred, &dirty_runs);
+    if let Some(batch) = legacy_batch {
+        let _ = batch.obsolete();
+    }
     if let Some((zero, dirty)) = metric_runs.as_mut() {
         remember_metric_runs(zero, &zero_runs);
         remember_metric_runs(dirty, &dirty_runs);
@@ -4975,6 +5032,37 @@ mod tests {
         assert_eq!(reservation.token.unwrap().state_generation, 101);
         assert!(SparseCoordination::new(0, 501).is_none());
         assert!(SparseCoordination::new(101, 0).is_none());
+    }
+
+    #[test]
+    fn legacy_sparse_attempt_is_mirrored_and_retired_as_one_exact_batch() {
+        let coordination = SparseCoordination::new(103, 503).unwrap();
+        let snapshot = coordination.clone();
+        assert!(Arc::ptr_eq(&coordination.batches.ledger, &snapshot.batches.ledger));
+
+        let batch = snapshot.seal_legacy(
+            0xA,
+            &[(0x3000, 2 * PAGE)],
+            &[0x3001, 0x1000],
+            &[(0x4000 + CHUNK, CHUNK)],
+        ).unwrap().unwrap();
+        assert_eq!(batch.token.state_generation, 103);
+        assert_eq!(
+            batch.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(),
+            [
+                (0x1000, WorkReasons::RETRY.0),
+                (0x3000, WorkReasons::ZERO.0 | WorkReasons::RETRY.0),
+                (0x4000, WorkReasons::ZERO.0 | WorkReasons::DIRTY.0),
+            ],
+        );
+        let through = snapshot.batches.through().unwrap();
+        batch.obsolete().unwrap();
+        assert_eq!(
+            coordination.batches.observe(through, 0xB),
+            Ok(ClaimFrontierAction::Ready { through, required_fence: None }),
+            "the parity batch remained visible after the legacy path retired it",
+        );
+        assert!(coordination.batches.seal(0xB, usize::MAX).unwrap().is_none());
     }
 
     fn wait_ready(fence: SparseFenceIdentity, through: u64, value: Option<u64>) -> SparseReadyReceipt {
