@@ -7664,6 +7664,12 @@ struct PipelineResolutionBenchPso {
     refs: AtomicUsize,
 }
 
+// The benchmark vtable is immutable and its only mutable state is atomic reference counting.
+#[cfg(feature = "pipeline-resolution-bench")]
+unsafe impl Send for PipelineResolutionBenchPso {}
+#[cfg(feature = "pipeline-resolution-bench")]
+unsafe impl Sync for PipelineResolutionBenchPso {}
+
 #[cfg(feature = "pipeline-resolution-bench")]
 unsafe extern "system" fn pipeline_resolution_bench_add_ref(this: *mut std::ffi::c_void) -> u32 {
     (*(this as *mut PipelineResolutionBenchPso)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
@@ -7672,6 +7678,49 @@ unsafe extern "system" fn pipeline_resolution_bench_add_ref(this: *mut std::ffi:
 #[cfg(feature = "pipeline-resolution-bench")]
 unsafe extern "system" fn pipeline_resolution_bench_release(this: *mut std::ffi::c_void) -> u32 {
     (*(this as *mut PipelineResolutionBenchPso)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+}
+
+/// Distinct exact-generation identities backed by one fake COM object. Field order keeps every
+/// generation owner alive only while the fake object and its vtable still exist.
+#[cfg(feature = "pipeline-resolution-bench")]
+pub(super) struct NativeGenerationBenchSet {
+    generations: Vec<NativeGeneration>,
+    _raw_owner: ID3D12PipelineState,
+    _native: Box<PipelineResolutionBenchPso>,
+    _vtable: Box<[usize; 3]>,
+}
+
+#[cfg(feature = "pipeline-resolution-bench")]
+impl NativeGenerationBenchSet {
+    pub(super) fn new(count: usize) -> Self {
+        assert!(count != 0);
+        let vtable = Box::new([
+            0,
+            pipeline_resolution_bench_add_ref as usize,
+            pipeline_resolution_bench_release as usize,
+        ]);
+        let mut native = Box::new(PipelineResolutionBenchPso {
+            vtable: vtable.as_ptr(),
+            refs: AtomicUsize::new(1),
+        });
+        let raw = (&mut *native as *mut PipelineResolutionBenchPso).cast::<std::ffi::c_void>();
+        let raw_owner = unsafe { ID3D12PipelineState::from_raw(raw) };
+        let generations = (0..count)
+            .map(|index| NativeGeneration {
+                generation: Arc::new(Generation {
+                    id: index as u64 + 1,
+                    raw: raw as usize,
+                    _owner: raw_owner.clone(),
+                }),
+                recipe: Weak::new(),
+            })
+            .collect();
+        Self { generations, _raw_owner: raw_owner, _native: native, _vtable: vtable }
+    }
+
+    pub(super) fn get(&self, index: usize) -> NativeGeneration {
+        self.generations[index].clone()
+    }
 }
 
 #[cfg(feature = "pipeline-resolution-bench")]
