@@ -5007,6 +5007,206 @@ mod used_tests {
     }
 
     #[test]
+    fn retained_native_lazy_choice_ignores_address_reuse_and_shares_promotion() {
+        let original = 0x7E57_D030usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let build = Arc::new(Build::new(Box::new(move || raw), false));
+        let pending = structured_pending(build.clone(), false);
+        assert!(PENDING.insert(original, pending.clone()).is_none());
+        let resolution = begin_pipeline_resolution(original).unwrap();
+        let clone = resolution.clone();
+        let replacement = structured_pending(Arc::new(Build::new(Box::new(|| {
+            panic!("replacement address was consulted")
+        }), false)), false);
+        assert!(Arc::ptr_eq(&PENDING.insert(original, replacement.clone()).unwrap(), &pending));
+
+        let job = build.job.lock().unwrap().take().unwrap();
+        build.sent.store(true, Ordering::Release); // the test owns `job`; suppress an empty queue entry
+        assert!(matches!(
+            resolution.select_for_native_bind(NativePipelineBindMode::Lazy),
+            NativePipelineChoice::InitialFallback { raw, bound_unbuilt: true } if raw == original
+        ));
+        assert!(replacement.build.job.lock().unwrap().is_some());
+        complete(&build, job());
+        let ready = PipelineResolution(classify_retained(original, &pending), false);
+        let NativePipelineChoice::Exact { raw: ready_raw, generation: ready_generation } =
+            ready.select_for_native_bind(NativePipelineBindMode::ForBind)
+            else { panic!("ready retained native choice was not exact") };
+        let NativePipelineChoice::Exact { raw: first_raw, generation: first } =
+            clone.select_for_native_bind(NativePipelineBindMode::Lazy)
+            else { panic!("completed retained native choice was not exact") };
+        let NativePipelineChoice::Exact { raw: second_raw, generation: second } =
+            resolution.select_for_native_bind(NativePipelineBindMode::Lazy)
+            else { panic!("promoted native winner was lost") };
+        assert_eq!((ready_raw, first_raw, second_raw), (raw, raw, raw));
+        assert!(ready_generation.same(&first));
+        assert!(first.same(&second));
+        assert_eq!(native.refs.load(Ordering::Relaxed), 2, "promotion allocated extra native owners");
+
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement));
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        release(raw_owner);
+        drop(second); drop(first); drop(ready_generation); drop(ready);
+        drop(clone); drop(resolution); drop(pending); drop(build);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retained_native_for_bind_waits_only_for_compute_initial() {
+        fn pending_build(compute: bool) -> (Arc<Build>, Arc<Pending>, Arc<AtomicBool>) {
+            let finish = Arc::new(AtomicBool::new(false));
+            let build_finish = finish.clone();
+            let build = Arc::new(Build::new(Box::new(move || {
+                while !build_finish.load(Ordering::Acquire) { std::thread::yield_now(); }
+                0
+            }), false));
+            (build.clone(), structured_pending(build, compute), finish)
+        }
+        let (compute_build, compute_pending, compute_finish) = pending_build(true);
+        let compute = PipelineResolution(
+            StructuredResolve::initial(0x7E57_D031, compute_pending, 0x7E57_D031, true), true,
+        );
+        assert!(matches!(
+            compute.select_for_native_bind_with_budget(
+                NativePipelineBindMode::ForBind, Some(std::time::Duration::ZERO),
+            ),
+            NativePipelineChoice::InitialFallback { raw: 0x7E57_D031, bound_unbuilt: true }
+        ));
+        compute_finish.store(true, Ordering::Release);
+        let mut done = compute_build.done.lock().unwrap();
+        while !*done { done = compute_build.cv.wait(done).unwrap(); }
+        drop(done);
+
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let (release_build, wait_for_release) = mpsc::channel();
+        let exact_build = Arc::new(Build::new(Box::new(move || {
+            wait_for_release.recv().unwrap();
+            raw
+        }), false));
+        let exact = PipelineResolution(StructuredResolve::initial(
+            0x7E57_D035, structured_pending(exact_build.clone(), true), 0x7E57_D035, true,
+        ), true);
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter = exact.clone();
+        let thread = std::thread::spawn(move || {
+            result_tx.send(waiter.select_for_native_bind_with_budget(
+                NativePipelineBindMode::ForBind, None,
+            )).unwrap();
+        });
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ), "compute ForBind returned before its retained build completed");
+        release_build.send(()).unwrap();
+        let NativePipelineChoice::Exact { raw: selected, generation } =
+            result_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+            else { panic!("compute ForBind did not return its completed exact generation") };
+        thread.join().unwrap();
+        assert_eq!(selected, raw);
+        let raw_owner = exact_build.real.swap(0, Ordering::AcqRel);
+        release(raw_owner);
+        drop(generation); drop(exact); drop(exact_build);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+
+        let (graphics_build, graphics_pending, graphics_finish) = pending_build(false);
+        let graphics = PipelineResolution(
+            StructuredResolve::initial(0x7E57_D032, graphics_pending, 0x7E57_D032, true), false,
+        );
+        assert!(matches!(
+            graphics.select_for_native_bind_with_budget(NativePipelineBindMode::ForBind, None),
+            NativePipelineChoice::InitialFallback { raw: 0x7E57_D032, bound_unbuilt: true }
+        ), "graphics ForBind waited instead of using lazy policy");
+        graphics_finish.store(true, Ordering::Release);
+        let mut done = graphics_build.done.lock().unwrap();
+        while !*done { done = graphics_build.cv.wait(done).unwrap(); }
+    }
+
+    #[test]
+    fn retained_native_deferred_is_fail_closed_then_observes_exact_publication() {
+        let original = 0x7E57_D033usize;
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut restored = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let restored_raw = &mut restored as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || first_raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        let pending = structured_pending(build.clone(), true);
+        let coordinator = RestorationCoordinator::<4, PIPELINE_RESOLUTION_RECEIPTS>::new(0xD033).unwrap();
+        let pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin);
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        let restoration = Arc::new(RestorationDemand::new(evicted));
+        let resolution = PipelineResolution(StructuredResolve::Deferred {
+            original, pending: pending.clone(), fallback: original,
+            restoration: restoration.clone(),
+        }, true);
+        assert!(matches!(
+            resolution.select_for_native_bind(NativePipelineBindMode::Lazy),
+            NativePipelineChoice::Unavailable
+        ));
+        assert!(matches!(
+            resolution.select_for_native_bind(NativePipelineBindMode::ForBind),
+            NativePipelineChoice::Unavailable
+        ));
+        assert!(!restoration.demanded.load(Ordering::Acquire));
+        assert!(restoration.requested.get().is_none(), "native selection requested restoration");
+
+        let (published, replaced) = recipe.publish(restored_raw);
+        assert!(replaced.is_none());
+        build.real.store(restored_raw, Ordering::Release);
+        build.owners.store(0, Ordering::Release);
+        assert!(matches!(
+            resolution.select_for_native_bind(NativePipelineBindMode::Lazy),
+            NativePipelineChoice::Unavailable
+        ), "released deferred identity resurrected a resident generation");
+        build.owners.store(1, Ordering::Release);
+        let NativePipelineChoice::Exact { raw, generation } =
+            resolution.select_for_native_bind(NativePipelineBindMode::Lazy)
+            else { panic!("published retained restoration was unavailable") };
+        assert_eq!(raw, restored_raw);
+        assert_eq!(generation.id(), published.id());
+        let PipelineChoice::Available { generation: emission, .. } = resolution.resolve_for_emission()
+            else { panic!("emission did not converge on resident deferred generation") };
+        assert!(generation.same(&emission));
+        let terminal = PipelineResolution(StructuredResolve::Terminal {
+            original, pending: pending.clone(), fallback: original,
+            failure: StructuredResolveFailure::RestorationUnavailable,
+        }, true);
+        assert!(matches!(
+            terminal.select_for_native_bind(NativePipelineBindMode::Lazy),
+            NativePipelineChoice::Unavailable
+        ));
+        assert!(matches!(terminal.resolve_for_emission(), PipelineChoice::Unavailable));
+
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(terminal); drop(emission); drop(generation); drop(published); drop(resolution);
+        drop(restoration); drop(pending); drop(build); drop(recipe);
+        release(raw_owner);
+        assert_eq!((first.refs.load(Ordering::Relaxed), restored.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn retained_native_unpromoted_release_is_unavailable() {
+        let build = Arc::new(Build::new(Box::new(|| panic!("released build ran")), false));
+        let pending = structured_pending(build.clone(), true);
+        let resolution = PipelineResolution(
+            StructuredResolve::initial(0x7E57_D034, pending, 0x7E57_D034, true), true,
+        );
+        build.owners.store(0, Ordering::Release);
+        for mode in [NativePipelineBindMode::Lazy, NativePipelineBindMode::ForBind] {
+            assert!(matches!(resolution.select_for_native_bind(mode), NativePipelineChoice::Unavailable));
+        }
+    }
+
+    #[test]
     fn initial_pending_probe_does_not_take_the_completion_lock() {
         let build = Arc::new(Build::new(Box::new(|| 0), false));
         let pending = structured_pending(build.clone(), true);
@@ -9159,6 +9359,20 @@ pub(super) enum IndirectPipelineChoice {
     Unavailable,
 }
 
+/// Retained native command-list bind decision. Exact owns the selected generation;
+/// InitialFallback is legal only for this snapshot's still-live initial build. Activation must
+/// apply each API's fail-closed Unavailable behavior without registry relookup or stale fallback.
+#[allow(dead_code)] // consumed by the native command-list bind integration stage
+pub(super) enum NativePipelineChoice {
+    Exact { raw: usize, generation: NativeGeneration },
+    InitialFallback { raw: usize, bound_unbuilt: bool },
+    Unavailable,
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // consumed by the native command-list bind integration stage
+pub(super) enum NativePipelineBindMode { Lazy, ForBind }
+
 /// Wrap one nonblocking decision without exposing coordinator or receipt types to command-list
 /// state. This does not start workers and never runs a queued driver build on the caller.
 #[allow(dead_code)] // activated with the later restoration-request stage
@@ -9181,6 +9395,69 @@ pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResol
 impl PipelineResolution {
     #[allow(dead_code)] // consumed by the ExecuteIndirect integration stage
     pub(super) fn is_compute(&self) -> bool { self.1 }
+
+    /// Select a native bind from this retained identity only. Lazy never waits; ForBind keeps
+    /// the existing bounded compute wait while graphics remains lazy.
+    #[allow(dead_code)] // consumed by the native command-list bind integration stage
+    pub(super) fn select_for_native_bind(
+        &self, mode: NativePipelineBindMode,
+    ) -> NativePipelineChoice {
+        self.select_for_native_bind_with_budget(mode, wait_budget())
+    }
+
+    #[allow(dead_code)] // testable policy core for the next integration stage
+    fn select_for_native_bind_with_budget(
+        &self, mode: NativePipelineBindMode, budget: Option<std::time::Duration>,
+    ) -> NativePipelineChoice {
+        if let StructuredResolve::Initial { original, pending, promoted, .. } = &self.0 {
+            if let Some(generation) = promoted.get() {
+                return native_exact(generation.clone());
+            }
+            if pending.build.owners.load(Ordering::Acquire) == 0
+                || pending.build.orphan.load(Ordering::Acquire)
+            {
+                return NativePipelineChoice::Unavailable;
+            }
+            let raw = match mode {
+                NativePipelineBindMode::ForBind if self.1 => {
+                    pending.note_use();
+                    resolve_wait_pending(pending, *original, budget)
+                }
+                NativePipelineBindMode::Lazy | NativePipelineBindMode::ForBind => {
+                    resolve_pending(pending, *original)
+                }
+            };
+            let bound_unbuilt = pending.bound_unbuilt(*original, raw);
+            let (raw, generation, stale_fallback) =
+                pin_resolved(*original, pending, raw, bound_unbuilt);
+            return match (generation, stale_fallback) {
+                (Some(generation), _) => promote_native_choice(promoted, generation),
+                (None, false) => finish_native_initial_choice(
+                    promoted, pending,
+                    NativePipelineChoice::InitialFallback { raw, bound_unbuilt },
+                ),
+                (None, true) => finish_native_initial_choice(
+                    promoted, pending, NativePipelineChoice::Unavailable,
+                ),
+            };
+        }
+        match (&self.0, mode) {
+            (StructuredResolve::Ready { pin: Some(generation), .. }, _) => {
+                native_exact(generation.clone())
+            }
+            (StructuredResolve::Deferred { pending, .. }, _) => {
+                if pending.build.owners.load(Ordering::Acquire) == 0
+                    || pending.build.orphan.load(Ordering::Acquire)
+                {
+                    NativePipelineChoice::Unavailable
+                } else {
+                    RestorationDemand::resident(pending)
+                        .map_or(NativePipelineChoice::Unavailable, native_exact)
+                }
+            }
+            _ => NativePipelineChoice::Unavailable,
+        }
+    }
 
     #[allow(dead_code)] // consumed by the ExecuteIndirect integration stage
     pub(super) fn resolve_for_indirect(&self) -> IndirectPipelineChoice {
@@ -9312,6 +9589,34 @@ impl PipelineResolution {
             | StructuredResolve::Terminal { .. } => PipelineChoice::Unavailable,
         }
     }
+}
+
+#[allow(dead_code)] // consumed by the native command-list bind integration stage
+fn native_exact(generation: NativeGeneration) -> NativePipelineChoice {
+    NativePipelineChoice::Exact { raw: generation.raw(), generation }
+}
+
+#[allow(dead_code)] // consumed by the native command-list bind integration stage
+fn promote_native_choice(
+    promoted: &OnceLock<NativeGeneration>, generation: NativeGeneration,
+) -> NativePipelineChoice {
+    let _ = promoted.set(generation);
+    native_exact(promoted.get().expect("initial native exact promotion").clone())
+}
+
+#[allow(dead_code)] // consumed by the native command-list bind integration stage
+fn finish_native_initial_choice(
+    promoted: &OnceLock<NativeGeneration>, pending: &Pending, local: NativePipelineChoice,
+) -> NativePipelineChoice {
+    if let Some(generation) = promoted.get() {
+        return native_exact(generation.clone());
+    }
+    if pending.build.owners.load(Ordering::Acquire) == 0
+        || pending.build.orphan.load(Ordering::Acquire)
+    {
+        return NativePipelineChoice::Unavailable;
+    }
+    local
 }
 
 fn promote_indirect_initial_choice(
