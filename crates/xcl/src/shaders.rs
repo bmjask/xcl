@@ -1328,6 +1328,8 @@ struct Pipelines {
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    /// pipelines made successfully whose driver blob could not be persisted
+    write_failures: AtomicUsize,
     /// pipelines an OS-backed claim proves another preparation process is already building
     elsewhere: AtomicUsize,
     split_programs: AtomicUsize,
@@ -1346,6 +1348,25 @@ struct Pipelines {
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+}
+
+fn record_driver_blob_write(wrote: bool, failures: &AtomicUsize) -> Option<usize> {
+    (!wrote).then(|| failures.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
+#[cfg(test)]
+mod pipeline_write_tests {
+    use super::record_driver_blob_write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_failed_driver_blob_writes_are_counted() {
+        let failures = AtomicUsize::new(0);
+        assert_eq!(record_driver_blob_write(true, &failures), None);
+        assert_eq!(record_driver_blob_write(false, &failures), Some(1));
+        assert_eq!(record_driver_blob_write(false, &failures), Some(2));
+        assert_eq!(failures.load(Ordering::Relaxed), 2);
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1926,6 +1947,7 @@ impl Pipelines {
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
+                write_failures: AtomicUsize::new(0),
                 elsewhere: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
@@ -2136,14 +2158,25 @@ impl Pipelines {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
             if let (Some(path), Ok(pso)) = (path.as_deref().filter(|_| _claim.is_some() || cached.is_some()), &pso) {
-                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
+                let wrote = if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
                     let len = unsafe { blob.GetBufferSize() };
                     if !bytes.is_null() && len != 0 {
                         let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
-                        if driver_cache::write(path, bytes) {
+                        let wrote = driver_cache::write(path, bytes);
+                        if wrote {
                             if let Some(((book, layout), _)) = receipt { book.record(warm_blobs::stamp(path, layout, bytes)); }
                         }
+                        wrote
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if let Some(failures) = record_driver_blob_write(wrote, &self.write_failures) {
+                    if failures == 1 {
+                        crate::xlog_warn!("Shader preparation: failed to persist driver blob {}; this pipeline will be rebuilt on the next run", path.display());
                     }
                 }
             }
@@ -3261,6 +3294,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             println!("previously verified native compute pipelines {}", p.verified.load(Ordering::Relaxed));
         }
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        let write_failures = p.write_failures.load(Ordering::Relaxed);
+        if write_failures != 0 {
+            println!("pipeline driver-cache writes failed {write_failures}");
+        }
         let elsewhere = p.elsewhere.load(Ordering::Relaxed);
         if elsewhere != 0 {
             println!("pipelines left to another preparation process {elsewhere}");
