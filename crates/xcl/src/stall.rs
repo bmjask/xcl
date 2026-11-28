@@ -19,6 +19,8 @@ pub enum StallKind {
     ShaderTranslation,
     DxcQueue,
     DxcCompile,
+    PipelineQueueSpeculative,
+    PipelineQueueDemand,
     PipelineWait,
     DriverCompileGate,
     DriverCompile,
@@ -40,10 +42,12 @@ pub enum StallKind {
 }
 
 impl StallKind {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::ShaderTranslation,
         Self::DxcQueue,
         Self::DxcCompile,
+        Self::PipelineQueueSpeculative,
+        Self::PipelineQueueDemand,
         Self::PipelineWait,
         Self::DriverCompileGate,
         Self::DriverCompile,
@@ -190,6 +194,14 @@ impl Recorder {
         Some(Span { recorder: self, kind, started_ns: clock.now_ns(), clock, finished: false })
     }
 
+    #[inline]
+    fn defer_with(&self, clock: &dyn Clock) -> Option<DeferredSpan> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(DeferredSpan { started_ns: clock.now_ns() })
+    }
+
     fn record(&self, kind: StallKind, started_ns: u64, duration_ns: u64) {
         self.aggregates[kind.index()].record(duration_ns);
         if duration_ns < SLOW_SPAN_NS {
@@ -224,6 +236,45 @@ pub struct Span<'a> {
     finished: bool,
 }
 
+/// A duration whose kind is chosen when it finishes. Dropping it records nothing, so work refused
+/// or cancelled before it starts does not look like completed queue latency.
+pub struct DeferredSpan {
+    started_ns: u64,
+}
+
+impl DeferredSpan {
+    fn stop_with(self, clock: &dyn Clock) -> DeferredDuration {
+        DeferredDuration {
+            started_ns: self.started_ns,
+            duration_ns: clock.now_ns().saturating_sub(self.started_ns),
+        }
+    }
+
+    pub fn stop(self) -> DeferredDuration {
+        self.stop_with(&CLOCK)
+    }
+
+    pub fn finish(self, kind: StallKind) {
+        self.stop().finish(kind);
+    }
+}
+
+/// A stopped deferred duration. Dropping it records nothing.
+pub struct DeferredDuration {
+    started_ns: u64,
+    duration_ns: u64,
+}
+
+impl DeferredDuration {
+    fn finish_with(self, recorder: &Recorder, kind: StallKind) {
+        recorder.record(kind, self.started_ns, self.duration_ns);
+    }
+
+    pub fn finish(self, kind: StallKind) {
+        self.finish_with(&RECORDER, kind);
+    }
+}
+
 impl Drop for Span<'_> {
     fn drop(&mut self) {
         if !self.finished {
@@ -252,6 +303,12 @@ pub fn note_submitter() {
 #[inline]
 pub fn span(kind: StallKind) -> Option<Span<'static>> {
     RECORDER.start_with(kind, &CLOCK)
+}
+
+/// Begin an opt-in duration which records only when [`DeferredSpan::finish`] is called.
+#[inline]
+pub fn deferred_span() -> Option<DeferredSpan> {
+    RECORDER.defer_with(&CLOCK)
 }
 
 /// A high-frequency command-recording span, enabled only by `XCL_STALL_TRACE_DETAIL`.
@@ -314,8 +371,37 @@ mod tests {
         let recorder = Recorder::new();
         let clock = TestClock::new(10);
         assert!(recorder.start_with(StallKind::DxcCompile, &clock).is_none());
+        assert!(recorder.defer_with(&clock).is_none());
         assert_eq!(clock.calls.load(Ordering::Relaxed), 0);
         assert_eq!(recorder.snapshot().aggregates[StallKind::DxcCompile.index()].count, 0);
+    }
+
+    #[test]
+    fn deferred_spans_split_queue_bands_and_abandoned_work_records_nothing() {
+        let recorder = Recorder::new();
+        recorder.enable();
+        let clock = TestClock::new(10);
+
+        let speculative = recorder.defer_with(&clock).unwrap();
+        clock.now.store(30, Ordering::Relaxed);
+        let speculative = speculative.stop_with(&clock);
+        let demand = recorder.defer_with(&clock).unwrap();
+        clock.now.store(75, Ordering::Relaxed);
+        speculative.finish_with(&recorder, StallKind::PipelineQueueSpeculative);
+        demand.stop_with(&clock).finish_with(&recorder, StallKind::PipelineQueueDemand);
+        let abandoned_previous = recorder.defer_with(&clock).unwrap();
+        clock.now.store(100, Ordering::Relaxed);
+        let abandoned_previous = abandoned_previous.stop_with(&clock);
+        let abandoned_active = recorder.defer_with(&clock).unwrap();
+        clock.now.store(1_000, Ordering::Relaxed);
+        drop((abandoned_previous, abandoned_active));
+
+        let snapshot = recorder.snapshot();
+        let speculative = &snapshot.aggregates[StallKind::PipelineQueueSpeculative.index()];
+        let demand = &snapshot.aggregates[StallKind::PipelineQueueDemand.index()];
+        assert_eq!((speculative.count, speculative.total_ns), (1, 20));
+        assert_eq!((demand.count, demand.total_ns), (1, 45));
+        assert_eq!(clock.calls.load(Ordering::Relaxed), 7, "abandoning deferred work must not read the clock again");
     }
 
     #[test]

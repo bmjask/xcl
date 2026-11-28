@@ -30,6 +30,13 @@ impl Priority {
     }
 }
 
+fn queue_stall_kind(priority: Priority) -> crate::stall::StallKind {
+    match priority {
+        Priority::Speculative | Priority::Preload => crate::stall::StallKind::PipelineQueueSpeculative,
+        Priority::BoundSoon | Priority::Foreground => crate::stall::StallKind::PipelineQueueDemand,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct JobId(u64);
 
@@ -156,8 +163,30 @@ struct Job {
     priority: Priority,
     preload_rank: Option<usize>,
     generation: u64,
+    previous_queue_wait: Option<crate::stall::DeferredDuration>,
+    queue_wait: Option<crate::stall::DeferredSpan>,
     work: Work,
     completion: Arc<Completion>,
+}
+
+struct ReadyJob {
+    priority: Priority,
+    previous_queue_wait: Option<crate::stall::DeferredDuration>,
+    queue_wait: Option<crate::stall::DeferredDuration>,
+    work: Work,
+    completion: Arc<Completion>,
+}
+
+impl ReadyJob {
+    fn publish_queue_wait(self) -> (Work, Arc<Completion>) {
+        if let Some(wait) = self.previous_queue_wait {
+            wait.finish(crate::stall::StallKind::PipelineQueueSpeculative);
+        }
+        if let Some(wait) = self.queue_wait {
+            wait.finish(queue_stall_kind(self.priority));
+        }
+        (self.work, self.completion)
+    }
 }
 
 struct State {
@@ -228,6 +257,10 @@ impl Inner {
             return true;
         }
         let ranked_preload = job.priority == Priority::Preload && job.preload_rank.is_some();
+        if queue_stall_kind(job.priority) != queue_stall_kind(priority) {
+            job.previous_queue_wait = job.queue_wait.take().map(crate::stall::DeferredSpan::stop);
+            job.queue_wait = crate::stall::deferred_span();
+        }
         job.priority = priority;
         job.generation += 1;
         let ticket = Ticket { id, generation: job.generation };
@@ -250,7 +283,7 @@ impl Inner {
         }
     }
 
-    fn take_ready(&self, state: &mut State, low: Priority, high: Priority) -> Option<(Work, Arc<Completion>)> {
+    fn take_ready(&self, state: &mut State, low: Priority, high: Priority) -> Option<ReadyJob> {
         for priority in (low.index()..=high.index()).rev() {
             let priority = match priority {
                 0 => Priority::Speculative,
@@ -263,12 +296,21 @@ impl Inner {
                     job.priority == priority && job.generation == ticket.generation
                 });
                 if current {
-                    let job = state.jobs.remove(&ticket.id).unwrap();
+                    let mut job = state.jobs.remove(&ticket.id).unwrap();
                     if priority == Priority::Preload && job.preload_rank.is_some() {
                         self.ranked_preloads.started.fetch_add(1, Ordering::Relaxed);
                     }
+                    // Dequeue acceptance is the end of priority-band residence. Stop the clock
+                    // while the queue state is authoritative, but publish only after unlocking.
+                    let queue_wait = job.queue_wait.take().map(crate::stall::DeferredSpan::stop);
                     job.completion.set(JobStatus::Running);
-                    return Some((job.work, job.completion));
+                    return Some(ReadyJob {
+                        priority,
+                        previous_queue_wait: job.previous_queue_wait.take(),
+                        queue_wait,
+                        work: job.work,
+                        completion: job.completion,
+                    });
                 }
             }
         }
@@ -280,7 +322,8 @@ impl Inner {
         let changed = self.changed(low, high);
         loop {
             if let Some(job) = self.take_ready(&mut state, low, high) {
-                return Some(job);
+                drop(state);
+                return Some(job.publish_queue_wait());
             }
             if state.stopped || !wait {
                 return None;
@@ -297,7 +340,8 @@ impl Inner {
                 return None;
             }
             if let Some(job) = self.take_ready(&mut state, low, high) {
-                return Some(job);
+                drop(state);
+                return Some(job.publish_queue_wait());
             }
             state = changed.wait_timeout(state, std::time::Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0;
         }
@@ -355,6 +399,10 @@ impl BuildQueue {
     }
 
     /// Add work, optionally ordered by an earlier-run rank within the Preload band only.
+    ///
+    /// Queue latency measures accepted priority-band residence: it starts at insertion after the
+    /// state mutex is acquired, so admission mutex wait is excluded. A cross-band promotion ends
+    /// the speculative interval when that promotion is accepted while holding the same mutex.
     pub(super) fn submit_ranked(&self, priority: Priority, preload_rank: Option<usize>, work: Work) -> Option<JobHandle> {
         let completion = Arc::new(Completion::new());
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -365,7 +413,15 @@ impl BuildQueue {
         let id = JobId(state.next_id);
         let generation = 0;
         let preload_rank = if priority == Priority::Preload { preload_rank } else { None };
-        state.jobs.insert(id, Job { priority, preload_rank, generation, work, completion: completion.clone() });
+        state.jobs.insert(id, Job {
+            priority,
+            preload_rank,
+            generation,
+            previous_queue_wait: None,
+            queue_wait: crate::stall::deferred_span(),
+            work,
+            completion: completion.clone(),
+        });
         state.push(priority, Ticket { id, generation }, preload_rank);
         if preload_rank.is_some() {
             self.inner.ranked_preloads.submissions.fetch_add(1, Ordering::Relaxed);
@@ -447,6 +503,14 @@ mod tests {
     }
 
     #[test]
+    fn queue_latency_bands_match_worker_priorities() {
+        assert_eq!(queue_stall_kind(Priority::Speculative), crate::stall::StallKind::PipelineQueueSpeculative);
+        assert_eq!(queue_stall_kind(Priority::Preload), crate::stall::StallKind::PipelineQueueSpeculative);
+        assert_eq!(queue_stall_kind(Priority::BoundSoon), crate::stall::StallKind::PipelineQueueDemand);
+        assert_eq!(queue_stall_kind(Priority::Foreground), crate::stall::StallKind::PipelineQueueDemand);
+    }
+
+    #[test]
     fn highest_priority_runs_first_and_each_priority_is_fifo() {
         let q = BuildQueue::new();
         let out = Arc::new(Mutex::new(Vec::new()));
@@ -503,6 +567,23 @@ mod tests {
             q.ranked_preload_stats(),
             RankedPreloadSnapshot { submissions: 3, started: 1, promoted: 1 },
         );
+    }
+
+    #[test]
+    fn promoted_timing_is_abandoned_for_cancel_shutdown_and_refusal() {
+        let q = BuildQueue::new();
+        let cancelled = q.submit(Priority::Speculative, Box::new(|| panic!("must not run"))).unwrap();
+        assert!(cancelled.promote(Priority::Foreground));
+        assert_eq!(cancelled.status(), JobStatus::Queued);
+        assert!(cancelled.cancel());
+        assert_eq!(cancelled.wait(), JobStatus::Cancelled);
+
+        let shutdown = q.submit(Priority::Preload, Box::new(|| panic!("must not run"))).unwrap();
+        assert!(shutdown.promote(Priority::BoundSoon));
+        assert_eq!(shutdown.status(), JobStatus::Queued);
+        q.shutdown();
+        assert_eq!(shutdown.wait(), JobStatus::Cancelled);
+        assert!(q.submit(Priority::Foreground, Box::new(|| {})).is_none());
     }
 
     #[test]
