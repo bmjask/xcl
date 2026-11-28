@@ -80,8 +80,29 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
+    let title = TITLE_WINDOWS.load(std::sync::atomic::Ordering::Relaxed);
+    if title != 0 {
+        return windows_for(title & !super::HEAP_WINDOWS, title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()));
+    }
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+    windows_for(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()))
+}
+
+/// The title's windows (`mem_windows` with `HEAP_WINDOWS`) for a process without its memory: a
+/// shader preparation worker builds the title's pipelines with them (0: none given).
+static TITLE_WINDOWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `mem_windows` is `windows` from here on (a preparation worker: `uma::leave_out`).
+pub fn set_title_windows(windows: u32) {
+    TITLE_WINDOWS.store(windows, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `n` windows as shaders take them: from the descriptor heap (`heap`), or in the switch form
+/// over the root UAVs – of which there are `MAX_WINDOWS`, so never more there (the HLSL path
+/// refused a wider switch, and DXIL quietly made it 4: a 16-window run whose heap views could
+/// not be made, or a pipeline the driver refused with them, lost every shader on HLSL).
+fn windows_for(n: u32, heap: bool) -> u32 {
+    if n > 1 && heap {
         n | super::HEAP_WINDOWS
     } else {
         n
@@ -178,6 +199,8 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
 /// each at every start. Keyed by two hashes and the length of the bytes, the stage and the
 /// translation parameters; translator sources and the DXC toolchain identify compatible builds.
 /// `XCL_TRANSLATED_CACHE=0` turns it off.
+pub(crate) fn translation_cache_identity() -> u64 { translated::identity() }
+
 mod translated {
     use super::{Compiled, Stage};
     use std::path::{Path, PathBuf};
@@ -245,7 +268,7 @@ mod translated {
 
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
-    fn identity() -> u64 {
+    pub(super) fn identity() -> u64 {
         static I: OnceLock<u64> = OnceLock::new();
         *I.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {

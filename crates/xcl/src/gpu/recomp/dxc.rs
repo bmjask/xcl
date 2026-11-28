@@ -691,7 +691,7 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
     h
 }
 
-fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
+pub(crate) fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
 }
 

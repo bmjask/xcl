@@ -222,7 +222,14 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
             }
             1..=6 | 24 | 25 => {
                 let state = read_state::<D3D12_SHADER_BYTECODE>(payload)?;
-                if state.BytecodeLength == 0 && ty != 25 {
+                if state.BytecodeLength == 0 {
+                    if ty == 25 {
+                        return None;
+                    }
+                    if matches!(ty, 1..=5) && payload.iter().all(|&byte| byte == 0) {
+                        h.u32(ty);
+                        h.u64(0);
+                    }
                     continue;
                 }
                 let code = payload_shader(payload)?;
@@ -274,6 +281,25 @@ mod tests {
     use super::*;
     use super::super::StreamOut;
     use std::ffi::c_void;
+
+    #[test]
+    fn inactive_shader_stages_keep_a_two_pass_driver_cache_key() {
+        let ms = [1u8, 2, 3, 4];
+        let key = |stages: &[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE]| {
+            let mut stream = StreamOut::default();
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+            for &stage in stages { stream.put(stage, &D3D12_SHADER_BYTECODE::default()); }
+            unsafe { two_pass_stream_key(&stream.0, &[], 7, 1) }
+        };
+        let ds = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS;
+        let hs = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS;
+        let gs = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
+        let tagged = key(&[ds, hs, gs]).unwrap();
+        assert_eq!(tagged.1, ms.len());
+        assert_eq!(Some(tagged), key(&[gs, ds, hs]));
+        assert_ne!(Some(tagged), key(&[]));
+        assert_eq!(key(&[ds, ds]), None);
+    }
 
     #[test]
     fn canonical_stream_key_distinguishes_state_samplers_and_driver() {
