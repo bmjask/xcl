@@ -143,7 +143,9 @@ impl Corpus {
         }
         let mut pipelines = Pipelines::for_adapter(&progress.adapter)?;
         let library_path = self.compute_directory().and_then(Path::parent).map(|dir| dir.join("compute.plib.pending"));
-        if library_path.is_some() { super::pipeline_library::begin(&pipelines.dev)?; }
+        if let Some(path) = &library_path {
+            super::pipeline_library::begin(&pipelines.dev, Some(&path.with_extension("")))?;
+        }
         pipelines.warm_blobs = super::warm_blobs::Verified::for_device(&pipelines.dev);
         pipelines.max_dxil = 0;
         pipelines.most = parallel;

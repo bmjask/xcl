@@ -8,7 +8,14 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 struct Builder {
     library: NativeLibrary,
+    previous: Option<std::sync::Arc<Previous>>,
     names: std::collections::HashSet<String>,
+    imported: std::collections::HashSet<String>,
+}
+
+struct Previous {
+    library: NativeLibrary,
+    names: [std::sync::Mutex<()>; 64],
 }
 
 static BUILD: std::sync::Mutex<Option<Builder>> = std::sync::Mutex::new(None);
@@ -50,26 +57,47 @@ fn with_name<T>(name: &str, f: impl FnOnce(&Active) -> Option<windows::core::Res
     f(active)?.ok()
 }
 
+fn from_previous<T>(name: &str, f: impl FnOnce(&NativeLibrary) -> windows::core::Result<T>) -> Option<T> {
+    let previous = BUILD.lock().unwrap().as_ref()?.previous.clone()?;
+    let slot = crate::gpu::shader::fnv64(name.as_bytes()) as usize % previous.names.len();
+    let _same_name = previous.names[slot].lock().unwrap();
+    let result = f(&previous.library).ok()?;
+    if let Some(builder) = BUILD.lock().unwrap().as_mut() {
+        builder.imported.insert(name.into());
+    }
+    Some(result)
+}
+
 pub(crate) fn load_compute(name: &str, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
-    with_name(name, |active| active.compute.as_ref().map(|library| library.load_compute(name, desc)))
+    from_previous(name, |library| library.load_compute(name, desc))
+        .or_else(|| with_name(name, |active| active.compute.as_ref().map(|library| library.load_compute(name, desc))))
 }
 
 pub(crate) fn load_graphics(name: &str, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
-    with_name(name, |active| active.graphics.as_ref().map(|library| library.load_graphics(name, desc)))
+    from_previous(name, |library| library.load_graphics(name, desc))
+        .or_else(|| with_name(name, |active| active.graphics.as_ref().map(|library| library.load_graphics(name, desc))))
 }
 
 pub(crate) fn load_stream(name: &str, desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Option<ID3D12PipelineState> {
-    with_name(name, |active| active.graphics.as_ref().map(|library| library.load_stream(name, desc)))
+    from_previous(name, |library| library.load_stream(name, desc))
+        .or_else(|| with_name(name, |active| active.graphics.as_ref().map(|library| library.load_stream(name, desc))))
 }
 
 pub(crate) fn building() -> bool { BUILD.lock().unwrap().is_some() }
 
-pub(crate) fn begin(device: &ID3D12Device) -> std::result::Result<bool, String> {
+pub(crate) fn begin(device: &ID3D12Device, previous: Option<&std::path::Path>) -> std::result::Result<bool, String> {
     if !NativeLibrary::supported(device) { return Ok(false) }
     let library = NativeLibrary::empty(device).map_err(|e| format!("Creating pipeline library: {e}"))?;
+    let previous = previous
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| NativeLibrary::open(device, bytes).ok())
+        .map(|library| std::sync::Arc::new(Previous {
+            library,
+            names: std::array::from_fn(|_| std::sync::Mutex::new(())),
+        }));
     let mut active = BUILD.lock().unwrap();
     if active.is_some() { return Err("A pipeline library build is already active".into()); }
-    *active = Some(Builder { library, names: Default::default() });
+    *active = Some(Builder { library, previous, names: Default::default(), imported: Default::default() });
     Ok(true)
 }
 
@@ -89,8 +117,10 @@ pub(crate) fn abort() { *BUILD.lock().unwrap() = None; }
 pub(crate) fn finish(path: &std::path::Path) -> std::result::Result<usize, String> {
     let builder = BUILD.lock().unwrap().take().ok_or("No pipeline library build is active")?;
     let count = builder.names.len();
+    let imported = builder.imported.intersection(&builder.names).count();
     let bytes = builder.library.serialize().map_err(|e| format!("Serializing pipeline library: {e}"))?;
     write_atomic(path, &bytes).map_err(|e| format!("Publishing {}: {e}", path.display()))?;
+    if imported != 0 { eprintln!("pipeline library: imported {imported} exact entries from the previous library"); }
     Ok(count)
 }
 
@@ -123,6 +153,9 @@ pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
     if result.is_err() { let _ = std::fs::remove_file(temporary); }
     result
 }
+
+#[cfg(test)]
+pub(crate) static BUILD_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) struct NativeLibrary {
     library: ID3D12PipelineLibrary1,
@@ -208,7 +241,7 @@ impl NativeLibrary {
 
 #[cfg(test)]
 mod tests {
-    use super::{abort, begin, finish, store, NativeLibrary};
+    use super::{abort, begin, finish, store, NativeLibrary, BUILD_TEST};
     use crate::gpu::recomp;
     use crate::shaders::Pipelines;
     use std::mem::ManuallyDrop;
@@ -216,6 +249,9 @@ mod tests {
     use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Direct3D12::*;
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
 
     fn fixture() -> Option<(Pipelines, Vec<u8>, ID3D12RootSignature)> {
         if let Err(reason) = recomp::dxc::location() {
@@ -348,34 +384,49 @@ void main() {{ output.Store(0, {n}); }}
 
     #[test]
     fn builder_deduplicates_names_and_atomically_replaces_output() {
+        let _serial = BUILD_TEST.lock().unwrap();
         let Some((pipelines, dxil, root)) = fixture() else { return };
         let desc = compute_desc(&dxil, &root);
         let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
             .expect("compute pipeline");
         let path = std::env::temp_dir().join(format!("xcl-pipeline-library-{}.bin", std::process::id()));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
         let _cleanup = Cleanup(path.clone());
         abort();
-        assert!(begin(&pipelines.dev).expect("begin library"));
+        assert!(begin(&pipelines.dev, None).expect("begin library"));
         store("one".into(), &pso).expect("store one");
         store("one".into(), &pso).expect("deduplicate one");
         assert_eq!(finish(&path).expect("publish library"), 1);
         let first = std::fs::read(&path).expect("published bytes");
         NativeLibrary::open(&pipelines.dev, first).expect("published library");
 
-        assert!(begin(&pipelines.dev).expect("begin replacement"));
+        assert!(begin(&pipelines.dev, Some(&path)).expect("begin replacement"));
+        let changed = recomp::dxc::compile(
+            "[RootSignature(\"UAV(u0)\")][numthreads(1,1,1)] void main() {}",
+            "main", "cs_6_6", &[],
+        ).expect("compile changed compute shader");
+        let changed_desc = compute_desc(&changed, &root);
+        assert!(super::load_compute("one", &changed_desc).is_none());
+        drop_desc(changed_desc);
+        let imported = super::load_compute("one", &desc).expect("import previous pipeline");
+        assert!(super::load_compute("missing", &desc).is_none());
+        store("one".into(), &imported).expect("store imported pipeline");
         store("two".into(), &pso).expect("store replacement");
-        assert_eq!(finish(&path).expect("replace library"), 1);
+        assert_eq!(finish(&path).expect("replace library"), 2);
         let replacement = std::fs::read(&path).expect("replacement bytes");
         let library = NativeLibrary::open(&pipelines.dev, replacement).expect("replacement library");
-        assert!(library.load_compute("one", &desc).is_err());
+        library.load_compute("one", &desc).expect("load imported pipeline");
         library.load_compute("two", &desc).expect("load replacement");
+
+        std::fs::write(&path, b"not a pipeline library").expect("write corrupt previous library");
+        assert!(begin(&pipelines.dev, Some(&path)).expect("ignore corrupt previous library"));
+        assert!(super::load_compute("one", &desc).is_none());
+        abort();
         drop_desc(desc);
     }
 
     #[test]
     fn graphics_pipeline_round_trips_through_serialized_library() {
+        let _serial = BUILD_TEST.lock().unwrap();
         let Some((pipelines, _, _)) = fixture() else { return };
         let source = r#"
 #define RS ""
@@ -412,8 +463,14 @@ struct V { float4 p : SV_Position; };
             .expect("graphics pipeline");
         let library = NativeLibrary::empty(&pipelines.dev).expect("empty pipeline library");
         library.store("graphics-0001", &pso).expect("store graphics pipeline");
-        let bytes = library.serialize().expect("serialize graphics library");
-        let reopened = NativeLibrary::open(&pipelines.dev, bytes).expect("reopen graphics library");
+        let path = std::env::temp_dir().join(format!("xcl-graphics-library-{}.bin", std::process::id()));
+        let _cleanup = Cleanup(path.clone());
+        std::fs::write(&path, library.serialize().expect("serialize graphics library")).expect("write graphics library");
+        assert!(begin(&pipelines.dev, Some(&path)).expect("begin graphics replacement"));
+        let imported = super::load_graphics("graphics-0001", &desc).expect("import graphics pipeline");
+        store("graphics-0001".into(), &imported).expect("store imported graphics pipeline");
+        assert_eq!(finish(&path).expect("publish graphics replacement"), 1);
+        let reopened = NativeLibrary::open(&pipelines.dev, std::fs::read(&path).unwrap()).expect("reopen graphics library");
         reopened.load_graphics("graphics-0001", &desc).expect("load graphics pipeline");
         drop(ManuallyDrop::into_inner(desc.pRootSignature));
     }
@@ -433,6 +490,7 @@ struct V { float4 p : SV_Position; };
 
     #[test]
     fn mesh_pipeline_round_trips_through_serialized_library() {
+        let _serial = BUILD_TEST.lock().unwrap();
         let Some((pipelines, _, _)) = fixture() else { return };
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
         if unsafe {
@@ -484,8 +542,14 @@ void main(out vertices V vertices[3], out indices uint3 triangles[1]) {
         let pso = unsafe { device.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect("mesh pipeline");
         let library = NativeLibrary::empty(&pipelines.dev).expect("empty pipeline library");
         library.store("mesh-0001", &pso).expect("store mesh pipeline");
-        let bytes = library.serialize().expect("serialize mesh library");
-        let reopened = NativeLibrary::open(&pipelines.dev, bytes).expect("reopen mesh library");
+        let path = std::env::temp_dir().join(format!("xcl-mesh-library-{}.bin", std::process::id()));
+        let _cleanup = Cleanup(path.clone());
+        std::fs::write(&path, library.serialize().expect("serialize mesh library")).expect("write mesh library");
+        assert!(begin(&pipelines.dev, Some(&path)).expect("begin mesh replacement"));
+        let imported = super::load_stream("mesh-0001", &desc).expect("import mesh pipeline");
+        store("mesh-0001".into(), &imported).expect("store imported mesh pipeline");
+        assert_eq!(finish(&path).expect("publish mesh replacement"), 1);
+        let reopened = NativeLibrary::open(&pipelines.dev, std::fs::read(&path).unwrap()).expect("reopen mesh library");
         reopened.load_stream("mesh-0001", &desc).expect("load mesh pipeline");
     }
 }

@@ -2212,6 +2212,15 @@ impl Pipelines {
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
+        let library_name = match root {
+            PipelineRoot::Whole => driver_cache::name_for_root(dxil, desc.Flags.0, false, samplers),
+            PipelineRoot::DirectChain => driver_cache::name_for_chain_root_node(
+                dxil, desc.Flags.0, driver_cache::ChainRoot::DirectConstants, samplers, desc.NodeMask,
+            ),
+            PipelineRoot::IndirectChain => driver_cache::name_for_chain_root_node(
+                dxil, desc.Flags.0, driver_cache::ChainRoot::IndirectCbv, samplers, desc.NodeMask,
+            ),
+        };
         let path = path_override.or_else(|| {
             #[cfg(test)]
             if let Some(dir) = self.cache_dir.as_deref() {
@@ -2244,6 +2253,16 @@ impl Pipelines {
                 drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                 return Ok(());
             }
+        }
+        if let Some(pso) = pipeline_library::load_compute(&library_name, &desc) {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            let library = pipeline_library::store(library_name, &pso);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            let done = self.made.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 25 == 0 {
+                eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+            }
+            return library;
         }
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
@@ -2363,15 +2382,7 @@ impl Pipelines {
             pso
         };
         let library = match &r {
-            Ok(pso) => pipeline_library::store(match root {
-                PipelineRoot::Whole => driver_cache::name_for_root(dxil, desc.Flags.0, false, samplers),
-                PipelineRoot::DirectChain => driver_cache::name_for_chain_root_node(
-                    dxil, desc.Flags.0, driver_cache::ChainRoot::DirectConstants, samplers, desc.NodeMask,
-                ),
-                PipelineRoot::IndirectChain => driver_cache::name_for_chain_root_node(
-                    dxil, desc.Flags.0, driver_cache::ChainRoot::IndirectCbv, samplers, desc.NodeMask,
-                ),
-            }, pso),
+            Ok(pso) => pipeline_library::store(library_name, pso),
             Err(_) => Ok(()),
         };
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -3117,7 +3128,10 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
     let (device, book) = match Pipelines::for_adapter("auto") {
         Ok(p) => {
             if library_path.is_some() {
-                match pipeline_library::begin(&p.dev) {
+                match pipeline_library::begin(
+                    &p.dev,
+                    library_path.as_ref().map(|path| path.with_extension("")).as_deref(),
+                ) {
                     Ok(_) => {}
                     Err(e) => { eprintln!("xcl shaders: {e}"); return 2; }
                 }
