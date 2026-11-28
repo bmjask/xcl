@@ -256,6 +256,9 @@ fn pipeline_resolution_benches(c: &mut Criterion) {
     group.bench_function("retained_ready", |b| {
         b.iter(|| black_box(&fixture).retained_ready());
     });
+    group.bench_function("retained_ready_recipe_tracked", |b| {
+        b.iter(|| black_box(&fixture).retained_ready_recipe_tracked());
+    });
     // Bind-time registry lookup + classification as a comparison ceiling, not another retained
     // emission path.
     group.bench_function("registry_ready", |b| {
@@ -278,6 +281,8 @@ fn pipeline_resolution_benches(c: &mut Criterion) {
         ("initial_unpromoted_shared", PipelineProbeMode::UnpromotedShared),
         ("initial_unpromoted_distinct", PipelineProbeMode::UnpromotedDistinct),
         ("initial_promoted_control", PipelineProbeMode::Promoted),
+        ("retained_ready", PipelineProbeMode::RetainedReady),
+        ("retained_ready_recipe_tracked", PipelineProbeMode::RetainedReadyRecipeTracked),
     ] {
         let pool = PipelineProbeWorkers::new(fixture.clone(), workers, mode);
         group.bench_function(&format!("{name}_parallel_{workers}"), |b| b.iter(|| pool.run()));
@@ -294,6 +299,8 @@ enum PipelineProbeMode {
     UnpromotedShared,
     UnpromotedDistinct,
     Promoted,
+    RetainedReady,
+    RetainedReadyRecipeTracked,
 }
 
 #[cfg(feature = "pipeline-resolution-bench")]
@@ -333,6 +340,8 @@ impl PipelineProbeWorkers {
                                 PipelineProbeMode::UnpromotedShared => fixture.initial_unpromoted_shared_probe(),
                                 PipelineProbeMode::UnpromotedDistinct => fixture.initial_unpromoted_distinct_probe(worker),
                                 PipelineProbeMode::Promoted => fixture.initial_promoted_probe(),
+                                PipelineProbeMode::RetainedReady => fixture.retained_ready() != 0,
+                                PipelineProbeMode::RetainedReadyRecipeTracked => fixture.retained_ready_recipe_tracked() != 0,
                             } as usize;
                         }
                         black_box(pending);
