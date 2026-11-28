@@ -88,6 +88,9 @@ pub fn ensure(p: usize, len: usize) {
     if len == 0 {
         return;
     }
+    unsafe {
+        let _ = crate::hle::d3d12x::sparse::ensure_cpu(p, len);
+    }
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {

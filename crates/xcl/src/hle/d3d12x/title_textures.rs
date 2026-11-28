@@ -1502,8 +1502,22 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
 struct QueueUploads {
     fence: ID3D12Fence,
     value: u64,
-    in_flight: std::collections::VecDeque<(u64, texture::InFlight)>,
+    in_flight: std::collections::VecDeque<(u64, UploadFlight)>,
     bytes: u64,
+}
+
+enum UploadFlight {
+    Cpu(texture::InFlight),
+    Detile(crate::gpu::detile::InFlight),
+}
+
+impl UploadFlight {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Cpu(f) => f.bytes,
+            Self::Detile(f) => f.bytes,
+        }
+    }
 }
 
 unsafe impl Send for QueueUploads {}
@@ -1545,12 +1559,12 @@ unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>
     (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
 }
 
-unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) -> Vec<texture::InFlight> {
+unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) -> Vec<UploadFlight> {
     let mut retired = Vec::new();
     let done = q.fence.GetCompletedValue();
     while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
         let (_, f) = q.in_flight.pop_front().unwrap();
-        q.bytes -= f.bytes;
+        q.bytes -= f.bytes();
         retired.push(f);
     }
     while q.bytes > cap {
@@ -1559,7 +1573,7 @@ unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u
             break;
         }
         let (_, f) = q.in_flight.pop_front().unwrap();
-        q.bytes -= f.bytes;
+        q.bytes -= f.bytes();
         retired.push(f);
     }
     retired
@@ -1603,11 +1617,120 @@ unsafe fn submit_on_title_queue(
     }
     q.bytes += f.bytes;
     let v = q.value;
-    q.in_flight.push_back((v, f));
+    q.in_flight.push_back((v, UploadFlight::Cpu(f)));
     let retired = reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
     drop(slot);
     drop(retired);
     Ok(failed)
+}
+
+/// Submit on XCL's internal DIRECT queue and order the title queue behind the copy with a GPU
+/// wait. The submitted allocator, list, and staging buffer stay alive until the producer fence
+/// retires; the CPU waits only when retained staging exceeds its bound or a driver call fails.
+unsafe fn submit_on_upload_queue(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    title: &ID3D12CommandQueue,
+    batch: &[texture::UploadBatchItem],
+    zero_mips: &[Vec<bool>],
+) -> Result<Vec<(usize, String)>, String> {
+    super::vram::before_execute(queue);
+    let (failed, f) = texture::submit_batch_with_zero_mips(dev, queue, batch, zero_mips)?;
+    let Some(f) = f else { return Ok(failed) };
+    let key = queue.as_raw() as usize;
+    let state = queue_upload_state(key);
+    let mut slot = state.lock().unwrap();
+    if slot.is_none() {
+        match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+            Ok(fence) => {
+                *slot = Some(QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+            }
+            Err(e) => {
+                drop(slot);
+                texture::drop_after_wait(f, texture::wait(dev, queue))?;
+                return Err(e.to_string());
+            }
+        }
+    }
+    let q = slot.as_mut().unwrap();
+    q.value += 1;
+    let value = q.value;
+    if let Err(e) = super::real::native_queue_signal(queue, &q.fence, value) {
+        q.value -= 1;
+        drop(slot);
+        texture::drop_after_wait(f, texture::wait(dev, queue))?;
+        return Err(e.to_string());
+    }
+    if let Err(e) = super::real::native_queue_wait(title, &q.fence, value) {
+        let waited = crate::gpu::fence::wait(&q.fence, value, dev, None, 10_000).map_err(|wait| wait.to_string());
+        drop(slot);
+        texture::drop_after_wait(f, waited)?;
+        return Err(e.to_string());
+    }
+    q.bytes += f.bytes;
+    q.in_flight.push_back((value, UploadFlight::Cpu(f)));
+    let retired = reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    drop(slot);
+    drop(retired);
+    Ok(failed)
+}
+
+/// Submit one opt-in GPU detile and retain all raw/table/linear buffers behind a queue fence.
+/// When an internal producer queue is used, the title queue receives a GPU wait before its next
+/// work can sample the texture.
+unsafe fn submit_gpu_detile(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    title: Option<&ID3D12CommandQueue>,
+    resource: &ID3D12Resource,
+    tex: &xg::Texture,
+    raw: &[u8],
+    states: &[D3D12_RESOURCE_STATES],
+) -> Result<(), String> {
+    let (surface, surface_offset) = tex.plane_surface(tex.main as u32).ok_or("texture has no texel surface")?;
+    let slices = if surface.depth > 0 { surface.chain.layers() } else { surface.array as usize };
+    let surface_bytes = surface.chain.slice_bytes.checked_mul(slices).ok_or("GPU detile surface size overflow")?;
+    let start: usize = surface_offset.try_into().map_err(|_| "GPU detile surface offset overflow")?;
+    let raw = raw.get(start..start.checked_add(surface_bytes).ok_or("GPU detile surface range overflow")?)
+        .ok_or("GPU detile surface exceeds title texture bytes")?;
+    super::vram::before_execute(queue);
+    let flight = crate::gpu::detile::submit(dev, queue, resource, &surface.chain, slices, raw, states)?;
+    let state = queue_upload_state(queue.as_raw() as usize);
+    let mut slot = state.lock().unwrap();
+    if slot.is_none() {
+        let fence = match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+            Ok(fence) => fence,
+            Err(e) => {
+                drop(slot);
+                texture::drop_after_wait(flight, texture::wait(dev, queue))?;
+                return Err(e.to_string());
+            }
+        };
+        *slot = Some(QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+    }
+    let q = slot.as_mut().unwrap();
+    q.value += 1;
+    let value = q.value;
+    if let Err(e) = super::real::native_queue_signal(queue, &q.fence, value) {
+        q.value -= 1;
+        drop(slot);
+        texture::drop_after_wait(flight, texture::wait(dev, queue))?;
+        return Err(e.to_string());
+    }
+    if let Some(title) = title {
+        if let Err(e) = super::real::native_queue_wait(title, &q.fence, value) {
+            let waited = crate::gpu::fence::wait(&q.fence, value, dev, None, 10_000).map_err(|wait| wait.to_string());
+            drop(slot);
+            texture::drop_after_wait(flight, waited)?;
+            return Err(e.to_string());
+        }
+    }
+    q.bytes += flight.bytes;
+    q.in_flight.push_back((value, UploadFlight::Detile(flight)));
+    let retired = reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    drop(slot);
+    drop(retired);
+    Ok(())
 }
 
 /// A preparation worker failed before this exact batch could be submitted. A texture still at the
@@ -1676,6 +1799,42 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
         if picked.is_empty() {
             continue;
         }
+        // Runtime opt-in until representative-title validation covers every format/mip mode.
+        // Each raw source is capped to the ordinary upload batch size; unsupported layouts,
+        // pipeline creation failures and driver errors leave the item for the CPU detiler below.
+        if std::env::var_os("XCL_GPU_DETILE").is_some() && !super::vram::level_pages() {
+            let d = device as *mut c_void;
+            if let Some(dev) = ID3D12Device::from_raw_borrowed(&d) {
+                let direct = title_queue_for(dev, title);
+                let internal = if direct.is_none() { upload_queue(dev, device).ok() } else { None };
+                if let Some(queue) = direct.as_ref().or(internal.as_ref()) {
+                    let wait_title = internal.as_ref().and_then(|_| {
+                        title.filter(|title| {
+                            let mut qd: Option<ID3D12Device> = None;
+                            title.GetDevice(&mut qd).is_ok() && qd.is_some_and(|d| d.as_raw() == dev.as_raw())
+                        })
+                    });
+                    let mut uploaded = BTreeSet::new();
+                    for (index, (resource, va, tex, states, _)) in picked.iter().enumerate() {
+                        let raw_bytes = tex.size() as usize;
+                        if raw_bytes == 0 || raw_bytes > BATCH_BYTES {
+                            continue;
+                        }
+                        let raw = with_title_bytes(*va, raw_bytes, <[u8]>::to_vec);
+                        if own_work(|| submit_gpu_detile(dev, queue, wait_title, resource, tex, &raw, states)).is_ok() {
+                            uploaded.insert(index);
+                        }
+                    }
+                    if !uploaded.is_empty() {
+                        UPLOADS.fetch_add(uploaded.len() as u64, Ordering::Relaxed);
+                        picked = picked.into_iter().enumerate().filter_map(|(i, item)| (!uploaded.contains(&i)).then_some(item)).collect();
+                    }
+                }
+            }
+        }
+        if picked.is_empty() {
+            continue;
+        }
         let Some(subs) = subresources_of_all(&picked, bytes) else {
             requeue_failed_preparation(&picked);
             warn("a texture preparation worker stopped; the batch will be retried");
@@ -1715,10 +1874,17 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
                 continue;
             }
         };
-        match own_work(|| {
-            super::vram::before_execute(&queue);
-            texture::upload_batch_with_zero_mips(dev, &queue, &batch, &zero_mips)
-        }) {
+        let submitted = title
+            .filter(|title| {
+                let mut qd: Option<ID3D12Device> = None;
+                title.GetDevice(&mut qd).is_ok() && qd.is_some_and(|d| d.as_raw() == dev.as_raw())
+            })
+            .map(|title| own_work(|| submit_on_upload_queue(dev, &queue, title, &batch, &zero_mips)))
+            .unwrap_or_else(|| own_work(|| {
+                super::vram::before_execute(&queue);
+                texture::upload_batch_with_zero_mips(dev, &queue, &batch, &zero_mips)
+            }));
+        match submitted {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
@@ -2207,6 +2373,7 @@ const TITLE_BYTES_KEPT: usize = 64 << 20;
 /// thread – the title can decommit its other memory from another thread at any moment, and a
 /// read in place then faults.
 unsafe fn with_title_bytes<R>(at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    let _ = super::sparse::ensure_cpu(at, len);
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         return f(std::slice::from_raw_parts(at as *const u8, len));
     }

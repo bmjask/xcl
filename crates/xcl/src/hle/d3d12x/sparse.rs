@@ -19,8 +19,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -55,6 +55,136 @@ const PAGE: usize = 0x1000;
 const PAGES_PER_TILE: usize = TILE / PAGE;
 const CHUNK: usize = 64;
 const CHUNKS: usize = PAGE / CHUNK;
+
+const RESTORE_FREE: usize = 0;
+const RESTORE_REQUESTED: usize = 1;
+const RESTORE_RUNNING: usize = 2;
+const RESTORE_DONE: usize = 3;
+const RESTORE_SLOTS: usize = 16;
+
+struct RestoreSlot {
+    state: AtomicUsize,
+    tile: AtomicUsize,
+    restored: AtomicUsize,
+    done: usize,
+}
+
+unsafe impl Send for RestoreSlot {}
+unsafe impl Sync for RestoreSlot {}
+
+struct RestoreWorker {
+    wake: usize,
+    slots: Vec<RestoreSlot>,
+}
+
+unsafe impl Send for RestoreWorker {}
+unsafe impl Sync for RestoreWorker {}
+
+static RESTORES: OnceLock<RestoreWorker> = OnceLock::new();
+static CPU_PARK_BITS: OnceLock<Box<[AtomicU64]>> = OnceLock::new();
+
+fn restore_handle(raw: usize) -> HANDLE {
+    HANDLE(raw as *mut c_void)
+}
+
+unsafe extern "system" fn restore_fault(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+    const CONTINUE_EXECUTION: i32 = -1;
+    const CONTINUE_SEARCH: i32 = 0;
+    if info.is_null() || (*info).ExceptionRecord.is_null() {
+        return CONTINUE_SEARCH;
+    }
+    let record = &*(*info).ExceptionRecord;
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as i32 || record.NumberParameters < 2 {
+        return CONTINUE_SEARCH;
+    }
+    let tile = record.ExceptionInformation[1] & !(TILE - 1);
+    if !cpu_tile_is_parked(tile) {
+        return CONTINUE_SEARCH;
+    }
+    let Some(worker) = RESTORES.get() else { return CONTINUE_SEARCH };
+    let Some(slot) = worker.slots.iter().find(|slot| {
+        slot.state.compare_exchange(RESTORE_FREE, RESTORE_REQUESTED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }) else { return CONTINUE_SEARCH };
+    slot.tile.store(tile, Ordering::Release);
+    slot.restored.store(0, Ordering::Relaxed);
+    // Publish the tile after claiming the slot; the worker accepts only REQUESTED slots after wake.
+    slot.state.store(RESTORE_REQUESTED, Ordering::Release);
+    let _ = windows::Win32::System::Threading::SetEvent(restore_handle(worker.wake));
+    let wait = windows::Win32::System::Threading::WaitForSingleObject(restore_handle(slot.done), 10_000);
+    let completed = wait == windows::Win32::Foundation::WAIT_OBJECT_0;
+    let restored = completed && slot.restored.load(Ordering::Acquire) != 0;
+    if completed {
+        slot.state.store(RESTORE_FREE, Ordering::Release);
+    }
+    if restored { CONTINUE_EXECUTION } else { CONTINUE_SEARCH }
+}
+
+fn cpu_tile_is_parked(tile: usize) -> bool {
+    let Some((word, bit)) = cpu_park_bit(tile) else { return false };
+    CPU_PARK_BITS.get().is_some_and(|bits| bits[word].load(Ordering::Acquire) & bit != 0)
+}
+
+fn cpu_park_bit(tile: usize) -> Option<(usize, u64)> {
+    let uma = crate::gpu::uma::get()?;
+    for window in 0..uma.shader_windows() {
+        let (base, size) = uma.window(window);
+        if tile >= base && tile < base + size {
+            let index = window * (crate::gpu::uma::WINDOW / TILE) + (tile - base) / TILE;
+            return Some((index / 64, 1u64 << (index % 64)));
+        }
+    }
+    None
+}
+
+fn publish_cpu_parked(tile: usize, parked: bool) {
+    let Some((word, bit)) = cpu_park_bit(tile) else { return };
+    let Some(bits) = CPU_PARK_BITS.get() else { return };
+    if parked {
+        bits[word].fetch_or(bit, Ordering::Release);
+    } else {
+        bits[word].fetch_and(!bit, Ordering::Release);
+    }
+}
+
+fn install_restore_worker() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| unsafe {
+        let Some(uma) = crate::gpu::uma::get() else { return };
+        let tiles = uma.shader_windows() * (crate::gpu::uma::WINDOW / TILE);
+        let bits = (0..tiles.div_ceil(64)).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice();
+        let _ = CPU_PARK_BITS.set(bits);
+        let Ok(wake) = windows::Win32::System::Threading::CreateEventW(None, false, false, None) else { return };
+        let mut slots = Vec::with_capacity(RESTORE_SLOTS);
+        for _ in 0..RESTORE_SLOTS {
+            let Ok(done) = windows::Win32::System::Threading::CreateEventW(None, false, false, None) else { return };
+            slots.push(RestoreSlot {
+                state: AtomicUsize::new(RESTORE_FREE),
+                tile: AtomicUsize::new(0),
+                restored: AtomicUsize::new(0),
+                done: done.0 as usize,
+            });
+        }
+        if RESTORES.set(RestoreWorker { wake: wake.0 as usize, slots }).is_err() {
+            return;
+        }
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(restore_fault));
+        let wake_raw = wake.0 as usize;
+        let _ = std::thread::Builder::new().name("xcl-sparse-restore".into()).spawn(move || loop {
+            windows::Win32::System::Threading::WaitForSingleObject(restore_handle(wake_raw), u32::MAX);
+            let Some(worker) = RESTORES.get() else { return };
+            for slot in &worker.slots {
+                if slot.state.compare_exchange(RESTORE_REQUESTED, RESTORE_RUNNING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    continue;
+                }
+                let restored = restore_cpu_tile(slot.tile.load(Ordering::Acquire));
+                slot.restored.store(restored as usize, Ordering::Release);
+                slot.state.store(RESTORE_DONE, Ordering::Release);
+                let _ = windows::Win32::System::Threading::SetEvent(restore_handle(slot.done));
+            }
+        });
+    });
+}
 
 /// Fast non-cryptographic integer hasher for page/tile lookup maps on the hot submit path.
 #[derive(Default)]
@@ -96,11 +226,21 @@ struct TileEntry {
     not_rw: u16,
     /// per-4 KiB-page hashes of the 64-byte chunks last sent to the GPU (`None` = all zero)
     sent: [Option<Box<[u64; CHUNKS]>>; PAGES_PER_TILE],
+    /// when the last CPU bytes of this tile were accepted by the upload queue
+    cpu_idle_since: Option<std::time::Instant>,
+}
+
+/// One sparse tile copied out of video memory without modifying the CPU view. `committed` is the
+/// CPU-page mask that a parking/restoration caller must recreate; GPU bytes for holes are ignored.
+#[allow(dead_code)]
+struct TileSnapshot {
+    bytes: Box<[u8; TILE]>,
+    committed: u16,
 }
 
 impl TileEntry {
     fn with_holes(pool: (u32, u32), holes: u16) -> Self {
-        Self { pool, holes, not_rw: 0, sent: std::array::from_fn(|_| None) }
+        Self { pool, holes, not_rw: 0, sent: std::array::from_fn(|_| None), cpu_idle_since: None }
     }
 }
 
@@ -1934,6 +2074,10 @@ struct State {
     retired: Vec<(ID3D12Heap, u64, std::time::Instant)>,
     /// tile address → pool tile + uncommitted page hole mask + per-page sent chunk hashes
     mapped: FxHashMap<usize, TileEntry>,
+    /// tile address → CPU pages deliberately decommitted while their authoritative bytes stay
+    /// in the mapped GPU tile. These are not console holes and must be restored before CPU use.
+    #[allow(dead_code)]
+    cpu_parked: FxHashMap<usize, u16>,
     /// pool tiles also used by placed buffers (not freed while they are)
     pinned: FxHashMap<(u32, u32), u32>,
     /// tile address → pool tile of tiles decommitted since the last title submit, still mapped
@@ -1985,6 +2129,9 @@ struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        for &tile in self.cpu_parked.keys() {
+            publish_cpu_parked(tile, false);
+        }
         if !self.event.is_invalid() {
             unsafe {
                 let _ = CloseHandle(self.event);
@@ -2168,6 +2315,7 @@ fn append_hash_updates(at: usize, bytes: &[u8], updates: &mut Vec<HashUpdate>) {
 }
 
 fn publish_hash_updates(mapped: &mut FxHashMap<usize, TileEntry>, updates: &[HashUpdate]) {
+    let now = std::time::Instant::now();
     for update in updates {
         let tile = update.at & !(TILE - 1);
         let Some(entry) = mapped.get_mut(&tile) else { continue };
@@ -2181,6 +2329,7 @@ fn publish_hash_updates(mapped: &mut FxHashMap<usize, TileEntry>, updates: &[Has
             continue;
         }
         entry.sent[index].get_or_insert_with(|| Box::new(ZERO_HASHES))[chunk] = update.hash;
+        entry.cpu_idle_since = Some(now);
     }
 }
 
@@ -2485,6 +2634,9 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
 /// sparse window in `gpu::uma` (empty: no sparse windows).
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
+    if std::env::var_os("XCL_GPU_CPU_PARK").is_some() {
+        install_restore_worker();
+    }
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
     let mut out = Vec::new();
     let mut windows = Vec::new();
@@ -2506,21 +2658,24 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         return out;
     }
     let made = (|| -> windows::core::Result<State> {
-        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        })?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
-            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &alloc, None)?;
             list.Close()?;
             let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
             let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
             slots.push(UploadSlot { alloc, list, fence_val: 0 });
         }
-        let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
+        let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+        let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &rb_alloc, None)?;
         rb_list.Close()?;
         let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
         let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
@@ -2545,6 +2700,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             free: Vec::new(),
             retired: Vec::new(),
             mapped: FxHashMap::default(),
+            cpu_parked: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
             quarantined: VecDeque::new(),
@@ -2610,6 +2766,26 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
 }
 
 impl State {
+    fn forget_cpu_parked_range(&mut self, a: usize, n: usize) {
+        let end = a.saturating_add(n);
+        let mut tile = a & !(TILE - 1);
+        while tile < end {
+            if let Some(mask) = self.cpu_parked.get_mut(&tile) {
+                let first = (a.max(tile) - tile) / PAGE;
+                let last = (end.min(tile + TILE) - 1 - tile) / PAGE;
+                let pages = last - first + 1;
+                let touched = ((((1u32 << pages) - 1) << first) & u16::MAX as u32) as u16;
+                *mask &= !touched;
+                if *mask == 0 {
+                    self.cpu_parked.remove(&tile);
+                    publish_cpu_parked(tile, false);
+                }
+            }
+            let Some(next) = tile.checked_add(TILE) else { break };
+            tile = next;
+        }
+    }
+
     #[inline]
     fn window_index(&self, a: usize) -> Option<usize> {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
@@ -3212,6 +3388,103 @@ impl State {
         }
     }
 
+    /// Copy one mapped 64 KiB tile out of sparse VRAM without landing it in title memory.
+    /// The caller has already ordered `self.queue` after the tile's last GPU writer.
+    #[allow(dead_code)]
+    unsafe fn readback_tile_snapshot(&mut self, tile: usize) -> Option<TileSnapshot> {
+        let tile = tile & !(TILE - 1);
+        let committed = !self.mapped.get(&tile)?.holes;
+        let wi = self.window_index(tile)?;
+        let base = self.windows[wi].0;
+        let (rb, p) = self.readback_buf()?;
+        if !self.wait_for(self.rb_last_fence) || self.rb_alloc.Reset().is_err() || self.rb_list.Reset(&self.rb_alloc, None).is_err() {
+            return None;
+        }
+        self.rb_list.CopyBufferRegion(&rb, 0, &self.windows[wi].1, (tile - base) as u64, TILE as u64);
+        self.rb_list.Close().ok()?;
+        let list = self.rb_list.cast::<ID3D12CommandList>().ok()?;
+        super::title_textures::own_work(|| super::real::native_queue_execute(&self.queue, &list));
+        self.signal();
+        self.rb_last_fence = self.value;
+        if !self.wait_for(self.value) {
+            return None;
+        }
+        let mut bytes = Box::new([0u8; TILE]);
+        std::ptr::copy_nonoverlapping(p, bytes.as_mut_ptr(), TILE);
+        Some(TileSnapshot { bytes, committed })
+    }
+
+    /// Decommit the CPU copy of one tile while leaving its GPU mapping authoritative. The caller
+    /// must have uploaded all CPU writes and ordered every possible GPU reader/writer first.
+    #[allow(dead_code)]
+    unsafe fn park_cpu_tile(&mut self, tile: usize) -> bool {
+        let tile = tile & !(TILE - 1);
+        if self.cpu_parked.contains_key(&tile) {
+            return true;
+        }
+        let Some(entry) = self.mapped.get(&tile) else { return false };
+        let committed = !entry.holes;
+        if committed == 0 {
+            return false;
+        }
+        // Publish ownership before the first destructive decommit. If a later page fails, the
+        // whole original mask remains restorable (committing an already committed page is safe).
+        self.cpu_parked.insert(tile, committed);
+        publish_cpu_parked(tile, true);
+        for page in 0..PAGES_PER_TILE {
+            if committed & (1 << page) != 0
+                && VirtualFree((tile + page * PAGE) as *mut c_void, PAGE, MEM_DECOMMIT) == 0
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Restore a parked CPU tile from its GPU bytes. The parked mask is kept on any failure so a
+    /// later access can retry; successfully restored pages become the new sent-hash baseline.
+    #[allow(dead_code)]
+    unsafe fn restore_cpu_tile(&mut self, tile: usize) -> bool {
+        let tile = tile & !(TILE - 1);
+        let Some(&committed) = self.cpu_parked.get(&tile) else { return false };
+        let Some(snapshot) = self.readback_tile_snapshot(tile) else { return false };
+        if snapshot.committed != committed {
+            return false;
+        }
+        for page in 0..PAGES_PER_TILE {
+            if committed & (1 << page) == 0 {
+                continue;
+            }
+            let at = tile + page * PAGE;
+            if VirtualAlloc(at as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+                return false;
+            }
+            let source = &snapshot.bytes[page * PAGE..(page + 1) * PAGE];
+            std::ptr::copy_nonoverlapping(source.as_ptr(), at as *mut u8, PAGE);
+            let hashes = std::array::from_fn(|chunk| {
+                let start = chunk * CHUNK;
+                chunk_hash(&source[start..start + CHUNK])
+            });
+            self.mapped.get_mut(&tile).unwrap().sent[page] = (hashes != ZERO_HASHES).then(|| Box::new(hashes));
+        }
+        self.cpu_parked.remove(&tile);
+        publish_cpu_parked(tile, false);
+        self.mapped.get_mut(&tile).unwrap().cpu_idle_since = Some(std::time::Instant::now());
+        true
+    }
+
+    /// Park a bounded number of tiles whose CPU bytes have been idle long enough. This opt-in
+    /// policy deliberately leaves mapped GPU tiles and console hole masks unchanged.
+    unsafe fn park_idle_cpu_tiles(&mut self, now: std::time::Instant, age: std::time::Duration, most: usize) -> usize {
+        let candidates: Vec<usize> = self.mapped.iter()
+            .filter(|(tile, entry)| !self.cpu_parked.contains_key(tile)
+                && entry.cpu_idle_since.is_some_and(|since| now.duration_since(since) >= age))
+            .map(|(&tile, _)| tile)
+            .take(most)
+            .collect();
+        candidates.into_iter().filter(|&tile| self.park_cpu_tile(tile)).count()
+    }
+
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
     unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) -> UploadStep {
@@ -3426,6 +3699,35 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
 
+unsafe fn restore_cpu_tile(tile: usize) -> bool {
+    let _upload_lifetime = UPLOAD_STATE_LIFETIME.read().unwrap();
+    let (mut uploads, _timing) = UploadGateTiming::acquire(false);
+    let mut state = lock_state();
+    let restored = state.as_mut().is_some_and(|state| state.restore_cpu_tile(tile));
+    drop(state);
+    drop(uploads.take());
+    restored
+}
+
+/// Restore every parked sparse tile intersecting a range before XCL or a routed kernel call
+/// dereferences it. Faulting title instructions use the same worker-backed primitive.
+pub unsafe fn ensure_cpu(a: usize, n: usize) -> bool {
+    if n == 0 {
+        return true;
+    }
+    let first = a & !(TILE - 1);
+    let end = a.saturating_add(n);
+    let mut tile = first;
+    while tile < end {
+        if cpu_tile_is_parked(tile) && !restore_cpu_tile(tile) {
+            return false;
+        }
+        let Some(next) = tile.checked_add(TILE) else { break };
+        tile = next;
+    }
+    true
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
@@ -3604,6 +3906,7 @@ impl State {
     }
 
     unsafe fn commit_range_with_protection(&mut self, a: usize, n: usize, writable: bool) {
+        self.forget_cpu_parked_range(a, n);
         self.ensure_mapped(a, n, |_| (0xFFFF, 0));
         let mut pg = a & !(PAGE - 1);
         let end = a.saturating_add(n);
@@ -3634,6 +3937,7 @@ impl State {
     /// `decommitted` with the state locked: the tiles that go are parked (`flush_parked` unmaps
     /// them and frees their pool tiles)
     unsafe fn decommit_range(&mut self, a: usize, n: usize) {
+        self.forget_cpu_parked_range(a, n);
         let mut pools: Vec<(usize, (u32, u32))> = Vec::new();
         let mut t = a & !(TILE - 1);
         let end = a.saturating_add(n);
@@ -4485,6 +4789,11 @@ unsafe fn before_execute_locked(
             return PreparationOutcome::RetryRequired;
         }
         super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &fence, value);
+    }
+    if std::env::var_os("XCL_GPU_CPU_PARK").is_some() {
+        if let Some(state) = lock_state().as_mut() {
+            state.park_idle_cpu_tiles(std::time::Instant::now(), std::time::Duration::from_secs(30), 16);
+        }
     }
     note_transfer_metrics(look.as_deref_mut(), metric_runs.as_ref());
     return PreparationOutcome::Ready;
@@ -5923,6 +6232,7 @@ mod tests {
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
                 mapped: FxHashMap::default(),
+                cpu_parked: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 quarantined: VecDeque::new(),
                 queue_fences: FxHashMap::default(),
@@ -6290,6 +6600,7 @@ mod tests {
                 free: Vec::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
+                cpu_parked: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 quarantined: VecDeque::new(),
@@ -6395,6 +6706,7 @@ mod tests {
                 free: Vec::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
+                cpu_parked: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 quarantined: VecDeque::new(),
@@ -6536,6 +6848,7 @@ mod tests {
             free: Vec::new(),
             retired: Vec::new(),
             mapped: FxHashMap::default(),
+            cpu_parked: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
             quarantined: VecDeque::new(),

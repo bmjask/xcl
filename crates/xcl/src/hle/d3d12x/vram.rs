@@ -1585,7 +1585,10 @@ impl Pages {
             crate::xlog_info!("D3D12.X: tiled resources tier {}: GPU-owned textures in arenas", o.TiledResourcesTier.0);
             return None;
         }
-        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        }).ok()?;
         let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");

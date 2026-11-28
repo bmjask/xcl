@@ -79,6 +79,40 @@ pub struct Layout {
     hz: &'static [u32],
 }
 
+/// Packed lookup-table ABI consumed by the GPU detiler. The six table offsets and lengths index
+/// `tables` in ox, oy, oz, hx, hy, hz order; scalar dimensions are kept explicit so HLSL performs
+/// the same block and high-coordinate arithmetic as [`Layout::offset_z`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuLayout {
+    pub block_w: u32,
+    pub block_h: u32,
+    pub block_d: u32,
+    pub block_bytes: u32,
+    pub elem_log2: u32,
+    pub base_xor: u32,
+    pub table_offsets: [u32; 6],
+    pub table_lengths: [u32; 6],
+    pub tables: Vec<u32>,
+}
+
+impl GpuLayout {
+    /// CPU mirror of the shader ABI, used to validate serialized layouts before GPU execution.
+    pub fn offset(&self, x: u32, y: u32, z: u32, pitch: u32) -> u32 {
+        let table = |kind: usize, index: u32| {
+            let len = self.table_lengths[kind];
+            self.tables[(self.table_offsets[kind] + index % len) as usize]
+        };
+        let block = (y / self.block_h) * pitch.div_ceil(self.block_w) + x / self.block_w;
+        let xor = table(0, x % self.block_w)
+            ^ table(1, y % self.block_h)
+            ^ table(2, z % self.block_d)
+            ^ table(3, x / self.block_w)
+            ^ table(4, y / self.block_h)
+            ^ table(5, z / self.block_d);
+        block * self.block_bytes + (xor ^ self.base_xor)
+    }
+}
+
 /// Cached immutable tiling tables keyed by `(is_3d, mode, elem_log2, pipe_cfg)`.
 /// Only valid combinations (bounded by `PATTERNS` / `PATTERNS_3D` + linear mode 0) are inserted.
 static LAYOUT_CACHE: OnceLock<RwLock<HashMap<(bool, u32, u32, PipeConfig), Layout>>> = OnceLock::new();
@@ -100,6 +134,30 @@ fn cached_layout(is_3d: bool, mode: u32, elem_log2: u32, cfg: PipeConfig, build:
 }
 
 impl Layout {
+    /// Serialize this layout's address tables without exposing their process-local leaked slices.
+    pub fn gpu_layout(&self) -> GpuLayout {
+        let source = [self.ox, self.oy, self.oz, self.hx, self.hy, self.hz];
+        let mut tables = Vec::new();
+        let mut table_offsets = [0u32; 6];
+        let mut table_lengths = [0u32; 6];
+        for (i, table) in source.into_iter().enumerate() {
+            table_offsets[i] = tables.len() as u32;
+            table_lengths[i] = table.len() as u32;
+            tables.extend_from_slice(table);
+        }
+        GpuLayout {
+            block_w: self.block_w as u32,
+            block_h: self.block_h as u32,
+            block_d: self.block_d as u32,
+            block_bytes: self.block_bytes as u32,
+            elem_log2: self.elem_log2,
+            base_xor: self.base_xor as u32,
+            table_offsets,
+            table_lengths,
+            tables,
+        }
+    }
+
     /// A 2D surface (or one slice of an array). `None` for unknown / reserved modes and
     /// elements over 16 B. Linear (0): rows padded to 256 bytes (addrlib
     /// Gfx10Lib::HwlComputeSurfaceInfoLinear), a "block" of 256 B, one row high.
@@ -682,6 +740,23 @@ pub fn image_chain(t: &super::desc::Image, cfg: PipeConfig) -> Option<Chain> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_layout_abi_matches_cpu_offsets() {
+        let cfg = PipeConfig { pipes_log2: 2, pkrs_log2: 1 };
+        for (is_3d, mode, elem) in [(false, 0, 2), (false, 9, 2), (false, 25, 0), (true, 5, 2), (true, 25, 3)] {
+            let layout = if is_3d { Layout::new_3d(mode, elem, cfg) } else { Layout::new(mode, elem, cfg) }.unwrap();
+            let gpu = layout.gpu_layout();
+            let pitch = layout.block_w * 3 - 1;
+            for z in 0..layout.block_d * 2 {
+                for y in [0, 1, layout.block_h - 1, layout.block_h, layout.block_h + 3] {
+                    for x in [0, 1, layout.block_w - 1, layout.block_w, layout.block_w + 5] {
+                        assert_eq!(gpu.offset(x as u32, y as u32, z as u32, pitch as u32) as usize, layout.offset_z(x, y, z, pitch));
+                    }
+                }
+            }
+        }
+    }
 
     const MODES: [u32; 14] = [1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27];
 
