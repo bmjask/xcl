@@ -47,8 +47,30 @@ struct Pending {
     on_use: Mutex<Option<OnUse>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipelineKind {
+    Unknown,
+    Graphics,
+    /// Compute submitted while console-shaped command-list playback owns pipeline binding.
+    ConsoleListCompute,
+    Compute,
+}
+
+impl PipelineKind {
+    fn submitted(compute: bool, console_lists: bool) -> Self {
+        match (compute, console_lists) {
+            (false, _) => Self::Graphics,
+            (true, true) => Self::ConsoleListCompute,
+            (true, false) => Self::Compute,
+        }
+    }
+}
+
 /// A pipeline build independent of the title-visible stand-ins that requested it.
 struct Build {
+    /// Authoritative pipeline kind supplied by its creation path. Never infer this from the
+    /// optional compute coalescing key: not every compute build has one.
+    kind: PipelineKind,
     compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>,
     /// Immutable inputs for rebuilding this pipeline after its first job has been consumed.
     #[allow(dead_code)] // retained for the later opt-in eviction/rebuild stage
@@ -302,17 +324,31 @@ fn run_build(build: &Arc<Build>, job: Job) {
 }
 
 impl Build {
+    fn is_evictable(&self) -> bool { self.kind == PipelineKind::Compute }
+
     fn new(job: Job, sent: bool) -> Self {
-        Self::new_keyed(job, sent, None, None)
+        Self::new_keyed_kind(job, sent, None, None, PipelineKind::Unknown)
     }
 
+    #[cfg(test)]
     fn new_keyed(
         job: Job,
         sent: bool,
         compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>,
         recipe: Option<Recipe>,
     ) -> Self {
+        Self::new_keyed_kind(job, sent, compute_key, recipe, PipelineKind::Unknown)
+    }
+
+    fn new_keyed_kind(
+        job: Job,
+        sent: bool,
+        compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>,
+        recipe: Option<Recipe>,
+        kind: PipelineKind,
+    ) -> Self {
         Self {
+            kind,
             compute_key,
             recipe,
             job: Mutex::new(Some(job)),
@@ -718,7 +754,12 @@ enum HeldRequeue { Requeued, Held(HeldEvictionCandidate), Expired }
 
 impl HeldEvictionCandidate {
     fn try_requeue_on<const N: usize>(self, candidates: &CandidateQueue<Build, N>) -> HeldRequeue {
-        if self.build.upgrade().is_none() { return HeldRequeue::Expired }
+        let Some(build) = self.build.upgrade() else { return HeldRequeue::Expired };
+        if !build.is_evictable() {
+            build.candidate_queued.store(false, Ordering::Release);
+            return HeldRequeue::Expired;
+        }
+        drop(build);
         match candidates.push(self.build.clone()) {
             Ok(()) => HeldRequeue::Requeued,
             Err(_) => HeldRequeue::Held(self),
@@ -730,6 +771,10 @@ impl HeldEvictionCandidate {
 /// the existing `XCL_PSO_REBUILD_RECIPES` gate selected generation-aware resolution; ordinary
 /// binds pay no candidate check, queue operation, registry scan, or allocation.
 fn note_eviction_candidate_on<const N: usize>(build: &Arc<Build>, frame: u64, candidates: &CandidateQueue<Build, N>) {
+    if !build.is_evictable() {
+        build.last_use_frame.fetch_max(frame, Ordering::Relaxed);
+        return;
+    }
     let _writer = build.eviction_timestamp_writer();
     build.last_use_frame.fetch_max(frame, Ordering::Relaxed);
     if build.candidate_queued.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -745,6 +790,9 @@ fn note_eviction_candidate(build: &Arc<Build>) {
 }
 
 fn resident_candidate(build: &Arc<Build>) -> Option<EvictionCandidate> {
+    if !build.is_evictable() {
+        return None;
+    }
     let done = build.done.lock().unwrap();
     if !*done || build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
         return None;
@@ -1488,6 +1536,11 @@ impl PressureObserver {
                 observation.discarded += 1;
                 continue;
             };
+            if !build.is_evictable() {
+                build.candidate_queued.store(false, Ordering::Release);
+                observation.discarded += 1;
+                continue;
+            }
             match resident_candidate(&build) {
                 Some(candidate) => drained.push(candidate),
                 None => nonactionable.push(HeldEvictionCandidate { build: weak }),
@@ -1930,6 +1983,9 @@ struct ExactEvictionSnapshot {
 }
 
 fn exact_eviction_snapshot(build: &Build) -> Result<ExactEvictionSnapshot, EvictionPreflight> {
+    if !build.is_evictable() {
+        return Err(EvictionPreflight::Changed);
+    }
     let done = build.done.lock().unwrap();
     if !*done {
         return Err(EvictionPreflight::Busy);
@@ -2008,6 +2064,9 @@ fn prepare_exact_eviction_on<'a, const E: usize, const R: usize>(
     build: &Arc<Build>, frame: u64, limits: EvictionSelectionLimits,
     coordinator: &'a RestorationCoordinator<E, R>,
 ) -> Result<PreparedExactEviction<'a, E, R>, EvictionPreflight> {
+    if !build.is_evictable() {
+        return Err(EvictionPreflight::Changed);
+    }
     let admission = coordinator.admission.lock().unwrap();
     if build.eviction_token().is_some() {
         return Err(EvictionPreflight::Busy);
@@ -2050,6 +2109,7 @@ impl<const E: usize, const R: usize> PreparedExactEviction<'_, E, R> {
         let build = self.installed.build.clone();
         let timestamp_claim = build.claim_eviction_timestamps();
         let done = build.done.lock().unwrap();
+        if !build.is_evictable() { return Err(EvictionPreflight::Changed) }
         if !*done { return Err(EvictionPreflight::Busy) }
         if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
             return Err(EvictionPreflight::Released);
@@ -3655,6 +3715,7 @@ fn submit_as(
     compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
 ) {
     debug_assert!(compute || compute_key.is_none());
+    let kind = PipelineKind::submitted(compute, super::console_list::enabled());
     let build = if let Some(compute_key) = compute_key {
         let mut removed = None;
         let mut retired_build = None;
@@ -3662,6 +3723,10 @@ fn submit_as(
             let mut shard = IN_FLIGHT.shard(&compute_key).lock().unwrap();
             let builds = shard.get_or_insert_with(HashMap::new);
             let active = builds.get(&compute_key).and_then(Weak::upgrade).and_then(|build| {
+                if build.kind != kind {
+                    retired_build = Some(build);
+                    return None;
+                }
                 let done = build.done.lock().unwrap();
                 let active = !*done && !build.orphan.load(Ordering::Acquire);
                 if active {
@@ -3686,7 +3751,9 @@ fn submit_as(
                     COALESCING.finished(1);
                 }
                 let compute_key = Arc::new(compute_key);
-                let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone()), recipe));
+                let build = Arc::new(Build::new_keyed_kind(
+                    job, false, Some(compute_key.clone()), recipe, kind,
+                ));
                 builds.insert(compute_key, Arc::downgrade(&build));
                 COALESCING.unique();
                 build
@@ -3696,7 +3763,9 @@ fn submit_as(
         drop(retired_build);
         build
     } else {
-        Arc::new(Build::new_keyed(job, false, None, recipe))
+        Arc::new(Build::new_keyed_kind(
+            job, false, None, recipe, kind,
+        ))
     };
     let p = Arc::new(Pending {
         build: build.clone(),
@@ -3994,13 +4063,17 @@ mod used_tests {
         LedgerNativeGeneration { id, identity: id as usize + 0x1000 }
     }
 
-    fn completed_recipe_build(recipe: &Recipe) -> Arc<Build> {
-        let build = Arc::new(Build::new_keyed(
-            recipe.initial_job(), false, None, Some(recipe.clone()),
+    fn completed_recipe_build_as(recipe: &Recipe, kind: PipelineKind) -> Arc<Build> {
+        let build = Arc::new(Build::new_keyed_kind(
+            recipe.initial_job(), false, None, Some(recipe.clone()), kind,
         ));
         let job = build.job.lock().unwrap().take().unwrap();
         complete(&build, job());
         build
+    }
+
+    fn completed_recipe_build(recipe: &Recipe) -> Arc<Build> {
+        completed_recipe_build_as(recipe, PipelineKind::Compute)
     }
 
     fn selected_candidate(build: &Arc<Build>) -> SelectedEvictionCandidate {
@@ -5226,7 +5299,9 @@ mod used_tests {
             build_calls.fetch_add(1, Ordering::Relaxed);
             build_next.load(Ordering::Acquire)
         });
-        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let build = Arc::new(Build::new_keyed_kind(
+            recipe.initial_job(), false, None, Some(recipe.clone()), PipelineKind::Compute,
+        ));
         let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
         let coordinator = pipeline_restoration_coordinator();
         build.candidate_queued.store(true, Ordering::Release);
@@ -5630,8 +5705,8 @@ mod used_tests {
         for value in &mut native {
             let raw = value as *mut RebuildFakePso as usize;
             let recipe = Recipe::new(move || raw);
-            let build = Arc::new(Build::new_keyed(
-                recipe.initial_job(), false, None, Some(recipe.clone()),
+            let build = Arc::new(Build::new_keyed_kind(
+                recipe.initial_job(), false, None, Some(recipe.clone()), PipelineKind::Compute,
             ));
             let job = build.job.lock().unwrap().take().unwrap();
             complete(&build, job());
@@ -5976,8 +6051,8 @@ mod used_tests {
         let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let raw = &mut native as *mut RebuildFakePso as usize;
         let recipe = Recipe::new(move || raw);
-        let build = Arc::new(Build::new_keyed(
-            recipe.initial_job(), false, None, Some(recipe.clone()),
+        let build = Arc::new(Build::new_keyed_kind(
+            recipe.initial_job(), false, None, Some(recipe.clone()), PipelineKind::Compute,
         ));
         let job = build.job.lock().unwrap().take().unwrap();
         complete(&build, job());
@@ -6016,7 +6091,10 @@ mod used_tests {
         let dead = Arc::new(Build::new(Box::new(|| 0), false));
         assert!(queue.push(Arc::downgrade(&dead)).is_ok());
         drop(dead);
-        let nonresident = Arc::new(Build::new(Box::new(|| 0), false)); nonresident.candidate_queued.store(true, Ordering::Release);
+        let nonresident = Arc::new(Build::new_keyed_kind(
+            Box::new(|| 0), false, None, None, PipelineKind::Compute,
+        ));
+        nonresident.candidate_queued.store(true, Ordering::Release);
         assert!(queue.push(Arc::downgrade(&nonresident)).is_ok());
         let config = PressureAdmissionConfig {
             enabled: true, max_evictions_per_turn: 2, ..PressureAdmissionConfig::default()
@@ -6037,9 +6115,39 @@ mod used_tests {
     }
 
     #[test]
+    fn pressure_observer_discards_an_injected_ineligible_record_once() {
+        let queue = CandidateQueue::<Build, 2>::new();
+        let injected = Arc::new(Build::new_keyed_kind(
+            Box::new(|| 0), false, None, None, PipelineKind::ConsoleListCompute,
+        ));
+        injected.candidate_queued.store(true, Ordering::Release);
+        assert!(queue.push(Arc::downgrade(&injected)).is_ok());
+        let config = PressureAdmissionConfig {
+            enabled: true, max_evictions_per_turn: 1, ..PressureAdmissionConfig::default()
+        };
+        let mut observer = PressureObserver::new(config, EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        }).unwrap();
+
+        assert_eq!(observer.observe_on(&queue, 1, 1, Some(pressure_sample(1, 100))), PressureObservation {
+            mode: PressureMode::Evicting,
+            scanned: 1,
+            discarded: 1,
+            ..Default::default()
+        });
+        assert!(!injected.candidate_queued.load(Ordering::Acquire));
+        assert!(queue.pop().is_none());
+        assert!(observer.held.is_empty());
+        assert_eq!(observer.observe_on(&queue, 2, 1, Some(pressure_sample(2, 100))).scanned, 0,
+            "the observer requeued an ineligible identity");
+    }
+
+    #[test]
     fn rejected_pressure_turns_do_not_replenish_observer_work() {
         let queue = CandidateQueue::<Build, 2>::new();
-        let nonresident = Arc::new(Build::new(Box::new(|| 0), false));
+        let nonresident = Arc::new(Build::new_keyed_kind(
+            Box::new(|| 0), false, None, None, PipelineKind::Compute,
+        ));
         nonresident.candidate_queued.store(true, Ordering::Release);
         assert!(queue.push(Arc::downgrade(&nonresident)).is_ok());
         let config = PressureAdmissionConfig {
@@ -6068,7 +6176,9 @@ mod used_tests {
     #[test]
     fn pressure_observer_work_replenishes_once_across_turn_wrap() {
         let queue = CandidateQueue::<Build, 2>::new();
-        let nonresident = Arc::new(Build::new(Box::new(|| 0), false));
+        let nonresident = Arc::new(Build::new_keyed_kind(
+            Box::new(|| 0), false, None, None, PipelineKind::Compute,
+        ));
         nonresident.candidate_queued.store(true, Ordering::Release);
         assert!(queue.push(Arc::downgrade(&nonresident)).is_ok());
         let config = PressureAdmissionConfig {
@@ -6104,6 +6214,98 @@ mod used_tests {
     }
 
     #[test]
+    fn only_non_console_compute_builds_enter_the_eviction_journal() {
+        assert_eq!(PipelineKind::submitted(false, false), PipelineKind::Graphics);
+        assert_eq!(PipelineKind::submitted(false, true), PipelineKind::Graphics);
+        assert_eq!(PipelineKind::submitted(true, true), PipelineKind::ConsoleListCompute);
+        assert_eq!(PipelineKind::submitted(true, false), PipelineKind::Compute);
+
+        let queue = CandidateQueue::<Build, 4>::new();
+        for kind in [PipelineKind::Unknown, PipelineKind::Graphics, PipelineKind::ConsoleListCompute] {
+            let build = Arc::new(Build::new_keyed_kind(Box::new(|| 0), false, None, None, kind));
+            build.last_use_frame.store(0, Ordering::Relaxed);
+            note_eviction_candidate_on(&build, 17, &queue);
+            assert_eq!(build.last_use_frame.load(Ordering::Relaxed), 17,
+                "{kind:?} lost retention-age tracking");
+            assert!(!build.candidate_queued.load(Ordering::Acquire), "{kind:?} entered the journal");
+        }
+        assert!(queue.pop().is_none());
+
+        let compute = Arc::new(Build::new_keyed_kind(
+            Box::new(|| 0), false, None, None, PipelineKind::Compute,
+        ));
+        note_eviction_candidate_on(&compute, 17, &queue);
+        assert!(compute.candidate_queued.load(Ordering::Acquire));
+        assert!(queue.pop().unwrap().upgrade().is_some());
+        compute.candidate_queued.store(false, Ordering::Release);
+
+        let injected = Arc::new(Build::new_keyed_kind(
+            Box::new(|| 0), false, None, None, PipelineKind::Graphics,
+        ));
+        injected.candidate_queued.store(true, Ordering::Release);
+        assert!(queue.push(Arc::downgrade(&injected)).is_ok());
+        assert!(drain_eviction_candidates_on(&queue, 1).is_empty());
+        assert!(!injected.candidate_queued.load(Ordering::Acquire),
+            "draining an injected ineligible record left its dedup bit stuck");
+    }
+
+    #[test]
+    fn injected_console_compute_cannot_prepare_or_commit_exact_eviction() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = completed_recipe_build_as(&recipe, PipelineKind::ConsoleListCompute);
+        let candidate = || EvictionCandidate {
+            build: build.clone(),
+            last_use_frame: build.last_use_frame.load(Ordering::Relaxed),
+            completed_frame: build.completed_frame.load(Ordering::Relaxed),
+            clear_queued_on_drop: true,
+        };
+        let selected = SelectedEvictionCandidate {
+            candidate: candidate(), unused_frames: 100, resident_frames: 100,
+        };
+        let coordinator = RestorationCoordinator::<2, 2>::new(1).unwrap();
+        let limits = EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        };
+        let hook_ran = AtomicBool::new(false);
+        assert_eq!(preflight_exact_eviction_on(&selected, 1, limits, &coordinator,
+            || hook_ran.store(true, Ordering::Release)), EvictionPreflight::Changed);
+        assert!(!hook_ran.load(Ordering::Acquire));
+        assert!(build.eviction_token().is_none());
+        assert!(coordinator.evicted.records(2).is_empty());
+        assert_eq!((build.real.load(Ordering::Acquire), native.refs.load(Ordering::Relaxed)), (raw, 2));
+
+        // Forge the state after preparation to exercise the final independent kind gate. The
+        // installed token must unwind without detaching either native owner.
+        let generation = recipe.pin_with_residency(raw).0.unwrap();
+        let admission = coordinator.admission.lock().unwrap();
+        let installed = coordinator.install_eviction(&build, generation.ledger_identity()).unwrap();
+        let prepared = PreparedExactEviction {
+            installed,
+            _admission: admission,
+            first: ExactEvictionSnapshot {
+                generation,
+                last_use_frame: build.last_use_frame.load(Ordering::Relaxed),
+                completed_frame: build.completed_frame.load(Ordering::Relaxed),
+            },
+            frame: 1,
+            limits,
+        };
+        assert!(matches!(prepared.commit_exact(|| panic!("ineligible final hook ran")),
+            Err(EvictionPreflight::Changed)));
+        assert!(build.eviction_token().is_none());
+        assert!(coordinator.evicted.records(2).is_empty());
+        assert_eq!((build.real.load(Ordering::Acquire), native.refs.load(Ordering::Relaxed)), (raw, 2));
+
+        drop(selected);
+        release(build.real.swap(0, Ordering::AcqRel));
+        drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn eviction_candidate_ring_is_bounded_reusable_and_does_not_retain_builds() {
         assert!(std::panic::catch_unwind(CandidateQueue::<usize, 0>::new).is_err());
         assert!(std::panic::catch_unwind(CandidateQueue::<usize, 1>::new).is_err());
@@ -6121,7 +6323,9 @@ mod used_tests {
         assert!(queue.pop().is_none());
 
         let builds = CandidateQueue::<Build, 2>::new();
-        let build = Arc::new(Build::new(Box::new(|| 0), false));
+        let build = Arc::new(Build::new_keyed_kind(
+            Box::new(|| 0), false, None, None, PipelineKind::Compute,
+        ));
         let weak = Arc::downgrade(&build);
         note_eviction_candidate_on(&build, 7, &builds);
         drop(build);
@@ -6188,11 +6392,11 @@ mod used_tests {
         let second_raw = &mut second as *mut RebuildFakePso as usize;
         let first_recipe = Recipe::new(move || first_raw);
         let second_recipe = Recipe::new(move || second_raw);
-        let first_build = Arc::new(Build::new_keyed(
-            first_recipe.initial_job(), false, None, Some(first_recipe.clone()),
+        let first_build = Arc::new(Build::new_keyed_kind(
+            first_recipe.initial_job(), false, None, Some(first_recipe.clone()), PipelineKind::Compute,
         ));
-        let second_build = Arc::new(Build::new_keyed(
-            second_recipe.initial_job(), false, None, Some(second_recipe.clone()),
+        let second_build = Arc::new(Build::new_keyed_kind(
+            second_recipe.initial_job(), false, None, Some(second_recipe.clone()), PipelineKind::Compute,
         ));
         let first_job = first_build.job.lock().unwrap().take().unwrap();
         let second_job = second_build.job.lock().unwrap().take().unwrap();
