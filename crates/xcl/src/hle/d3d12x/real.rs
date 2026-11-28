@@ -4982,23 +4982,41 @@ pub(crate) mod driver_cache {
         /// process's newer replacement.
         pub fn invalidate(self) -> bool {
             use windows_sys::Win32::Storage::FileSystem::{
-                FileDispositionInfoEx, SetFileInformationByHandle,
-                FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-                FILE_DISPOSITION_INFO_EX,
+                FileStandardInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+                FILE_STANDARD_INFO,
             };
             let Some(file) = self.file else { return false };
             let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-            let ex = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
             let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            if set_disposition_with(|class, info, size| unsafe {
+                SetFileInformationByHandle(handle, class, info, size) != 0
+            }) {
+                return true;
+            }
+            let mut info = FILE_STANDARD_INFO::default();
             unsafe {
-                SetFileInformationByHandle(
-                    handle,
-                    FileDispositionInfoEx,
-                    (&ex as *const FILE_DISPOSITION_INFO_EX).cast(),
-                    std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
-                ) != 0
+                GetFileInformationByHandleEx(
+                    handle, FileStandardInfo, (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                ) != 0 && info.DeletePending
             }
         }
+    }
+
+    /// Prefer immediate POSIX unlinking, but filesystems which do not implement the extended
+    /// disposition class can still mark this exact open file object for deletion on close.
+    fn set_disposition_with(mut set: impl FnMut(i32, *const std::ffi::c_void, u32) -> bool) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, FileDispositionInfoEx,
+            FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+            FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+        };
+        let ex = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+        if set(FileDispositionInfoEx, (&ex as *const FILE_DISPOSITION_INFO_EX).cast(), std::mem::size_of_val(&ex) as u32) {
+            return true;
+        }
+        let basic = FILE_DISPOSITION_INFO { DeleteFile: true };
+        set(FileDispositionInfo, (&basic as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of_val(&basic) as u32)
     }
 
     pub fn load(p: &Path) -> Option<LoadedBlob> {
@@ -5348,6 +5366,17 @@ pub(crate) mod driver_cache {
         fn a_blob_without_delete_access_fails_closed() {
             let loaded = LoadedBlob { bytes: Arc::new(vec![1]), file: None };
             assert!(!loaded.invalidate());
+        }
+
+        #[test]
+        fn unsupported_posix_disposition_falls_back_to_exact_handle_deletion() {
+            use windows_sys::Win32::Storage::FileSystem::{FileDispositionInfo, FileDispositionInfoEx};
+            let mut classes = Vec::new();
+            assert!(set_disposition_with(|class, _, _| {
+                classes.push(class);
+                class == FileDispositionInfo
+            }));
+            assert_eq!(classes, [FileDispositionInfoEx, FileDispositionInfo]);
         }
 
         #[test]
