@@ -2605,6 +2605,14 @@ pub(super) fn poison_native_generations<'a>(pins: impl Iterator<Item = &'a Nativ
     drop(retired);
 }
 
+#[cfg(test)]
+pub(super) fn sweep_native_generations_for_test() {
+    let mut retiring = RETIRING_GENERATIONS.lock().unwrap();
+    let retired = retiring.sweep(super::alloc_pool::SubmissionReceipt::is_complete);
+    drop(retiring);
+    drop(retired);
+}
+
 /// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
 /// same operation; retaining it does not by itself schedule or run more work. Its existing opt-in
 /// allocation also owns the native generation; one-shot builds instead allocate an owner lazily
@@ -7261,6 +7269,15 @@ pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResol
 }
 
 impl PipelineResolution {
+    /// Exact completed generation safe to pass as a native Reset initial pipeline. An unfinished
+    /// or unavailable retained identity returns None instead of consulting its reusable address.
+    pub(super) fn ready_for_reset(&self) -> Option<(usize, NativeGeneration)> {
+        match &self.0 {
+            StructuredResolve::Ready { raw, pin: Some(generation), .. } => Some((*raw, generation.clone())),
+            _ => None,
+        }
+    }
+
     /// Resolve this bind's retained identity for correctness-critical emission. No branch looks
     /// up `original` in the registry: an address reused since the bind cannot redirect the wait.
     /// Restoration states remain fail-closed until a later stage activates their coordinator.
