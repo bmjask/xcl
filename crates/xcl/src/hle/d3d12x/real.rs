@@ -3376,6 +3376,7 @@ macro_rules! as_usize {
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     let _detail = crate::stall::detail_span_if(!super::title_textures::is_own_work(), crate::stall::StallKind::DetailListLifecycle);
+    let poisoned = super::list_x::recording_poisoned(this as usize);
     super::list_x::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot!(this, "Close")));
@@ -3385,7 +3386,20 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
         let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
     }
-    hr
+    if poisoned {
+        crate::xlog_warn!("D3D12.X: command list {this:p} poisoned by an unavailable pipeline bind");
+        crate::util::E_FAIL
+    } else {
+        hr
+    }
+}
+
+#[cfg(test)]
+pub(super) unsafe fn close_for_test(list: *mut c_void) -> HRESULT { cl_close(list) }
+
+#[cfg(test)]
+pub(super) fn submission_rejected_for_test(lists: &[*mut c_void]) -> bool {
+    super::list_x::any_recording_poisoned(lists)
 }
 
 /// Reset (PC path): re-adopt the runtime's new open-state vtable if Reset replaced it.
@@ -9341,12 +9355,6 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     }
 }
 
-/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
-/// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
-pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
-    cl_set_pipeline_state(this, pso)
-}
-
 /// Bind an already-selected exact native generation without sending its raw pointer back through
 /// the title-address resolver. Used by direct Dispatch after its retained bind is consumed.
 pub(super) unsafe fn bind_pipeline_exact(this: *mut c_void, original: usize, raw: usize) {
@@ -9356,13 +9364,19 @@ pub(super) unsafe fn bind_pipeline_exact(this: *mut c_void, original: usize, raw
     super::dred::mark_pipeline(this, original, raw);
 }
 
-unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+/// Clear native pipeline state with an already-selected raw pointer. `raw == 0` is the
+/// API-specific fail-closed action for an unavailable retained identity.
+pub(super) unsafe fn clear_pipeline_exact(this: *mut c_void, original: usize, raw: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "SetPipelineState")));
-    let bound = super::list_x::resolve_and_record_pipeline_lazy(this as usize, pso as usize);
-    f(this, bound as *mut c_void);
-    super::dred::mark_pipeline(this, pso as usize, bound);
-    super::list_x::on_set_pipeline_state(this, pso as usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ClearState")));
+    f(this, raw as *mut c_void);
+    if original != 0 && raw != 0 {
+        super::dred::mark_pipeline(this, original, raw);
+    }
+}
+
+unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+    super::bind::set_pipeline_state(this, pso)
 }
 
 unsafe extern "system" fn cl_execute_bundle(this: *mut c_void, bundle: *mut c_void) {
@@ -9381,15 +9395,7 @@ unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: 
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
-    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ClearState")));
-    let bound = super::list_x::resolve_and_record_pipeline(this as usize, pso as usize);
-    f(this, bound as *mut c_void);
-    if !pso.is_null() {
-        super::dred::mark_pipeline(this, pso as usize, bound);
-    }
-    super::list_x::on_clear_state(this, pso as usize);
-    super::bind::clear_state(this, pso as usize);
+    super::bind::clear_pipeline_state(this, pso as usize)
 }
 
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
@@ -9764,12 +9770,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
     let mut preparation_stall = crate::stall::span(crate::stall::StallKind::SubmitPreparation);
-    // textures in title memory the CPU wrote since: uploaded again first
-    prepare_title_submission(this);
+    let title_lists = std::slice::from_raw_parts(lists, n as usize);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
-    for &l in std::slice::from_raw_parts(lists, n as usize) {
+    for &l in title_lists {
         if let Some(pc) = super::console_list::pc_list(l) {
             mapped.push(pc);
         } else {
@@ -9782,6 +9787,12 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             }
         }
     }
+    if super::list_x::any_recording_poisoned(&mapped) {
+        crate::xlog_warn!("D3D12.X: ExecuteCommandLists rejected a poisoned physical recording");
+        return;
+    }
+    // textures in title memory the CPU wrote since: uploaded again first
+    prepare_title_submission(this);
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     let plan = super::list_x::submission_plan(&mapped);
     drop(preparation_stall);
