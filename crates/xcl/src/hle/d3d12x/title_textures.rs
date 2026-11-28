@@ -1070,35 +1070,60 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+    let measure_selection = look.is_some();
+    let (todo, selection_measurement): (Vec<(ID3D12Resource, Upload)>, _) = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
+        let wait_started = measure_selection.then(std::time::Instant::now);
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if !e.cpu_backed {
-                    return false;
-                }
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
+        let locked_at = wait_started.map(|_| std::time::Instant::now());
+        let (mut visited, mut dirty_tests, mut matches, mut retained) = (0usize, 0usize, 0usize, 0usize);
+        let mut todo = Vec::new();
+        for (&res, e) in &mut t.by_res {
+            if measure_selection {
+                visited += 1;
+            }
+            if !e.cpu_backed {
+                continue;
+            }
+            let selected = if e.pending {
+                true
+            } else if e.gpu_written {
+                false
+            } else {
+                if measure_selection {
+                    dirty_tests += 1;
                 }
                 let i = dirty.partition_point(|&p| p + page as usize <= e.src);
                 dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
+            };
+            if !selected {
+                continue;
+            }
+            if measure_selection {
+                matches += 1;
+            }
+            if e.pending {
+                e.pending = false;
+                PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+            let p = res as *mut c_void;
+            if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
+                todo.push((r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), e.generation)));
+                if measure_selection {
+                    retained += 1;
                 }
-                let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p)
-                    .map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), e.generation)))
-            })
-            .collect()
+            }
+        }
+        drop(t);
+        let finished_at = locked_at.map(|_| std::time::Instant::now());
+        let measurement = wait_started.zip(locked_at).zip(finished_at).map(|((started, locked), finished)| {
+            (locked.duration_since(started), finished.duration_since(locked), visited, dirty_tests, matches, retained)
+        });
+        (todo, measurement)
     });
+    if let (Some(sample), Some((wait, hold, visited, dirty_tests, matches, retained))) = (look.as_deref_mut(), selection_measurement) {
+        super::sparse::note_texture_selection(sample, wait, hold, visited, dirty_tests, matches, retained);
+    }
     seed_stream_recheck(&todo, &ranges.ranges, recheck_frame);
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
     super::sparse::PreparationOutcome::Ready
