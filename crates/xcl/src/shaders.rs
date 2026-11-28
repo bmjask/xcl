@@ -1698,7 +1698,8 @@ impl Pipelines {
             }
             driver_cache::path_for(dxil, desc.Flags.0, chained)
         });
-        let mut cached = path.as_deref().and_then(driver_cache::load);
+        let mut loaded = path.as_deref().and_then(driver_cache::load);
+        let mut cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
         let receipt = self.warm_blobs.as_ref().zip(layout).zip(path.as_deref());
         if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
             if !pipeline_library::building() && book.contains(&warm_blobs::stamp(path, layout, blob)) {
@@ -1726,7 +1727,8 @@ impl Pipelines {
         }
         // (another process may have written the blob while this one waited for its turn)
         if cached.is_none() {
-            cached = path.as_deref().and_then(driver_cache::load);
+            loaded = path.as_deref().and_then(driver_cache::load);
+            cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
         }
         // not in the cache: the one process that claims the pipeline builds it. Records with the
         // same program are in several workers' slices, and the driver's compile of one took
@@ -1756,10 +1758,12 @@ impl Pipelines {
         });
         // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
         // size cap and start the expensive uncached driver compile.
-        if cached.is_some() && from_cache.is_none() && over_cap {
-            if let Some(path) = path.as_deref() {
-                let _ = std::fs::remove_file(path);
+        if cached.is_some() && from_cache.is_none() {
+            if let Some(loaded) = loaded.take() {
+                let _ = loaded.invalidate();
             }
+        }
+        if cached.is_some() && from_cache.is_none() && over_cap {
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
