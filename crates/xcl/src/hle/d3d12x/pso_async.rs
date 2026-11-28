@@ -939,8 +939,9 @@ struct PressureAdmission {
     config: PressureAdmissionConfig,
     mode: PressureMode,
     last_observed_turn: Option<u64>,
+    accepted_policy_turn: Option<u64>,
     eviction_budget_turn: Option<u64>,
-    evictions_issued: usize,
+    evictions_succeeded: usize,
     retry_rehydrate_at: Option<u64>,
     next_rehydrate_backoff: u64,
 }
@@ -968,8 +969,9 @@ impl PressureAdmission {
                 config,
                 mode: PressureMode::Idle,
                 last_observed_turn: None,
+                accepted_policy_turn: None,
                 eviction_budget_turn: None,
-                evictions_issued: 0,
+                evictions_succeeded: 0,
                 retry_rehydrate_at: None,
             })
     }
@@ -983,10 +985,14 @@ impl PressureAdmission {
             || pressure_turn_after(sample.observed_turn, now)
             || now.wrapping_sub(sample.observed_turn) > self.config.max_sample_age_turns
             || self.last_observed_turn.is_some_and(|last| !pressure_turn_after(sample.observed_turn, last))
+            || self.accepted_policy_turn.is_some_and(|last| {
+                now != last && !pressure_turn_after(now, last)
+            })
         {
             return PressureDecision::default();
         }
         self.last_observed_turn = Some(sample.observed_turn);
+        self.accepted_policy_turn = Some(now);
         let usage = u128::from(sample.segment.usage) * 10_000;
         let budget = u128::from(sample.segment.budget);
         if usage >= budget * u128::from(self.config.high_basis_points) {
@@ -1001,10 +1007,9 @@ impl PressureAdmission {
             PressureMode::Evicting => {
                 if self.eviction_budget_turn != Some(now) {
                     self.eviction_budget_turn = Some(now);
-                    self.evictions_issued = 0;
+                    self.evictions_succeeded = 0;
                 }
-                let max_evictions = self.config.max_evictions_per_turn.saturating_sub(self.evictions_issued);
-                self.evictions_issued += max_evictions;
+                let max_evictions = self.config.max_evictions_per_turn.saturating_sub(self.evictions_succeeded);
                 PressureDecision { max_evictions, allow_rehydrate: false }
             }
             PressureMode::Rehydrating => PressureDecision {
@@ -1014,6 +1019,17 @@ impl PressureAdmission {
                 }),
             },
         }
+    }
+
+    /// Charge only native pipelines which the exact transaction actually detached. Scans and
+    /// failed attempts have their own observer budgets and must not consume this allowance.
+    fn note_evictions(&mut self, now: u64, succeeded: usize) {
+        if self.mode != PressureMode::Evicting || self.eviction_budget_turn != Some(now) {
+            return;
+        }
+        self.evictions_succeeded = self.evictions_succeeded
+            .saturating_add(succeeded)
+            .min(self.config.max_evictions_per_turn);
     }
 
     fn note_rehydrate_result(&mut self, now: u64, succeeded: bool) {
@@ -1329,6 +1345,8 @@ struct PressureObservation {
     deferred: usize,
     discarded: usize,
     requeue_saturated: usize,
+    attempted: usize,
+    evicted: usize,
     prepared: usize,
     recent: usize,
     changed: usize,
@@ -1339,6 +1357,7 @@ struct PressureObservation {
 
 impl PressureObservation {
     fn note_preflight(&mut self, result: EvictionPreflight) {
+        self.attempted += 1;
         match result {
             EvictionPreflight::Prepared => self.prepared += 1,
             EvictionPreflight::Recent => self.recent += 1,
@@ -1349,11 +1368,20 @@ impl PressureObservation {
         }
     }
 
+    fn attempt_outcomes(self) -> usize {
+        self.evicted + self.prepared + self.recent + self.changed + self.busy
+            + self.released + self.ledger_full
+    }
+
+    fn attempts_accounted(self) -> bool { self.attempted == self.attempt_outcomes() }
+
     fn line(self) -> String {
+        debug_assert!(self.attempts_accounted());
         format!(
-            "pipeline pressure observation: {:?}; {} scanned, {} eligible, {} deferred, {} discarded, {} requeue saturated; preflight {} prepared, {} recent, {} changed, {} busy, {} released, {} ledger full",
+            "pipeline pressure observation: {:?}; {} scanned, {} eligible, {} deferred, {} discarded, {} requeue saturated; {} attempted, {} evicted; preflight {} prepared, {} recent, {} changed, {} busy, {} released, {} ledger full",
             self.mode, self.scanned, self.eligible, self.deferred, self.discarded, self.requeue_saturated,
-            self.prepared, self.recent, self.changed, self.busy, self.released, self.ledger_full,
+            self.attempted, self.evicted, self.prepared, self.recent, self.changed, self.busy,
+            self.released, self.ledger_full,
         )
     }
 }
@@ -1365,12 +1393,16 @@ struct PressureObserver {
     admission: PressureAdmission,
     limits: EvictionSelectionLimits,
     held: Vec<HeldEvictionCandidate>,
+    work_budget_turn: Option<u64>,
+    scans_issued: usize,
+    attempts_issued: usize,
 }
 
 impl PressureObserver {
     fn new(config: PressureAdmissionConfig, limits: EvictionSelectionLimits) -> Option<Self> {
         PressureAdmission::new(config).map(|admission| Self {
             admission, held: Vec::with_capacity(limits.max_scan), limits,
+            work_budget_turn: None, scans_issued: 0, attempts_issued: 0,
         })
     }
 
@@ -1422,6 +1454,11 @@ impl PressureObserver {
     ) -> PressureObservation {
         let decision = self.admission.decide(turn, sample);
         let mut observation = PressureObservation { mode: self.admission.mode, ..Default::default() };
+        if self.admission.accepted_policy_turn == Some(turn) && self.work_budget_turn != Some(turn) {
+            self.work_budget_turn = Some(turn);
+            self.scans_issued = 0;
+            self.attempts_issued = 0;
+        }
 
         // Conserve exact weak identities until this one-scan backlog returns to the journal.
         let pending = std::mem::replace(&mut self.held, Vec::with_capacity(self.limits.max_scan));
@@ -1437,8 +1474,8 @@ impl PressureObserver {
             return observation;
         }
         let limits = EvictionSelectionLimits {
-            max_scan: self.limits.max_scan.min(decision.max_evictions),
-            max_select: self.limits.max_select.min(decision.max_evictions),
+            max_scan: self.limits.max_scan.saturating_sub(self.scans_issued),
+            max_select: self.limits.max_select.saturating_sub(self.attempts_issued),
             ..self.limits
         };
         let mut drained = Vec::new();
@@ -1446,6 +1483,7 @@ impl PressureObserver {
         for _ in 0..limits.max_scan {
             let Some(weak) = candidates.pop() else { break };
             observation.scanned += 1;
+            self.scans_issued += 1;
             let Some(build) = weak.upgrade() else {
                 observation.discarded += 1;
                 continue;
@@ -1463,6 +1501,7 @@ impl PressureObserver {
         for selected in selected {
             if let Some(result) = preflight(&selected) {
                 observation.note_preflight(result);
+                self.attempts_issued += 1;
             }
             actionable.push(selected.candidate);
         }
@@ -1480,6 +1519,7 @@ impl PressureObserver {
             }
         }
         observation.requeue_saturated = self.held.len();
+        debug_assert!(observation.attempts_accounted());
         observation
     }
 }
@@ -4048,13 +4088,34 @@ mod used_tests {
     }
 
     #[test]
-    fn pressure_admission_shares_one_eviction_budget_within_a_turn() {
+    fn pressure_admission_charges_only_successful_evictions_within_a_turn() {
         let mut state = PressureAdmission::new(pressure_config()).unwrap();
         assert_eq!(state.decide(10, Some(pressure_sample(9, 95))).max_evictions, 3);
-        assert_eq!(state.decide(10, Some(pressure_sample(10, 95))).max_evictions, 0,
-            "a second fresh sample replenished the same policy turn");
+        state.note_evictions(10, 0);
+        assert_eq!(state.evictions_succeeded, 0, "a failed attempt spent the success allowance");
+        state.note_evictions(10, 1);
+        assert_eq!(state.decide(10, Some(pressure_sample(10, 95))).max_evictions, 2);
+        state.note_evictions(10, 2);
+        assert_eq!(state.evictions_succeeded, 3,
+            "successful evictions did not exhaust the same-turn allowance");
+        state.note_evictions(9, 3);
+        assert_eq!(state.evictions_succeeded, 3,
+            "an out-of-turn result changed the current allowance");
         assert_eq!(state.decide(11, Some(pressure_sample(11, 95))).max_evictions, 3,
             "a new policy turn did not replenish its bounded allowance");
+    }
+
+    #[test]
+    fn pressure_attempt_telemetry_accounts_shadow_and_eviction_outcomes_separately() {
+        let mut shadow = PressureObservation::default();
+        shadow.note_preflight(EvictionPreflight::Prepared);
+        shadow.note_preflight(EvictionPreflight::Busy);
+        assert_eq!((shadow.attempted, shadow.prepared, shadow.evicted), (2, 1, 0));
+        assert!(shadow.attempts_accounted());
+
+        let detached = PressureObservation { attempted: 2, evicted: 1, recent: 1, ..Default::default() };
+        assert!(detached.attempts_accounted());
+        assert!(!PressureObservation { attempted: 2, evicted: 1, ..Default::default() }.attempts_accounted());
     }
 
     #[test]
@@ -5586,7 +5647,7 @@ mod used_tests {
         let config = PressureAdmissionConfig {
             enabled: true,
             max_sample_age_turns: 1,
-            max_evictions_per_turn: 2,
+            max_evictions_per_turn: 1,
             ..PressureAdmissionConfig::default()
         };
         let limits = EvictionSelectionLimits {
@@ -5616,17 +5677,21 @@ mod used_tests {
             segment: super::super::memory_report::Segment { usage: 95, budget: 100 },
         };
         let observed = observer.observe_exact_on(&queue, 10, 100, Some(high), &coordinator);
-        assert_eq!(positions(), (before.0 + 2, before.1 + 2), "an observed candidate was not requeued exactly once");
+        assert_eq!(positions(), (before.0 + 3, before.1 + 3), "an observed candidate was not requeued exactly once");
         assert_eq!(observed, PressureObservation {
             mode: PressureMode::Evicting,
-            scanned: 2,
-            eligible: 1,
+            scanned: 3,
+            eligible: 2,
             deferred: 1,
             discarded: 0,
             requeue_saturated: 0,
-            prepared: 1,
+            attempted: 2,
+            prepared: 2,
             ..Default::default()
         });
+        assert!(observed.attempts_accounted());
+        assert_eq!((observer.scans_issued, observer.attempts_issued, observer.admission.evictions_succeeded),
+            (3, 2, 0), "scan, attempt, and success accounting were not independent");
         assert!(builds.iter().all(|build| build.real.load(Ordering::Acquire) != 0));
         assert!(builds.iter().all(|build| build.candidate_queued.load(Ordering::Acquire)));
         assert!(builds.iter().all(|build| build.eviction_token().is_none()));
@@ -5638,7 +5703,7 @@ mod used_tests {
         };
         assert_eq!(observer.observe_on(&queue, 10, 100, Some(same_turn)), PressureObservation {
             mode: PressureMode::Evicting, ..Default::default()
-        }, "a second sample replenished the same observation turn");
+        }, "a second sample replenished the same-turn scan or attempt allowance");
 
         // Deterministically model producers consuming every freed slot between drain and requeue.
         // The observer must retain exact candidates instead of clearing their queued identity.
@@ -5654,9 +5719,9 @@ mod used_tests {
         });
         assert_eq!(saturated, PressureObservation {
             mode: PressureMode::Evicting,
-            scanned: 2,
+            scanned: 3,
             eligible: 2,
-            deferred: 0,
+            deferred: 1,
             discarded: 0,
             requeue_saturated: 2,
             ..Default::default()
@@ -5969,6 +6034,62 @@ mod used_tests {
             ..Default::default()
         });
         assert!(queue.pop().unwrap().upgrade().is_some());
+    }
+
+    #[test]
+    fn rejected_pressure_turns_do_not_replenish_observer_work() {
+        let queue = CandidateQueue::<Build, 2>::new();
+        let nonresident = Arc::new(Build::new(Box::new(|| 0), false));
+        nonresident.candidate_queued.store(true, Ordering::Release);
+        assert!(queue.push(Arc::downgrade(&nonresident)).is_ok());
+        let config = PressureAdmissionConfig {
+            enabled: true, max_sample_age_turns: 2, max_evictions_per_turn: 1,
+            ..PressureAdmissionConfig::default()
+        };
+        let mut observer = PressureObserver::new(config, EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        }).unwrap();
+
+        assert_eq!(observer.observe_on(&queue, 10, 1, Some(pressure_sample(8, 100))).scanned, 1);
+        let positions = (queue.enqueue.load(Ordering::Relaxed), queue.dequeue.load(Ordering::Relaxed));
+        assert_eq!(observer.observe_on(&queue, 9, 1, Some(pressure_sample(9, 100))).scanned, 0,
+            "a backward policy turn with a forward sample replenished scan work");
+        assert_eq!(observer.observe_on(&queue, 11, 1, None).scanned, 0,
+            "a missing sample replenished scan work");
+        assert_eq!(observer.observe_on(&queue, 10, 1, Some(pressure_sample(10, 100))).scanned, 0,
+            "a later valid sample replenished an already-consumed policy turn");
+        assert_eq!((queue.enqueue.load(Ordering::Relaxed), queue.dequeue.load(Ordering::Relaxed)), positions);
+        assert_eq!((observer.work_budget_turn, observer.scans_issued), (Some(10), 1));
+
+        assert!(queue.pop().unwrap().upgrade().is_some());
+        nonresident.candidate_queued.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn pressure_observer_work_replenishes_once_across_turn_wrap() {
+        let queue = CandidateQueue::<Build, 2>::new();
+        let nonresident = Arc::new(Build::new(Box::new(|| 0), false));
+        nonresident.candidate_queued.store(true, Ordering::Release);
+        assert!(queue.push(Arc::downgrade(&nonresident)).is_ok());
+        let config = PressureAdmissionConfig {
+            enabled: true, max_evictions_per_turn: 1, ..PressureAdmissionConfig::default()
+        };
+        let mut observer = PressureObserver::new(config, EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        }).unwrap();
+
+        assert_eq!(observer.observe_on(&queue, u64::MAX, 1,
+            Some(pressure_sample(u64::MAX, 100))).scanned, 1);
+        assert_eq!(observer.observe_on(&queue, 0, 1, Some(pressure_sample(0, 100))).scanned, 1,
+            "the serial turn wrap did not replenish work");
+        let positions = (queue.enqueue.load(Ordering::Relaxed), queue.dequeue.load(Ordering::Relaxed));
+        assert_eq!(observer.observe_on(&queue, 0, 1, Some(pressure_sample(0, 100))).scanned, 0,
+            "the wrapped turn replenished work more than once");
+        assert_eq!((queue.enqueue.load(Ordering::Relaxed), queue.dequeue.load(Ordering::Relaxed)), positions);
+        assert_eq!((observer.work_budget_turn, observer.scans_issued), (Some(0), 1));
+
+        assert!(queue.pop().unwrap().upgrade().is_some());
+        nonresident.candidate_queued.store(false, Ordering::Release);
     }
 
     #[test]
