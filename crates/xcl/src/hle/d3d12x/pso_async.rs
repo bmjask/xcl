@@ -659,6 +659,21 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     results
 }
 
+/// Run one demanded auxiliary pipeline build on the foreground worker queue and wait for it.
+/// Unlike `build_pieces`, the caller never drains or executes the job itself.
+pub(super) fn build_foreground(job: Job) -> usize {
+    let build = Arc::new(Build::new(job, false));
+    build.want();
+    schedule(&build, Priority::Foreground, false, None);
+    let _held = Held::new();
+    let _stall = crate::stall::span(crate::stall::StallKind::PipelineWait);
+    let mut done = build.done.lock().unwrap();
+    while !*done {
+        done = build.cv.wait(done).unwrap();
+    }
+    build.real.load(Ordering::Acquire)
+}
+
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
 pub fn release(p: usize) {
     if p != 0 {
@@ -955,6 +970,15 @@ mod used_tests {
         used::note(set);
         assert!(used::shader_noted(vs) && used::shader_noted(ps), "the shaders of the used set");
         assert!(!used::shader_noted(cs), "the other set was not used");
+    }
+
+    #[test]
+    fn demanded_auxiliary_build_runs_on_a_worker() {
+        let caller = std::thread::current().id();
+        assert_eq!(build_foreground(Box::new(move || {
+            assert_ne!(std::thread::current().id(), caller);
+            0x7E57_C0DE
+        })), 0x7E57_C0DE);
     }
 
     #[test]
