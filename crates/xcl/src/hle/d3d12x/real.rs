@@ -4407,12 +4407,20 @@ static PSO_DISPATCH_REMAP: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::ne
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     let pso = super::pso_async::resolve(pso);
+    pso_user_sgprs_exact(pso)
+}
+
+pub(super) fn pso_user_sgprs_exact(pso: usize) -> Option<u32> {
     PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).map(|e| e.0)
 }
 
 /// The console's group shape (`numthreads`) of a translated compute pipeline (None: not known).
 pub fn pso_threads(pso: usize) -> Option<[u32; 3]> {
     let pso = super::pso_async::resolve(pso);
+    pso_threads_exact(pso)
+}
+
+pub(super) fn pso_threads_exact(pso: usize) -> Option<[u32; 3]> {
     PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).map(|e| e.1)
 }
 
@@ -4422,8 +4430,21 @@ pub(crate) fn register_threads_for_test(pso: usize, threads: [u32; 3]) {
     PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, (0, threads));
 }
 
+#[cfg(test)]
+pub(super) fn register_compute_metadata_for_test(
+    pso: usize, user_sgprs: u32, threads: [u32; 3], remap: (u32, u32), root: usize,
+) {
+    PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, (user_sgprs, threads));
+    PSO_DISPATCH_REMAP.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, remap);
+    PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, root);
+}
+
 pub fn pso_dispatch_remap(pso: usize) -> Option<(u32, u32)> {
     let pso = super::pso_async::resolve(pso);
+    pso_dispatch_remap_exact(pso)
+}
+
+pub(super) fn pso_dispatch_remap_exact(pso: usize) -> Option<(u32, u32)> {
     PSO_DISPATCH_REMAP.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
@@ -4443,6 +4464,10 @@ fn note_pso_dispatch_remap(pso: *mut c_void, remap: Option<(u32, u32)>) {
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
+    pso_root_signature_exact(pso)
+}
+
+pub(super) fn pso_root_signature_exact(pso: usize) -> Option<usize> {
     PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
@@ -5129,8 +5154,13 @@ pub(super) mod remap_fallback {
         }
     }
 
+    #[allow(dead_code)] // title-address counterpart to whole_exact
     pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<ID3D12PipelineState, String> {
         let pso = super::super::pso_async::resolve(pso);
+        whole_exact(pso)
+    }
+
+    pub(in crate::hle::d3d12x) unsafe fn whole_exact(pso: usize) -> Result<ID3D12PipelineState, String> {
         let fb = FALLBACKS.lock().unwrap().get(&pso).cloned().ok_or("no remap fallback")?;
         fb.whole.get_or_build(std::time::Instant::now(), || {
             let status = Arc::new(std::sync::atomic::AtomicI32::new(E_INVALIDARG));
@@ -7525,6 +7555,10 @@ static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mut
 /// The compute pass of a pipeline state XCL built from console MS / GS code.
 pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
     let pso = super::pso_async::resolve(pso);
+    two_pass_of_exact(pso)
+}
+
+pub(super) fn two_pass_of_exact(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
     TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
