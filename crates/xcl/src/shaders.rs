@@ -1403,6 +1403,58 @@ impl Claim {
     }
 }
 
+struct RunningPermit<'a> {
+    state: &'a (Mutex<usize>, std::sync::Condvar),
+}
+
+impl<'a> RunningPermit<'a> {
+    fn enter(state: &'a (Mutex<usize>, std::sync::Condvar), most: usize) -> Self {
+        let mut running = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        while *running >= most {
+            running = state.1.wait(running).unwrap_or_else(|e| e.into_inner());
+        }
+        *running += 1;
+        Self { state }
+    }
+}
+
+impl Drop for RunningPermit<'_> {
+    fn drop(&mut self) {
+        let mut running = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        *running = running.saturating_sub(1);
+        self.state.1.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod running_permit_tests {
+    use super::RunningPermit;
+    use std::sync::{mpsc, Condvar, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn unwind_releases_the_slot_and_wakes_a_waiter() {
+        let state = (Mutex::new(0usize), Condvar::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _permit = RunningPermit::enter(&state, 1);
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    let _waiting = RunningPermit::enter(&state, 1);
+                    acquired_tx.send(()).unwrap();
+                });
+                started_rx.recv().unwrap();
+                panic!("simulated driver panic");
+            }));
+            assert!(panicked.is_err());
+            acquired_rx.recv_timeout(Duration::from_secs(1)).expect("waiter stayed blocked after unwind");
+        });
+        assert_eq!(*state.0.lock().unwrap_or_else(|e| e.into_inner()), 0);
+    }
+}
+
 #[cfg(test)]
 mod pipeline_claim_tests {
     use super::{claim_path_for, Claim, ClaimAcquire};
@@ -1885,10 +1937,11 @@ impl Pipelines {
         let _claim = match path.as_deref() {
             Some(path) => match Claim::acquire(path) {
                 ClaimAcquire::Acquired(claim) => Some(claim),
+                ClaimAcquire::HeldElsewhere if required => None,
                 ClaimAcquire::HeldElsewhere => {
                     self.elsewhere.fetch_add(1, Ordering::Relaxed);
                     drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-                    return;
+                    return Err("Another process is preparing this compute pipeline".into());
                 }
                 ClaimAcquire::Unavailable(e) => {
                     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1908,39 +1961,15 @@ impl Pipelines {
                 self.capped.fetch_add(1, Ordering::Relaxed);
                 self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
                 drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-                return;
+                return Err(format!("Compute DXIL exceeds the native pipeline size limit ({} bytes)", dxil.len()));
             }
         }
-        {
-            let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
-            }
-            *n += 1;
-        }
+        let _permit = RunningPermit::enter(&self.running, self.most);
         // (another process may have written the blob while this one waited for its turn)
         if cached.is_none() {
             loaded = path.as_deref().and_then(driver_cache::load);
             cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
         }
-        // not in the cache: the one process that claims the pipeline builds it. Records with the
-        // same program are in several workers' slices, and the driver's compile of one took
-        // twice as long in each of four workers that built it at once.
-        let claim = match (&cached, path.as_deref()) {
-            (None, Some(path)) => match Claim::take(path) {
-                Some(c) => Some(c),
-                // A mandatory job needs a native result even if another process owns the cache write.
-                None if required => None,
-                None => {
-                    *self.running.0.lock().unwrap() -= 1;
-                    self.running.1.notify_one();
-                    self.elsewhere.fetch_add(1, Ordering::Relaxed);
-                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-                    return Err("Another process is preparing this compute pipeline".into());
-                }
-            },
-            _ => None,
-        };
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
@@ -1957,8 +1986,6 @@ impl Pipelines {
             }
         }
         if cached.is_some() && from_cache.is_none() && over_cap {
-            *self.running.0.lock().unwrap() -= 1;
-            self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1973,7 +2000,7 @@ impl Pipelines {
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            if let (Some(path), Ok(pso)) = (path.as_deref().filter(|_| claim.is_some() || cached.is_some()), &pso) {
+            if let (Some(path), Ok(pso)) = (path.as_deref().filter(|_| _claim.is_some() || cached.is_some()), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
                     let len = unsafe { blob.GetBufferSize() };
@@ -1988,12 +2015,9 @@ impl Pipelines {
             pso
         };
         let library = match &r {
-            Ok(pso) => pipeline_library::store(driver_cache::name_for(dxil, desc.Flags.0, chained), pso),
+            Ok(pso) => pipeline_library::store(driver_cache::name_for_root(dxil, desc.Flags.0, chained, samplers), pso),
             Err(_) => Ok(()),
         };
-        drop(claim);
-        *self.running.0.lock().unwrap() -= 1;
-        self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match &r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
