@@ -9412,9 +9412,9 @@ impl PipelineResolution {
     #[allow(dead_code)] // consumed by the ExecuteIndirect integration stage
     pub(super) fn is_compute(&self) -> bool { self.1 }
 
-    /// Only immutable eviction-eligible compute may omit an unavailable SetPipelineState: every
-    /// translated emission consumes its retained resolution and fails closed.
-    pub(super) fn can_omit_unavailable_set(&self) -> bool {
+    /// Whether every later consumer is retained-resolution emission and therefore fails closed
+    /// when this identity is unavailable. Other pipeline kinds must poison a successful recording.
+    pub(super) fn unavailable_is_emission_guarded(&self) -> bool {
         matches!(self.2, UnavailableSet::Omit)
     }
 
