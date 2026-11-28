@@ -3568,6 +3568,12 @@ mod used_tests {
 
     thread_local! { static RESTORE_REENTER_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
+    static PIPELINE_RESTORATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn pipeline_restoration_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        PIPELINE_RESTORATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     unsafe extern "system" fn rebuild_reenter_release(this: *mut std::ffi::c_void) -> u32 {
         let remaining = rebuild_fake_release(this);
         if remaining == 0 {
@@ -4441,7 +4447,7 @@ mod used_tests {
         let pending = structured_pending(build.clone(), false);
         assert!(PENDING.insert(original, pending.clone()).is_none());
         let resolution = begin_pipeline_resolution(original).expect("unfinished pipeline");
-        assert!(resolution.initial_build_pending());
+        assert!(resolution.submit_demand_pending());
 
         let job = build.job.lock().unwrap().take().unwrap();
         complete(&build, job());
@@ -4450,7 +4456,7 @@ mod used_tests {
         let PipelineChoice::Available { generation: second, .. } = resolution.resolve_for_emission()
             else { panic!("promoted initial pipeline was unavailable") };
         assert!(first.same(&second));
-        assert!(!resolution.initial_build_pending());
+        assert!(!resolution.submit_demand_pending());
         let (reset_raw, reset) = resolution.ready_for_reset().expect("promoted reset generation");
         assert_eq!(reset_raw, raw);
         assert!(first.same(&reset));
@@ -4484,7 +4490,7 @@ mod used_tests {
         let resolution = PipelineResolution(StructuredResolve::initial(0x7E57_D01B, pending, 0x7E57_D01B, true));
         let done = build.done.lock().unwrap();
         let (tx, rx) = mpsc::channel();
-        let thread = std::thread::spawn(move || tx.send(resolution.initial_build_pending()).unwrap());
+        let thread = std::thread::spawn(move || tx.send(resolution.submit_demand_pending()).unwrap());
         assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("completion probe took the done lock"));
         drop(done);
         thread.join().unwrap();
@@ -4722,6 +4728,7 @@ mod used_tests {
 
     #[test]
     fn bind_snapshot_defers_evicted_pipeline_without_requesting_restoration() {
+        let _global = pipeline_restoration_test_guard();
         let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
         let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let raw = &mut native as *mut RebuildFakePso as usize;
@@ -4746,7 +4753,7 @@ mod used_tests {
         let resolution = begin_pipeline_resolution(original).expect("registered evicted pipeline");
         assert!(matches!(&resolution.0, StructuredResolve::Deferred { pending: retained, .. }
             if Arc::ptr_eq(retained, &pending)));
-        assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Unavailable));
+        assert!(resolution.submit_demand_pending());
         assert_eq!(calls.load(Ordering::Relaxed), 1, "bind snapshot ran the rebuild recipe");
         assert!(build.queued.lock().unwrap().is_none(), "bind snapshot queued build work");
         assert!(coordinator.receipts.records(1).is_empty(), "bind snapshot reserved a receipt");
@@ -4758,6 +4765,106 @@ mod used_tests {
         assert!(coordinator.evicted.retire(&evicted));
         drop(resolution); drop(pending); drop(build); drop(recipe);
         assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retained_submit_demand_restores_one_exact_generation_after_address_reuse() {
+        let _global = pipeline_restoration_test_guard();
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_next = next.clone(); let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            build_next.load(Ordering::Acquire)
+        });
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let coordinator = pipeline_restoration_coordinator();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin); assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+        let original = 0x7E57_D019usize;
+        let pending = structured_pending(build.clone(), true);
+        PENDING.insert(original, pending.clone());
+        let resolution = begin_pipeline_resolution(original).unwrap();
+        assert!(resolution.submit_demand_pending());
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "classification ran the rebuild recipe");
+
+        let replacement_pending = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), false);
+        assert!(Arc::ptr_eq(&PENDING.insert(original, replacement_pending.clone()).unwrap(), &pending));
+        let clones = [resolution.clone(), resolution.clone()];
+        let demanded = std::thread::scope(|scope| {
+            let first = scope.spawn(|| clones[0].need_by_submit());
+            let second = scope.spawn(|| clones[1].need_by_submit());
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(demanded.into_iter().filter(|demanded| *demanded).count(), 1,
+            "concurrent clones did not install exactly one submit demand");
+        assert!(!resolution.submit_demand_pending(), "concurrent demand did not publish its ticket");
+        let PipelineChoice::Available { raw, generation } = resolution.resolve_for_emission()
+            else { panic!("exact restoration was unavailable") };
+        assert_eq!((raw, generation.id(), calls.load(Ordering::Relaxed)), (replacement_raw, 2, 2));
+        assert!(build.eviction_token().is_none(), "terminal restoration was not reconciled");
+        assert!(coordinator.evicted.state(&evicted).is_none(), "exact eviction record was not retired");
+
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement_pending));
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(generation); drop(clones); drop(resolution); drop(replacement_pending);
+        drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn retained_failed_demand_observes_another_binds_successful_retry() {
+        let _global = pipeline_restoration_test_guard();
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(raw)); let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let pin = recipe.pin_with_residency(raw).0.unwrap();
+        let coordinator = pipeline_restoration_coordinator();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin); assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(0, Ordering::Release);
+        let pending = structured_pending(build.clone(), true);
+        let resolution = PipelineResolution(classify_retained(0x7E57_D020, &pending));
+
+        assert!(resolution.need_by_submit());
+        assert!(matches!(resolution.resolve_for_emission(), PipelineChoice::Unavailable));
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted),
+            "failed restoration was not returned to retryable eviction state");
+        assert!(coordinator.receipts.records(1).is_empty(), "terminal failure receipt was not reconciled");
+        assert!(build.eviction_token().is_some_and(|token| token.exact(&evicted)),
+            "retryable failure lost its exact eviction identity");
+
+        next.store(replacement_raw, Ordering::Release);
+        let retry = PipelineResolution(classify_retained(0x7E57_D021, &pending));
+        assert!(retry.need_by_submit());
+        let PipelineChoice::Available { raw: retry_raw, generation: retry_generation } = retry.resolve_for_emission()
+            else { panic!("second bind did not restore the exact recipe") };
+        assert_eq!(retry_raw, replacement_raw);
+        let PipelineChoice::Available { raw: first_raw, generation: first_generation } = resolution.resolve_for_emission()
+            else { panic!("failed demand did not observe the resident retry") };
+        assert_eq!(first_raw, replacement_raw);
+        assert!(first_generation.same(&retry_generation));
+        assert!(build.eviction_token().is_none(), "successful retry was not reconciled");
+        assert!(coordinator.evicted.state(&evicted).is_none(), "successful retry left the exact eviction record");
+
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(first_generation); drop(retry_generation); drop(retry); drop(resolution);
+        drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!((native.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
     }
 
     #[test]
@@ -7798,6 +7905,7 @@ enum StructuredResolve<const R: usize> {
         original: usize,
         pending: Arc<Pending>,
         fallback: usize,
+        restoration: Arc<RestorationDemand<R>>,
     },
     Restoring {
         original: usize,
@@ -7813,21 +7921,89 @@ enum StructuredResolve<const R: usize> {
     },
 }
 
-#[allow(dead_code)] // activated with the later restoration-request stage
 const PIPELINE_RESTORATION_EVICTIONS: usize = 1024;
 const PIPELINE_RESOLUTION_RECEIPTS: usize = 1024;
-#[allow(dead_code)] // activated with the later restoration-request stage
 type PipelineRestorationCoordinator =
     RestorationCoordinator<PIPELINE_RESTORATION_EVICTIONS, PIPELINE_RESOLUTION_RECEIPTS>;
 
-/// One dormant coordinator identity for a later restoration-request stage. Merely obtaining it
-/// neither starts workers nor enables eviction.
-#[allow(dead_code)] // activated with the later restoration-request stage
+/// Exact restoration identity shared by every clone of one retained bind. Classification only
+/// captures the already-installed eviction token; submit/emission demand owns worker startup and
+/// the single request publication.
+struct RestorationDemand<const R: usize> {
+    evicted: EvictedBuildToken,
+    demanded: AtomicBool,
+    requested: OnceLock<DeferredDemand<R>>,
+}
+
+#[derive(Clone)]
+enum DeferredDemand<const R: usize> {
+    Ready(NativeGeneration),
+    Restoring(RestorationTicket<R>),
+    Failed(StructuredResolveFailure),
+}
+
+impl<const R: usize> RestorationDemand<R> {
+    fn new(evicted: EvictedBuildToken) -> Self {
+        Self { evicted, demanded: AtomicBool::new(false), requested: OnceLock::new() }
+    }
+}
+
+impl<const R: usize> Drop for RestorationDemand<R> {
+    fn drop(&mut self) {
+        // Bind-state replacements are dropped outside their list locks. This bounded sweep retires
+        // an already-terminal abandoned attempt; an in-flight one is swept before the next request.
+        reconcile_pipeline_restorations();
+    }
+}
+
+impl RestorationDemand<PIPELINE_RESOLUTION_RECEIPTS> {
+    fn resident(pending: &Pending) -> Option<NativeGeneration> {
+        let recipe = pending.build.recipe.as_ref()?;
+        let raw = pending.build.real.load(Ordering::Acquire);
+        let (pin, residency) = recipe.pin_with_residency(raw);
+        pin.filter(|_| matches!(residency, Residency::Resident | Residency::Rebuilding))
+    }
+
+    fn request(&self, pending: &Pending) -> DeferredDemand<PIPELINE_RESOLUTION_RECEIPTS> {
+        self.demanded.store(true, Ordering::Release);
+        if let Some(pin) = Self::resident(pending) {
+            return DeferredDemand::Ready(pin);
+        }
+        let requested = self.requested.get_or_init(|| {
+            if let Some(pin) = Self::resident(pending) {
+                return DeferredDemand::Ready(pin);
+            }
+            // Retire terminal attempts left by abandoned lists before consuming another bounded
+            // slot. A failed ticket is terminal for this retained bind; a later bind gets a new
+            // demand cell and may retry the still-exact eviction token.
+            reconcile_pipeline_restorations();
+            let requested = pipeline_restoration_coordinator().request_foreground(&self.evicted);
+            // Publication/reconciliation can cross the exact-token snapshot and request. Prefer
+            // the retained build's newly owned resident generation over a stale refusal.
+            if let Some(pin) = Self::resident(pending) {
+                return DeferredDemand::Ready(pin);
+            }
+            requested.map_or(
+                DeferredDemand::Failed(StructuredResolveFailure::RestorationUnavailable),
+                DeferredDemand::Restoring,
+            )
+        }).clone();
+        // A failed attempt is terminal only for this demand cell. Another retained bind may
+        // retry the same exact eviction and publish its replacement before this bind emits.
+        Self::resident(pending).map_or(requested, DeferredDemand::Ready)
+    }
+}
+
+/// Merely obtaining the coordinator neither starts workers nor enables eviction.
 fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator {
     static COORDINATOR: OnceLock<PipelineRestorationCoordinator> = OnceLock::new();
     COORDINATOR.get_or_init(|| {
         PipelineRestorationCoordinator::new(1).expect("nonzero pipeline restoration capacities")
     })
+}
+
+fn reconcile_pipeline_restorations() {
+    let _ = pipeline_restoration_coordinator().reconcile(PIPELINE_RESOLUTION_RECEIPTS);
 }
 
 /// Opaque retained resolver decision carried by command-list state.
@@ -7863,26 +8039,42 @@ pub(super) fn begin_pipeline_resolution(original: usize) -> Option<PipelineResol
 }
 
 impl PipelineResolution {
-    /// Whether this retained bind still has an unfinished initial build. Completed and
-    /// restoration states are consumed directly instead of creating another deferred segment.
-    pub(super) fn initial_build_pending(&self) -> bool {
+    /// Whether submit can move exact work off recording without looking up the title address.
+    pub(super) fn submit_demand_pending(&self) -> bool {
         matches!(&self.0, StructuredResolve::Initial { pending, bound_unbuilt: true, promoted, .. }
             if promoted.get().is_none()
                 && pending.build.owners.load(Ordering::Acquire) != 0
                 && !pending.build.orphan.load(Ordering::Acquire)
                 && !pending.build.completed.load(Ordering::Acquire))
+            || matches!(&self.0, StructuredResolve::Deferred { restoration, .. }
+                if !restoration.demanded.load(Ordering::Acquire))
     }
 
-    /// Promote this retained bind's exact initial build for a deferred submit without looking up
-    /// the title address, which may already name a different pipeline generation.
-    pub(super) fn need_initial_by_submit(&self) {
-        if let StructuredResolve::Initial { pending, bound_unbuilt: true, promoted, .. } = &self.0 {
-            if promoted.get().is_none()
-                && pending.build.owners.load(Ordering::Acquire) != 0
-                && !pending.build.orphan.load(Ordering::Acquire)
-            {
-                need_pending_by_submit(pending);
+    pub(super) fn is_deferred_restoration(&self) -> bool {
+        matches!(&self.0, StructuredResolve::Deferred { .. })
+    }
+
+    /// Publish exact demand before a deferred submit. Initial work is promoted as before; an
+    /// evicted generation creates or promotes one coordinator attempt on normal workers.
+    pub(super) fn need_by_submit(&self) -> bool {
+        match &self.0 {
+            StructuredResolve::Initial { pending, bound_unbuilt: true, promoted, .. } => {
+                if promoted.get().is_none()
+                    && pending.build.owners.load(Ordering::Acquire) != 0
+                    && !pending.build.orphan.load(Ordering::Acquire)
+                {
+                    need_pending_by_submit(pending);
+                }
+                true
             }
+            StructuredResolve::Deferred { pending, restoration, .. } => {
+                if restoration.demanded.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    return false;
+                }
+                let _ = restoration.request(pending);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -7900,7 +8092,7 @@ impl PipelineResolution {
 
     /// Resolve this bind's retained identity for correctness-critical emission. No branch looks
     /// up `original` in the registry: an address reused since the bind cannot redirect the wait.
-    /// Restoration states remain fail-closed until a later stage activates their coordinator.
+    /// An evicted generation waits only on the exact ticket retained by this bind.
     #[allow(dead_code)] // consumed by the later command-list integration stage
     pub(super) fn resolve_for_emission(&self) -> PipelineChoice {
         match &self.0 {
@@ -7913,8 +8105,20 @@ impl PipelineResolution {
                 }
                 promote_initial_choice(promoted, resolve_retained_for_emission(*original, pending))
             }
+            StructuredResolve::Deferred { pending, restoration, .. } => {
+                let generation = match restoration.request(pending) {
+                    DeferredDemand::Ready(generation) => Some(generation),
+                    DeferredDemand::Restoring(ticket) => ticket.wait_and_take_pin().ok(),
+                    DeferredDemand::Failed(failure) => { let _terminal = failure; None }
+                }.or_else(|| RestorationDemand::resident(pending));
+                // Clone/take the exact success pin above before terminal reconciliation can drop
+                // the coordinator's attempt owner.
+                reconcile_pipeline_restorations();
+                generation.map_or(PipelineChoice::Unavailable, |generation| {
+                    PipelineChoice::Available { raw: generation.raw(), generation }
+                })
+            }
             StructuredResolve::Ready { pin: None, .. }
-            | StructuredResolve::Deferred { .. }
             | StructuredResolve::Restoring { .. }
             | StructuredResolve::Terminal { .. } => PipelineChoice::Unavailable,
         }
@@ -8117,7 +8321,7 @@ impl PipelineResolutionBench {
 
     #[inline(never)]
     pub fn initial_completed_dispatch(&self) -> usize {
-        if self.initial_completed.initial_build_pending() {
+        if self.initial_completed.submit_demand_pending() {
             return 0;
         }
         Self::consume(self.initial_completed.resolve_for_emission())
@@ -8125,17 +8329,17 @@ impl PipelineResolutionBench {
 
     #[inline(never)]
     pub fn initial_unpromoted_shared_probe(&self) -> bool {
-        self.initial_unpromoted_shared.initial_build_pending()
+        self.initial_unpromoted_shared.submit_demand_pending()
     }
 
     #[inline(never)]
     pub fn initial_unpromoted_distinct_probe(&self, worker: usize) -> bool {
-        self.initial_unpromoted_distinct[worker % self.initial_unpromoted_distinct.len()].initial_build_pending()
+        self.initial_unpromoted_distinct[worker % self.initial_unpromoted_distinct.len()].submit_demand_pending()
     }
 
     #[inline(never)]
     pub fn initial_promoted_probe(&self) -> bool {
-        self.initial_completed.initial_build_pending()
+        self.initial_completed.submit_demand_pending()
     }
 
     fn consume(choice: PipelineChoice) -> usize {
@@ -8288,8 +8492,8 @@ impl From<RehydrateCompletion> for StructuredResolveFailure {
     }
 }
 
-/// Retain one point-in-time bind decision. This takes no coordinator receipt and submits no work;
-/// an absent exact generation stays deferred for a later restoration-request stage.
+/// Retain one point-in-time bind decision. This takes no coordinator receipt, starts no worker,
+/// and submits no work. An absent generation keeps only its exact installed eviction identity.
 fn classify_retained<const R: usize>(original: usize, pending: &Arc<Pending>) -> StructuredResolve<R> {
     let done = pending.build.done.lock().unwrap();
     let raw = pending.build.real.load(Ordering::Acquire);
@@ -8308,8 +8512,23 @@ fn classify_retained<const R: usize>(original: usize, pending: &Arc<Pending>) ->
         (Some(pin), Residency::Resident | Residency::Rebuilding) => {
             StructuredResolve::Ready { original, raw, pin: Some(pin) }
         }
-        (_, Residency::Failed) => StructuredResolve::initial(original, pending.clone(), fallback, false),
-        _ => StructuredResolve::Deferred { original, pending: pending.clone(), fallback },
+        (_, Residency::Failed) => match pending.build.eviction_token() {
+            Some(evicted) => StructuredResolve::Deferred {
+                original, pending: pending.clone(), fallback,
+                restoration: Arc::new(RestorationDemand::new(evicted)),
+            },
+            None => StructuredResolve::initial(original, pending.clone(), fallback, false),
+        },
+        _ => match pending.build.eviction_token() {
+            Some(evicted) => StructuredResolve::Deferred {
+                original, pending: pending.clone(), fallback,
+                restoration: Arc::new(RestorationDemand::new(evicted)),
+            },
+            None => StructuredResolve::Terminal {
+                original, pending: pending.clone(), fallback,
+                failure: StructuredResolveFailure::MissingEvictionRecord,
+            },
+        },
     }
 }
 
@@ -8326,6 +8545,7 @@ fn classify_structured_on<const E: usize, const R: usize>(
     enum Snapshot {
         Ready(usize, Option<NativeGeneration>),
         Initial(usize, bool),
+        Failed(usize),
         Restore(usize),
     }
     let snapshot = || {
@@ -8347,7 +8567,7 @@ fn classify_structured_on<const E: usize, const R: usize>(
             // resident generation remains published and fully usable.
             (Some(pin), Residency::Resident | Residency::Rebuilding) => Snapshot::Ready(raw, Some(pin)),
             (None, Residency::Evicted | Residency::Rebuilding) => Snapshot::Restore(fallback),
-            (None, Residency::Failed) => Snapshot::Initial(fallback, false),
+            (None, Residency::Failed) => Snapshot::Failed(fallback),
             _ => Snapshot::Restore(fallback),
         }
     };
@@ -8356,6 +8576,10 @@ fn classify_structured_on<const E: usize, const R: usize>(
         Snapshot::Initial(fallback, bound_unbuilt) => {
             return StructuredResolve::initial(original, pending.clone(), fallback, bound_unbuilt);
         }
+        Snapshot::Failed(fallback) if pending.build.eviction_token().is_none() => {
+            return StructuredResolve::initial(original, pending.clone(), fallback, false);
+        }
+        Snapshot::Failed(fallback) => fallback,
         Snapshot::Restore(fallback) => fallback,
     };
     let Some(evicted) = pending.build.eviction_token() else {
@@ -8365,6 +8589,9 @@ fn classify_structured_on<const E: usize, const R: usize>(
             Snapshot::Ready(raw, pin) => StructuredResolve::Ready { original, raw, pin },
             Snapshot::Initial(fallback, bound_unbuilt) => {
                 StructuredResolve::initial(original, pending.clone(), fallback, bound_unbuilt)
+            }
+            Snapshot::Failed(fallback) => {
+                StructuredResolve::initial(original, pending.clone(), fallback, false)
             }
             Snapshot::Restore(fallback) => StructuredResolve::Terminal {
                 original, pending: pending.clone(), fallback,
