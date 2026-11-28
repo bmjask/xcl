@@ -468,7 +468,7 @@ labelled as missing; it does not infer significance or percentages.
 ## Tests
 
 ```powershell
-.\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+.\scripts\test.ps1                         # build + benchmark smoke + all workspace tests
 .\scripts\perf-run.tests.ps1               # cold/warm runner fixture (no game is run)
 .\scripts\perf-compare.tests.ps1           # comparison fixture (synthetic artifacts)
 cargo bench -p xcl                          # synthetic performance benchmarks
