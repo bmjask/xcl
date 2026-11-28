@@ -115,6 +115,8 @@ struct Table {
     shadowed_by_va: BTreeMap<(usize, usize), usize>,
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
+    /// Active textures whose CPU upload source differs from their indexed title VA.
+    non_identity_sources: usize,
     next_generation: u64,
 }
 
@@ -126,6 +128,7 @@ impl Table {
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
+            non_identity_sources: 0,
             next_generation: 0,
         }
     }
@@ -175,6 +178,7 @@ impl Table {
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
+                self.non_identity_sources -= usize::from(old.src != old.va);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -211,6 +215,7 @@ impl Table {
         let mut to_unmap = Vec::new();
         if let Some(old) = self.by_res.remove(&res) {
             self.by_va.remove(&(old.va, res));
+            self.non_identity_sources -= usize::from(old.src != old.va);
             if old.pending {
                 pending_delta -= 1;
             }
@@ -224,6 +229,7 @@ impl Table {
             }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
+                self.non_identity_sources -= usize::from(old.src != old.va);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -254,6 +260,7 @@ impl Table {
             pending_delta += 1;
         }
         self.by_va.insert((va, res), end);
+        self.non_identity_sources += usize::from(entry.src != entry.va);
         self.by_res.insert(res, entry);
         (pending_delta, to_unmap)
     }
@@ -270,6 +277,7 @@ impl Table {
         }
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
         self.by_va.remove(&(old.va, res));
+        self.non_identity_sources -= usize::from(old.src != old.va);
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
         let end = va.saturating_add(old.tex.size() as usize);
@@ -297,6 +305,7 @@ impl Table {
                     pending_delta += 1;
                 }
                 self.by_va.insert((sva, sres), send);
+                self.non_identity_sources += usize::from(e.src != e.va);
                 self.by_res.insert(sres, e);
             }
         }
@@ -578,6 +587,9 @@ fn recheck_gpu_view_sources() {
     let t = &mut *g;
     for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
         changed |= recheck_source(e);
+    }
+    if changed {
+        t.non_identity_sources = t.by_res.values().filter(|entry| entry.src != entry.va).count();
     }
     drop(g);
     if changed {
@@ -862,6 +874,19 @@ fn texture_needs_upload(
     dirty_overlap()
 }
 
+#[inline(always)]
+fn dirty_pages_overlap(dirty: &[usize], page: usize, src: usize, size: usize) -> bool {
+    let end = src + size;
+    match dirty {
+        [] => false,
+        &[dirty] => dirty + page > src && dirty < end,
+        dirty => {
+            let i = dirty.partition_point(|&dirty| dirty + page <= src);
+            dirty.get(i).is_some_and(|&dirty| dirty < end)
+        }
+    }
+}
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma, measure: bool) -> Arc<WatchRanges> {
     let key = (
         super::sparse::mapped_gen(),
@@ -1097,7 +1122,20 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
         let locked_at = wait_started.map(|_| std::time::Instant::now());
         let (mut visited, mut dirty_tests, mut matches, mut retained) = (0usize, 0usize, 0usize, 0usize);
         let mut todo = Vec::new();
-        for (&res, e) in &mut t.by_res {
+        // A lone written page normally touches one texture. When every active upload source is
+        // its indexed VA, use the existing non-overlapping range index instead of walking all of
+        // `by_res`. Pending first uploads and mirrored sources keep the exhaustive path.
+        let indexed_candidates = (PENDING.load(Ordering::Relaxed) == 0
+            && dirty.len() == 1
+            && t.non_identity_sources == 0)
+            .then(|| {
+                let start = dirty[0];
+                t.active_overlaps(start, start.saturating_add(page as usize))
+                    .into_iter()
+                    .map(|(_, res, _)| res)
+                    .collect::<Vec<_>>()
+            });
+        let mut select = |res: usize, e: &mut Entry| {
             if measure_selection {
                 visited += 1;
             }
@@ -1108,13 +1146,10 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
                 e.cpu_backed,
                 e.pending,
                 e.gpu_written,
-                || {
-                    let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-                },
+                || dirty_pages_overlap(&dirty, page as usize, e.src, e.tex.size() as usize),
             );
             if !selected {
-                continue;
+                return;
             }
             if measure_selection {
                 matches += 1;
@@ -1129,6 +1164,17 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
                 if measure_selection {
                     retained += 1;
                 }
+            }
+        };
+        if let Some(candidates) = indexed_candidates {
+            for res in candidates {
+                if let Some(entry) = t.by_res.get_mut(&res) {
+                    select(res, entry);
+                }
+            }
+        } else {
+            for (&res, entry) in &mut t.by_res {
+                select(res, entry);
             }
         }
         drop(t);
@@ -1173,6 +1219,8 @@ struct TextureSelectionBenchEntry {
 #[cfg(feature = "texture-selection-bench")]
 pub struct TextureSelectionBench {
     entries: Mutex<BTreeMap<usize, TextureSelectionBenchEntry>>,
+    source_ranges: BTreeMap<(usize, usize), usize>,
+    max_size: usize,
     dirty: Vec<usize>,
     pending: std::sync::atomic::AtomicUsize,
 }
@@ -1184,6 +1232,8 @@ impl TextureSelectionBench {
     pub fn new(count: usize, scenario: TextureSelectionScenario) -> Self {
         let base = 0x1000_0000usize;
         let mut entries = BTreeMap::new();
+        let mut source_ranges = BTreeMap::new();
+        let mut max_size = 0;
         let mut pending = 0;
         for i in 0..count {
             let aliased = matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 16 == 1;
@@ -1196,9 +1246,12 @@ impl TextureSelectionBench {
             let gpu_written = matches!(scenario, TextureSelectionScenario::AllGpuWritten)
                 || matches!(scenario, TextureSelectionScenario::MixedAliases) && i % 11 == 0;
             pending += is_pending as usize;
+            let size = Self::PAGE + (alias_group % 3) * Self::PAGE;
+            max_size = max_size.max(size);
+            source_ranges.insert((src, i + 1), src + size);
             entries.insert(i + 1, TextureSelectionBenchEntry {
                 src,
-                size: Self::PAGE + (alias_group % 3) * Self::PAGE,
+                size,
                 cpu_backed,
                 pending: is_pending,
                 gpu_written,
@@ -1213,7 +1266,7 @@ impl TextureSelectionBench {
         let stride = if matches!(scenario, TextureSelectionScenario::DenseDirty) { 1 } else { 31 };
         let mut dirty: Vec<_> = (0..pages).map(|i| base + i * stride * Self::PAGE).collect();
         dirty.sort_unstable();
-        Self { entries: Mutex::new(entries), dirty, pending: std::sync::atomic::AtomicUsize::new(pending) }
+        Self { entries: Mutex::new(entries), source_ranges, max_size, dirty, pending: std::sync::atomic::AtomicUsize::new(pending) }
     }
 
     #[inline(never)]
@@ -1221,21 +1274,37 @@ impl TextureSelectionBench {
         if self.dirty.is_empty() && self.pending.load(Ordering::Relaxed) == 0 {
             return (0, 0);
         }
+        let indexed_candidates = (self.dirty.len() == 1 && self.pending.load(Ordering::Relaxed) == 0)
+            .then(|| {
+                let start = self.dirty[0];
+                let end = start + Self::PAGE;
+                self.source_ranges
+                    .range((start.saturating_sub(self.max_size), 0)..(end, 0))
+                    .filter(|&(_, &range_end)| range_end > start)
+                    .map(|(&(_, resource), _)| resource)
+                    .collect::<Vec<_>>()
+            });
         let entries = self.entries.lock().unwrap();
         let mut matches = 0usize;
         let mut checksum = 0usize;
-        for (&resource, entry) in entries.iter() {
+        let mut select = |resource: usize, entry: &TextureSelectionBenchEntry| {
             if texture_needs_upload(
                 entry.cpu_backed,
                 entry.pending,
                 entry.gpu_written,
-                || {
-                    let i = self.dirty.partition_point(|&p| p + Self::PAGE <= entry.src);
-                    self.dirty.get(i).is_some_and(|&p| p < entry.src + entry.size)
-                },
+                || dirty_pages_overlap(&self.dirty, Self::PAGE, entry.src, entry.size),
             ) {
                 matches += 1;
                 checksum ^= resource;
+            }
+        };
+        if let Some(candidates) = indexed_candidates {
+            for resource in candidates {
+                select(resource, &entries[&resource]);
+            }
+        } else {
+            for (&resource, entry) in entries.iter() {
+                select(resource, entry);
             }
         }
         (matches, checksum)
@@ -3971,12 +4040,34 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    #[test]
+    fn dirty_page_overlap_single_page_matches_binary_search_boundaries() {
+        const PAGE: usize = 0x1000;
+        let reference = |dirty: &[usize], src: usize, size: usize| {
+            let i = dirty.partition_point(|&page| page + PAGE <= src);
+            dirty.get(i).is_some_and(|&page| page < src + size)
+        };
+        for dirty in [vec![], vec![0x4000], vec![0x1000, 0x4000, 0x9000]] {
+            for src in [0x3000, 0x3fff, 0x4000, 0x4fff, 0x5000] {
+                for size in [1, PAGE, PAGE * 3] {
+                    assert_eq!(
+                        dirty_pages_overlap(&dirty, PAGE, src, size),
+                        reference(&dirty, src, size),
+                        "dirty {dirty:x?}, texture {src:#x}..{:#x}",
+                        src + size,
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "texture-selection-bench")]
     #[test]
     fn texture_selection_fixture_keeps_empty_gate_and_exact_aliases() {
         assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::Empty).scan(), (0, 0));
         assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::AllPending).scan().0, 128);
         assert_eq!(TextureSelectionBench::new(128, TextureSelectionScenario::AllGpuWritten).scan().0, 0);
+        assert_eq!(TextureSelectionBench::new(16_384, TextureSelectionScenario::OneDirty).scan(), (1, 1));
         let mixed = TextureSelectionBench::new(32, TextureSelectionScenario::MixedAliases);
         {
             let entries = mixed.entries.lock().unwrap();
@@ -3991,6 +4082,8 @@ mod tests {
         };
         let aliases = TextureSelectionBench {
             entries: Mutex::new(BTreeMap::from([(1, entry(0x1000)), (2, entry(0x1000))])),
+            source_ranges: BTreeMap::from([((0x1000, 1), 0x2000), ((0x1000, 2), 0x2000)]),
+            max_size: TextureSelectionBench::PAGE,
             dirty: vec![0x1000],
             pending: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -4374,6 +4467,18 @@ mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+
+        let mut sources = Table::new();
+        let mut mirrored = entry(0x30_0000, &tex_16k, false, false);
+        mirrored.src = 0x40_0000;
+        sources.insert(30, mirrored);
+        assert_eq!(sources.non_identity_sources, 1);
+        sources.insert(31, entry(0x30_0000, &tex_64k, false, false));
+        assert_eq!(sources.non_identity_sources, 0, "a shadowed mirror does not disable the active address index");
+        sources.remove(31);
+        assert_eq!(sources.non_identity_sources, 1, "reactivating a mirror disables the address index");
+        sources.remove(30);
+        assert_eq!(sources.non_identity_sources, 0);
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased
