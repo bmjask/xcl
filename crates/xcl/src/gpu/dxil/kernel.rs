@@ -259,6 +259,10 @@ fn translate_on_this_thread(
             [1, 1, 1]
         }
     };
+    // Entry setup may contain real control flow (compute dispatch limits use a guarded
+    // prologue). The program must start after that prologue's join, not by appending another
+    // branch to the already-terminated physical entry block.
+    let prologue = lw.cur();
     // the HLSL kernel loads and stores every register its emitted instructions name: all of
     // them in a program with branches, those up to the first s_endpgm in straight-line code
     let branchy = cfg.insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
@@ -325,12 +329,12 @@ fn translate_on_this_thread(
     if gs_only {
         // the GS alone: in the lower hardware wave only
         let gate = lw.block(Some(1));
-        lw.edge(Block(0), gate);
+        lw.edge(prologue, gate);
         lw.s.m.set_block(gate);
         let up = lw.upper;
         lw.cond_br(up, exit, h0);
     } else {
-        lw.edge(Block(0), h0);
+        lw.edge(prologue, h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
     // scalar loads the program repeats keep their first values (compute programs and kernels:
@@ -440,7 +444,7 @@ fn translate_on_this_thread(
         }
     }
     lw.s.m.ret();
-    lw.s.m.set_block(Block(0));
+    lw.s.m.set_block(prologue);
     lw.s.m.br(h0);
     let hw = if split || !o.wave64 { 32 } else { 64 };
     let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
@@ -474,7 +478,7 @@ impl Lw {
     /// `entry`: the shader with its buffers,
     /// the SSA's entry block, the program's LDS and the split form's exchange storage and
     /// partner. The caller then sets up the lanes for its entry (`setup_lanes*`), lowers the
-    /// program's blocks, branches from `Block(0)` to the first of them and ends with
+    /// program's blocks, branches from the entry prologue's exit to the first of them and ends with
     /// [`Lw::finish`]. #1426's block walk (`translate_on_this_thread`) and the recompiler's
     /// per-lane lowering (`recomp::lower_dxil`) both build their `Lw` here.
     pub fn new(insts: &[Decoded], leaders: &BTreeSet<u64>, o: KernelOptions, entry: &Entry) -> Lw {
@@ -646,6 +650,15 @@ impl Lw {
 
 #[cfg(test)]
 #[test]
+fn compute_dispatch_limit_prologue_reaches_the_program_after_its_guard() {
+    let code = crate::gpu::rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
+    let cs = CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    translate_compute(&code, options, &cs).expect("a guarded dispatch-limit prologue");
+}
+
+#[cfg(test)]
+#[test]
 fn dispatch_chain_native_wave64_builds_whole() {
     use crate::gpu::recomp::runner;
 
@@ -741,7 +754,44 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     }
     let zero = lw.c(0);
     sgpr.insert(VAR_SCC, zero);
+    let io = lw.init.io.expect("the I/O buffer");
+    let mut dispatch_limited = lw.s.m.i1c(false);
+    let mut limits = Vec::new();
+    for (k, _) in cs.threads.iter().enumerate().filter(|(_, &threads)| threads > 1) {
+        let off = lw.c((crate::gpu::recomp::IO_THREAD_LIMIT[k] * 4) as u32);
+        let limit = lw.s.raw_load(io, off, 1)[0];
+        let zero = lw.c(0);
+        let limited = lw.cmp(Pred::Ne, limit, zero);
+        dispatch_limited = lw.lor(dispatch_limited, limited);
+        limits.push((k, limit));
+    }
     let (lo, hi) = entry_exec(lw, total, tid);
+    let (exec_lo, exec_hi) = (lw.tmp_var(), lw.tmp_var());
+    lw.wr(exec_lo, lo);
+    lw.wr(exec_hi, hi);
+    let _ = lw.guarded(dispatch_limited, &mut |lw| {
+        let mut dispatch_live = lw.s.m.i1c(true);
+        for &(k, limit) in &limits {
+            let zero = lw.c(0);
+            let unlimited = lw.cmp(Pred::Eq, limit, zero);
+            let group = lw.s.group_id(k as u32);
+            let width = lw.c(cs.threads[k]);
+            let base = lw.mul(group, width);
+            let id = lw.add(base, gtid[k]);
+            let inside = lw.cmp(Pred::ULt, id, limit);
+            let axis_live = lw.lor(unlimited, inside);
+            dispatch_live = lw.land(dispatch_live, axis_live);
+        }
+        let (dispatch_lo, dispatch_hi) = lw.ballot(dispatch_live);
+        let old_lo = lw.rd(exec_lo);
+        let old_hi = lw.rd(exec_hi);
+        let lo = lw.and(old_lo, dispatch_lo);
+        let hi = lw.and(old_hi, dispatch_hi);
+        lw.wr(exec_lo, lo);
+        lw.wr(exec_hi, hi);
+        Ok(())
+    });
+    let (lo, hi) = (lw.rd(exec_lo), lw.rd(exec_hi));
     sgpr.insert(126, lo);
     sgpr.insert(127, hi);
     let mut vgpr = HashMap::new();
