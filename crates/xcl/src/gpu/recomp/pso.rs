@@ -124,10 +124,10 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 pub fn mem_windows() -> u32 {
     let title = TITLE_WINDOWS.load(std::sync::atomic::Ordering::Relaxed);
     if title != 0 {
-        return windows_for(title & !super::HEAP_WINDOWS, title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()));
+        let n = title & !(super::HEAP_WINDOWS | super::HEAP_FLAT);
+        return windows_for_mode(n, title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()));
     }
-    let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    windows_for(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()))
+    windows_for(crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32))
 }
 
 /// The title's windows (`mem_windows` with `HEAP_WINDOWS`) for a process without its memory: a
@@ -139,13 +139,19 @@ pub fn set_title_windows(windows: u32) {
     TITLE_WINDOWS.store(windows, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `n` windows as this run's programs take them (`mem_windows`; also the keys
+/// `xcl shaders --precompile` makes, so they are the ones the runtime looks up).
+pub fn windows_for(n: u32) -> u32 {
+    windows_for_mode(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()))
+}
+
 /// `n` windows as shaders take them: from the descriptor heap (`heap`), or in the switch form
 /// over the root UAVs – of which there are `MAX_WINDOWS`, so never more there (the HLSL path
 /// refused a wider switch, and DXIL quietly made it 4: a 16-window run whose heap views could
 /// not be made, or a pipeline the driver refused with them, lost every shader on HLSL).
-fn windows_for(n: u32, heap: bool) -> u32 {
+fn windows_for_mode(n: u32, heap: bool) -> u32 {
     if n > 1 && heap {
-        n | super::HEAP_WINDOWS
+        n | super::HEAP_WINDOWS | if heap_flat() { super::HEAP_FLAT } else { 0 }
     } else {
         n
     }
@@ -179,6 +185,13 @@ pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
 pub fn heap_windows() -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
     *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
+}
+
+/// `XCL_HEAP_FLAT=1` (with heap windows): the direct DXIL translator reads a compute stage's heap
+/// windows without a branch per access (`HEAP_FLAT`). Opt-in while it is measured.
+pub fn heap_flat() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_FLAT").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
