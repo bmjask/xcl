@@ -78,6 +78,21 @@ pub(super) struct Em {
     img_writes: Vec<u64>,
     /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
     pub coherent_mem: bool,
+    /// split wave64: what lies between the basic block's previous LDS access and here
+    x64_lds: LdsGap,
+    /// first instructions of the basic blocks (branch targets, after branches)
+    block_starts: BTreeSet<u64>,
+}
+
+/// Split wave64 (`x64_lds_meet`): since the basic block's previous LDS access
+#[derive(Clone, Copy, PartialEq)]
+enum LdsGap {
+    /// that was a write or an atomic, or there was none in the block
+    Open,
+    /// that was a read, and no exchange since
+    Read,
+    /// the halves met in an exchange since
+    Met,
 }
 
 /// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
@@ -595,7 +610,9 @@ fn to_f16_rounded_expr(dynamic_rm: bool, e: &str) -> String {
 }
 
 impl Em {
-    pub fn new(opt: Options) -> Self {
+    /// `block_starts`: the first instructions of the program's basic blocks (branch targets and
+    /// the instructions after branches): split wave64 elides no LDS meeting across them.
+    pub fn new(opt: Options, block_starts: BTreeSet<u64>) -> Self {
         Em {
             opt,
             reductions: Default::default(),
@@ -629,6 +646,8 @@ impl Em {
             has_s_barrier: false,
             img_writes: Vec::new(),
             coherent_mem: false,
+            x64_lds: LdsGap::Open,
+            block_starts,
         }
     }
 
@@ -986,6 +1005,9 @@ impl Em {
                 ballot = "ballot_px_local";
             }
         }
+        if ballot == "xcl_x_ballot" {
+            self.x64_met();
+        }
         match if ballot == "ballot_px" { quad_bits(a, cond, &m) } else { None } {
             Some((reads, q)) => {
                 if !reads.is_empty() {
@@ -1143,6 +1165,7 @@ impl Em {
                     self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                     self.line(&format!("xcl_x_put(0u, {t}_m);"));
                     self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                    self.x64_met();
                     self.line(&format!("uint {t}_r1 = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                     self.line(&format!("uint {t}_r2 = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                     self.write32(&dst1, &format!("{t}_r1"));
@@ -1167,6 +1190,7 @@ impl Em {
                             self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                             self.line(&format!("xcl_x_put(0u, {t}_m);"));
                             self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                            self.x64_met();
                             self.line(&format!("uint {r1} = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                             self.line(&format!("uint {r2} = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                             self.write32(&Dst::S(s1), &r1);
@@ -1218,6 +1242,7 @@ impl Em {
                         self.line(&format!("uint {t}_mh = WaveReadLaneAt({vh}, {lane32}u);"));
                         self.line(&format!("xcl_x_put(0u, {t}_ml); xcl_x_put(1u, {t}_mh);"));
                         self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+                        self.x64_met();
                         self.line(&format!("uint {t}_ol = {t}_ok ? xcl_x_get(0u) : 0u;"));
                         self.line(&format!("uint {t}_oh = {t}_ok ? xcl_x_get(1u) : 0u;"));
                         let (h1, h2) = (l1 >> 5, l2 >> 5);
@@ -1255,6 +1280,9 @@ impl Em {
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
         self.cur_pc = d.pc;
+        if self.block_starts.contains(&d.pc) {
+            self.x64_lds = LdsGap::Open;
+        }
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
             return Flow::Jump(t);
@@ -1994,6 +2022,7 @@ impl Em {
             }
             let get: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!("{v} = xcl_x_get({i}u);")).collect();
             self.line(&format!("if (xcl_x_meet() && xcl_half != 0u) {{ {} }}", get.join(" ")));
+            self.x64_met();
         }
         for (i, v) in vals.iter().enumerate() {
             let s = self.sreg(sdata + i as u64);
@@ -4094,6 +4123,7 @@ impl Em {
                 let rla = self.rla_uniform_fn();
                 // (a live lane of EXEC where there is one: `first_lane_live`)
                 self.line(&format!("uint {t} = {rla}({a}, first_lane_live({el}, {eh}));"));
+                self.x64_met();
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -4121,6 +4151,8 @@ impl Em {
                     (Some(Read::Shadow), Some((v, l))) => self.line(&format!("uint {t} = xcl_sh{v}_{l}; if (!xcl_hw32) {t} = {read};")),
                     _ => self.line(&format!("uint {t} = {read};")),
                 }
+                // split wave64 (no `upper` there): the last arm, an exchange
+                self.x64_met();
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -4526,6 +4558,33 @@ impl Em {
     }
 
     /// LDS (`groupshared`, compute only) and the DS cross-lane permutes.
+    /// Split wave64: the console runs an instruction in all 64 lanes before the next, so a lane
+    /// reads the LDS the other half wrote an instruction earlier with no s_barrier – the halves
+    /// meet before every LDS access (nothing exchanged: the meeting is the order). Called once
+    /// the access is known to be translated. Not in geometry mode: ES lanes write their own
+    /// items and read no other lane's before the barrier where the phases meet.
+    /// No meeting for a read right after a read of the same basic block, nor when the halves
+    /// met in an exchange since the block's previous access (`LdsGap`). Still in order: for
+    /// accesses j < i of the stream, one a write, the halves meet between them (the access
+    /// after a write and every write meet, or an exchange lies before them; a block's first
+    /// access meets), and both halves pass the same meetings: the other half's j is done
+    /// before this half's i. Two reads need no order.
+    fn x64_lds_meet(&mut self, write: bool) {
+        if self.x64() && !matches!(self.opt.mode, Mode::Geometry(_)) {
+            if self.x64_lds == LdsGap::Open || (write && self.x64_lds == LdsGap::Read) {
+                self.line("xcl_x_meet();");
+            }
+            self.x64_lds = if write { LdsGap::Open } else { LdsGap::Read };
+        }
+    }
+
+    /// An exchange (`xcl_x_meet`) the current instruction always runs, in the split form.
+    fn x64_met(&mut self) {
+        if self.x64() {
+            self.x64_lds = LdsGap::Met;
+        }
+    }
+
     fn ds(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let act = self.act();
@@ -4557,6 +4616,7 @@ impl Em {
                 self.line(&format!("uint {t}_l = (({a} + {off16}u) >> 2) & {m}u;"));
                 let rla = if self.x64() {
                     self.x64_words = 32;
+                    self.x64_met();
                     "xcl_x_rla_any"
                 } else {
                     "rla"
@@ -4587,6 +4647,7 @@ impl Em {
         }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
+            self.x64_lds_meet(name == "ds_write_addtid_b32");
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
@@ -4651,6 +4712,7 @@ impl Em {
         };
         // d16 8 / 16-bit LDS accesses (half of the VGPR)
         if let Some((bits, signed, write, half)) = ds_d16(name) {
+            self.x64_lds_meet(write);
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4676,6 +4738,7 @@ impl Em {
             _ => None,
         };
         if let Some((bits, signed, write)) = small {
+            self.x64_lds_meet(write);
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4697,6 +4760,7 @@ impl Em {
             return Ok(());
         }
         if let Some((write, n, stride, two)) = rw(name) {
+            self.x64_lds_meet(write);
             let addrs: Vec<String> = if two {
                 vec![format!("{a} + {}u", o0 * stride), format!("{a} + {}u", o1 * stride)]
             } else {
@@ -4729,6 +4793,7 @@ impl Em {
         };
         // two exchanges (ds_wrxchg2(st64)_rtn_b32): old values to VDST, VDST + 1
         if op == "wrxchg2_b32" || op == "wrxchg2st64_b32" {
+            self.x64_lds_meet(true);
             let stride = if op == "wrxchg2_b32" { 4 } else { 256 };
             let (s0, s1) = (lds(format!("{a} + {}u", o0 * stride)), lds(format!("{a} + {}u", o1 * stride)));
             let (v0, v1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
@@ -4744,6 +4809,7 @@ impl Em {
         let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
         let slot = lds(format!("{a} + {off16}u"));
         let body = rmw32(&op, &At::Ref(slot), &v, &v2, &format!("{t}_o"), &t).ok_or("DS")?;
+        self.x64_lds_meet(true);
         self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {body} }}"));
         if rtn {
             let r = self.vreg(f("VDST"));
