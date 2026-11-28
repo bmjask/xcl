@@ -787,7 +787,9 @@ struct ListState {
 pub(super) enum Deferred {
     /// x, y, z and `DispatchX`'s flags (0 for `Dispatch`)
     Dispatch(u32, u32, u32, u32),
-    Indirect(usize, u32, usize, u64, usize, u64),
+    /// Raw signature/resources rely on the existing D3D12 caller lifetime requirement through
+    /// execution; this stage retains only the immutable classification snapshot.
+    Indirect(usize, u32, usize, u64, usize, u64, super::bind::IndirectSignatureInfo),
 }
 
 /// Why a recording needs a physical command-list boundary.
@@ -3767,7 +3769,11 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         }
         match what {
             Deferred::Dispatch(x, y, z, flags) => super::bind::dispatch_flags(seg, x, y, z, flags),
-            Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
+            Deferred::Indirect(sig, max, args, args_off, count_buf, count_off, signature) => {
+                super::bind::execute_indirect_classified(
+                    seg, sig, max, args, args_off, count_buf, count_off, signature,
+                )
+            }
         }
         let ext = *(seg as *const usize);
         let hr = segment_close(wrapper, seg);
