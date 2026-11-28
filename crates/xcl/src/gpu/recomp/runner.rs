@@ -1843,7 +1843,10 @@ fn dispatch_with(
                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
             }
             if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
-                super::pso::record_dispatch_chain(&list, groups, most, scratch, k > 0, pieces);
+                super::pso::record_dispatch_chain(
+                    &list, groups, most, scratch, k > 0, pieces,
+                    |piece| list.SetPipelineState(piece),
+                );
             } else {
                 list.Dispatch(groups[0], groups[1], groups[2]);
             }
