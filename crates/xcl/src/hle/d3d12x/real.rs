@@ -5466,6 +5466,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 // non-blocking pipeline creation (see `pso_async`)
 // ---------------------------------------------------------------------------------------
 
+pub(in crate::hle::d3d12x) mod compute_build_key;
+
 /// A pipeline description that owns what it points to (shader blobs, input layout and its
 /// semantic names), so a worker can build the pipeline after the title's memory is gone.
 /// The root signature pointer is kept as is (the translated paths replace it).
@@ -5777,6 +5779,12 @@ unsafe fn go_background(
     let (key, parts) = owned.shaders_key();
     // (a graphics pipeline used in this run is built before the next starts: `gfx_records`)
     let described = if super::pso_async::lazy() { owned.record(key, &parts) } else { None };
+    let build_key = match &owned {
+        OwnedDesc::Compute(desc, shaders) => shaders.first().map(|shader| {
+            compute_build_key::ComputeBuildKey::capture(this as usize, desc, shader, wave32_only(this))
+        }),
+        _ => None,
+    };
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let job: super::pso_async::Job = Box::new(move || {
@@ -5788,12 +5796,12 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        super::pso_async::submit_lazy_keyed(*ppv as usize, compute, job, key, build_key);
         if let Some(entry) = described {
             super::pso_async::on_first_use(*ppv as usize, Box::new(move || super::gfx_records::note(entry)));
         }
     } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
+        super::pso_async::submit_keyed(*ppv as usize, compute, job, build_key);
     }
     if driver != 0 {
         super::pso_async::shared(*ppv as usize, driver);
